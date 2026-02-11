@@ -54,7 +54,10 @@ public class IndoorMapManager {
     private static final String TAG = "IndoorMapManager";
     private static final String FLOORPLAN_REQUEST_BASE_URL =
             "https://openpositioning.org/api/live/floorplan/request";
-    private static final String FLOORPLAN_API_KEY = BuildConfig.OPENPOSITIONING_API_KEY;
+    private static final String FLOORPLAN_API_KEY =
+            !TextUtils.isEmpty(BuildConfig.OPENPOSITIONING_MASTER_KEY)
+                    ? BuildConfig.OPENPOSITIONING_MASTER_KEY
+                    : BuildConfig.OPENPOSITIONING_API_KEY;
     private static final int MAX_APS_IN_REQUEST = 20;
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
     private static final long REQUEST_INTERVAL_MS = 8_000L;
@@ -111,7 +114,7 @@ public class IndoorMapManager {
             return;
         }
         if (TextUtils.isEmpty(FLOORPLAN_API_KEY)) {
-            Log.w(TAG, "OPENPOSITIONING_API_KEY is empty; skipping nearby floorplan request.");
+            Log.w(TAG, "OPENPOSITIONING_MASTER_KEY/API_KEY is empty; skipping nearby floorplan request.");
             return;
         }
         long now = System.currentTimeMillis();

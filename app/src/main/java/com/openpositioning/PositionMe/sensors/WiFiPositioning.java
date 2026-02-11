@@ -113,8 +113,9 @@ public class WiFiPositioning {
                 response -> parseSuccessResponse(response, callback),
                 error -> {
                     int statusCode = error.networkResponse == null ? -1 : error.networkResponse.statusCode;
-                    if (!useLegacyEndpoint && statusCode == 404) {
-                        Log.w("WiFiPositioning", "Live endpoint returned 404, retrying legacy endpoint.");
+                    if (!useLegacyEndpoint && (statusCode == 404 || statusCode == 405)) {
+                        Log.w("WiFiPositioning",
+                                "Live endpoint returned " + statusCode + ", retrying legacy endpoint.");
                         enqueuePositionRequest(jsonWifiFeatures, callback, true);
                         return;
                     }
