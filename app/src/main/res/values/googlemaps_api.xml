@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- google_maps_key is injected via resValue in app/build.gradle -->
+</resources>
