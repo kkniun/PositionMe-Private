@@ -1084,6 +1084,26 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     /**
+     * 获取最近一次 BLE 扫描窗口的去重设备数量（只读展示用）。
+     */
+    public int getLatestBleDeviceCount() {
+        if (bleProcessor == null) {
+            return 0;
+        }
+        return bleProcessor.getLatestBleDeviceCount();
+    }
+
+    /**
+     * 获取最近一次 BLE 扫描窗口的最强 RSSI（只读展示用）。
+     */
+    public int getLatestStrongestBleRssi() {
+        if (bleProcessor == null) {
+            return -100;
+        }
+        return bleProcessor.getLatestStrongestBleRssi();
+    }
+
+    /**
      * Get information about all the sensors registered in SensorFusion.
      *
      * @return  List of SensorInfo objects containing name, resolution, power, etc.

@@ -13,6 +13,8 @@
     <string name="grant">Grant permissions</string>
     <string name="exit">Exit application</string>
     <string name="ok">OK</string>
+    <string name="copy_debug_info">Copy</string>
+    <string name="copied_debug_info">Copied</string>
     <string name="show_storage">Show locally</string>
     <string name="setLocation">Set</string>
     <string name="cancel">Cancel</string>
@@ -30,6 +32,7 @@
     <string name="pdr_pos">PDR Position</string>
     <string name="pdr">Pedestrian Dead Reckoning</string>
     <string name="wifi">WiFi Networks</string>
+    <string name="ble_devices">BLE Devices</string>
 
 
     <!-- Misc -->
@@ -71,6 +74,11 @@
     <!-- Units only -->
     <string name="meter">%1$s m</string>
     <string name="db">%1$s dB</string>
+    <string name="ble_devices_count">Devices: %1$d</string>
+    <string name="ble_strongest_rssi">Strongest: %1$d dBm</string>
+    <string name="ble_devices_count_default">Devices: 0</string>
+    <string name="ble_strongest_rssi_default">Strongest: -100 dBm</string>
+    <string name="ble_icon_desc">BLE icon</string>
 
     <!-- Sync Preferences -->
     <string name="time_title">Sync frequency</string>

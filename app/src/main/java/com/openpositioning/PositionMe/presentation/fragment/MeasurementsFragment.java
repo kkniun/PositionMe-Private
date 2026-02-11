@@ -1,27 +1,41 @@
 package com.openpositioning.PositionMe.presentation.fragment;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.os.Bundle;
 import android.os.Handler;
 import android.view.LayoutInflater;
+import android.view.Menu;
+import android.view.MenuInflater;
+import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.cardview.widget.CardView;
 import androidx.constraintlayout.widget.ConstraintLayout;
+import androidx.core.view.MenuHost;
+import androidx.core.view.MenuProvider;
 import androidx.fragment.app.Fragment;
+import androidx.lifecycle.Lifecycle;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import com.openpositioning.PositionMe.BuildConfig;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.sensors.SensorTypes;
 import com.openpositioning.PositionMe.sensors.Wifi;
 import com.openpositioning.PositionMe.presentation.viewitems.WifiListAdapter;
 
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -38,6 +52,9 @@ public class MeasurementsFragment extends Fragment {
 
     // Static constant for refresh time in milliseconds
     private static final long REFRESH_TIME = 5000;
+    private static final long BLE_REFRESH_TIME_MS = 1000;
+    private static final int DEFAULT_BLE_DEVICE_COUNT = 0;
+    private static final int DEFAULT_BLE_STRONGEST_RSSI = -100;
 
     // Singleton Sensor Fusion class handling all sensor data
     private SensorFusion sensorFusion;
@@ -47,6 +64,8 @@ public class MeasurementsFragment extends Fragment {
     // UI elements
     private ConstraintLayout sensorMeasurementList;
     private RecyclerView wifiListView;
+    private TextView bleDeviceCountText;
+    private TextView bleStrongestRssiText;
     // List of string resource IDs
     private int[] prefaces;
     private int[] gnssPrefaces;
@@ -101,6 +120,7 @@ public class MeasurementsFragment extends Fragment {
     @Override
     public void onPause() {
         refreshDataHandler.removeCallbacks(refreshTableTask);
+        refreshDataHandler.removeCallbacks(refreshBleOverviewTask);
         super.onPause();
     }
 
@@ -111,6 +131,7 @@ public class MeasurementsFragment extends Fragment {
     @Override
     public void onResume() {
         refreshDataHandler.postDelayed(refreshTableTask, REFRESH_TIME);
+        refreshDataHandler.post(refreshBleOverviewTask);
         super.onResume();
     }
 
@@ -124,7 +145,11 @@ public class MeasurementsFragment extends Fragment {
         super.onViewCreated(view, savedInstanceState);
         sensorMeasurementList = (ConstraintLayout) getView().findViewById(R.id.sensorMeasurementList);
         wifiListView = (RecyclerView) getView().findViewById(R.id.wifiList);
+        bleDeviceCountText = (TextView) getView().findViewById(R.id.bleDeviceCountText);
+        bleStrongestRssiText = (TextView) getView().findViewById(R.id.bleStrongestRssiText);
         wifiListView.setLayoutManager(new LinearLayoutManager(getActivity()));
+        updateBleOverview(DEFAULT_BLE_DEVICE_COUNT, DEFAULT_BLE_STRONGEST_RSSI);
+        registerCopyDebugMenu();
     }
 
     /**
@@ -174,4 +199,138 @@ public class MeasurementsFragment extends Fragment {
             refreshDataHandler.postDelayed(refreshTableTask, REFRESH_TIME);
         }
     };
+
+    private final Runnable refreshBleOverviewTask = new Runnable() {
+        @Override
+        public void run() {
+            // 只读获取 BLE 统计并刷新 UI，不触发任何扫描流程。
+            int deviceCount = sensorFusion.getLatestBleDeviceCount();
+            int strongestRssi = sensorFusion.getLatestStrongestBleRssi();
+            updateBleOverview(deviceCount, strongestRssi);
+            refreshDataHandler.postDelayed(this, BLE_REFRESH_TIME_MS);
+        }
+    };
+
+    // 统一 BLE 面板文案更新，避免分散在多个生命周期回调中。
+    private void updateBleOverview(int deviceCount, int strongestRssi) {
+        if (bleDeviceCountText != null) {
+            bleDeviceCountText.setText(getString(R.string.ble_devices_count, deviceCount));
+        }
+        if (bleStrongestRssiText != null) {
+            bleStrongestRssiText.setText(getString(R.string.ble_strongest_rssi, strongestRssi));
+        }
+    }
+
+    // 在页面工具栏添加 Copy 按钮，仅用于只读调试信息复制。
+    private void registerCopyDebugMenu() {
+        MenuHost menuHost = requireActivity();
+        menuHost.addMenuProvider(new MenuProvider() {
+            @Override
+            public void onCreateMenu(@NonNull Menu menu, @NonNull MenuInflater menuInflater) {
+                menuInflater.inflate(R.menu.menu_measurements, menu);
+                MenuItem copyItem = menu.findItem(R.id.action_copy_debug_info);
+                if (copyItem != null) {
+                    copyItem.setVisible(BuildConfig.DEBUG);
+                }
+            }
+
+            @Override
+            public boolean onMenuItemSelected(@NonNull MenuItem menuItem) {
+                if (menuItem.getItemId() == R.id.action_copy_debug_info) {
+                    copyDebugInfoToClipboard();
+                    return true;
+                }
+                return false;
+            }
+        }, getViewLifecycleOwner(), Lifecycle.State.RESUMED);
+    }
+
+    // 读取当前页面可见数据并复制到剪贴板，不改变任何采集/上报流程。
+    private void copyDebugInfoToClipboard() {
+        String debugInfoText = buildDebugInfoText();
+        ClipboardManager clipboardManager = (ClipboardManager) requireContext()
+                .getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboardManager != null) {
+            clipboardManager.setPrimaryClip(ClipData.newPlainText("debug_info", debugInfoText));
+        }
+        Toast.makeText(requireContext(), R.string.copied_debug_info, Toast.LENGTH_SHORT).show();
+    }
+
+    // 组装当前页面关键读数，缺失数据统一交给 formatter 输出 N/A。
+    private String buildDebugInfoText() {
+        Map<SensorTypes, float[]> sensorValueMap = sensorFusion.getSensorValueMap();
+        float[] accelerometer = getSensorValues(sensorValueMap, SensorTypes.ACCELEROMETER);
+        float[] gravity = getSensorValues(sensorValueMap, SensorTypes.GRAVITY);
+        float[] gyro = getSensorValues(sensorValueMap, SensorTypes.GYRO);
+        float[] magnetic = getSensorValues(sensorValueMap, SensorTypes.MAGNETICFIELD);
+        Float light = getScalarValue(sensorValueMap, SensorTypes.LIGHT);
+        Float pressure = getScalarValue(sensorValueMap, SensorTypes.PRESSURE);
+        Float proximity = getScalarValue(sensorValueMap, SensorTypes.PROXIMITY);
+        float[] gnssLatLong = getSensorValues(sensorValueMap, SensorTypes.GNSSLATLONG);
+        float[] pdr = getSensorValues(sensorValueMap, SensorTypes.PDR);
+
+        List<Wifi> wifiObjects = sensorFusion.getWifiList();
+        Integer wifiApCount = (wifiObjects == null) ? null : wifiObjects.size();
+        Integer wifiStrongestRssi = getWifiStrongestRssi(wifiObjects);
+
+        Integer bleDeviceCount = null;
+        Integer bleStrongestRssi = null;
+        try {
+            bleDeviceCount = sensorFusion.getLatestBleDeviceCount();
+            bleStrongestRssi = sensorFusion.getLatestStrongestBleRssi();
+        } catch (Exception ignored) {
+            // BLE 统计不可用时降级为 N/A，保证复制功能不影响主流程。
+        }
+
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                .format(new Date());
+        return DebugInfoFormatter.format(
+                timestamp,
+                accelerometer,
+                gravity,
+                gyro,
+                magnetic,
+                light,
+                pressure,
+                proximity,
+                gnssLatLong,
+                pdr,
+                wifiApCount,
+                wifiStrongestRssi,
+                bleDeviceCount,
+                bleStrongestRssi
+        );
+    }
+
+    private float[] getSensorValues(Map<SensorTypes, float[]> sensorValueMap, SensorTypes type) {
+        if (sensorValueMap == null) {
+            return null;
+        }
+        return sensorValueMap.get(type);
+    }
+
+    private Float getScalarValue(Map<SensorTypes, float[]> sensorValueMap, SensorTypes type) {
+        float[] values = getSensorValues(sensorValueMap, type);
+        if (values == null || values.length == 0) {
+            return null;
+        }
+        return values[0];
+    }
+
+    // WiFi 列表取最强 RSSI（数值越大信号越强）。
+    private Integer getWifiStrongestRssi(List<Wifi> wifiObjects) {
+        if (wifiObjects == null || wifiObjects.isEmpty()) {
+            return null;
+        }
+        Integer strongest = null;
+        for (Wifi wifi : wifiObjects) {
+            if (wifi == null) {
+                continue;
+            }
+            if (strongest == null || wifi.getLevel() > strongest) {
+                strongest = wifi.getLevel();
+            }
+        }
+        return strongest;
+    }
 }
