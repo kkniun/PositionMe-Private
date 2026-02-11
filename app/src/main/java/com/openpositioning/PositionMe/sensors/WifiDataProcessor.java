@@ -50,6 +50,8 @@ public class WifiDataProcessor implements Observable {
     private static boolean sThrottleSettingWarned = false;
 
     private long lastScanElapsedMs = 0L;
+    private long lastResultElapsedMs = 0L;
+    private int lastThrottleStatus = -1;
     private String lastToastMsg = "";
     private long lastToastTimeMs = 0L;
     private boolean isWifiReceiverRegistered = false;
@@ -104,7 +106,7 @@ public class WifiDataProcessor implements Observable {
         }
 
         //Inform the user if wifi throttling is enabled on their device
-        checkWifiThrottling();
+        lastThrottleStatus = checkWifiThrottling();
     }
 
     /**
@@ -134,6 +136,7 @@ public class WifiDataProcessor implements Observable {
 
             //Collect the list of nearby wifis
             List<ScanResult> wifiScanList = wifiManager.getScanResults();
+            lastResultElapsedMs = SystemClock.elapsedRealtime();
 
             //Loop though each item in wifi list
             wifiData = new Wifi[wifiScanList.size()];
@@ -265,6 +268,7 @@ public class WifiDataProcessor implements Observable {
      * The method declares a new timer instance to schedule a scan for nearby wifis every 5 seconds.
      */
     public void startListening() {
+        lastThrottleStatus = checkWifiThrottling();
         this.scanWifiDataTimer = new Timer();
         this.scanWifiDataTimer.scheduleAtFixedRate(new scheduledWifiScan(), 0, SCAN_INTERVAL_MS);
     }
@@ -302,16 +306,34 @@ public class WifiDataProcessor implements Observable {
                     //Inform user to disable wifi throttling
                     showDebouncedToast("Disable Wi-Fi Throttling", Toast.LENGTH_SHORT);
                 }
+                lastThrottleStatus = throttleSetting;
                 return throttleSetting;
             } catch (Settings.SettingNotFoundException | SecurityException e) {
                 if (!sThrottleSettingWarned) {
                     Log.i(WIFI_CHECK_TAG, "wifi_scan_throttle_enabled not readable; status unknown.");
                     sThrottleSettingWarned = true;
                 }
+                lastThrottleStatus = -1;
                 return -1;
             }
         }
+        lastThrottleStatus = -1;
         return -1;
+    }
+
+    public long getMillisSinceLastResult() {
+        if (lastResultElapsedMs == 0L) {
+            return Long.MAX_VALUE;
+        }
+        return SystemClock.elapsedRealtime() - lastResultElapsedMs;
+    }
+
+    public boolean isScanFlowHealthy(long maxGapMs) {
+        return getMillisSinceLastResult() <= maxGapMs;
+    }
+
+    public int getLastThrottleStatus() {
+        return lastThrottleStatus;
     }
 
     private void showDebouncedToast(String message, int duration) {

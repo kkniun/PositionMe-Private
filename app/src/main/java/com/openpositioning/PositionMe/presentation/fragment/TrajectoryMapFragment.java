@@ -34,8 +34,11 @@ import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.utils.IndoorMapManager;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 
 public class TrajectoryMapFragment extends Fragment {
     private GoogleMap gMap;
@@ -46,6 +49,7 @@ public class TrajectoryMapFragment extends Fragment {
     private Polyline gnssPolyline;
     private LatLng lastGnssLocation;
     private LatLng pendingCameraPosition;
+    private final List<Marker> testPointMarkers = new ArrayList<>();
     private boolean hasPendingCameraMove;
     private boolean isRed = true;
     private boolean isGnssOn;
@@ -297,6 +301,34 @@ public class TrajectoryMapFragment extends Fragment {
         return currentLocation;
     }
 
+    @Nullable
+    public String getCurrentFloorLabel() {
+        if (indoorMapManager == null || indoorMapManager.getFloorCount() <= 0) {
+            return null;
+        }
+        return String.format(Locale.US, "F%d", indoorMapManager.getCurrentFloor() + 1);
+    }
+
+    public void addTestPointMarker(@NonNull LatLng location,
+                                   int index,
+                                   long absoluteTimestampMs,
+                                   long relativeTimestampMs) {
+        if (gMap == null) {
+            return;
+        }
+        String displayTime = new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
+                .format(new Date(absoluteTimestampMs));
+        Marker marker = gMap.addMarker(new MarkerOptions()
+                .position(location)
+                .title(getString(R.string.test_point_marker_title, index))
+                .snippet(getString(R.string.test_point_marker_snippet, displayTime, relativeTimestampMs))
+                .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE)));
+        if (marker != null) {
+            testPointMarkers.add(marker);
+            marker.showInfoWindow();
+        }
+    }
+
     public void updateGNSS(@NonNull LatLng gnssLocation) {
         if (gMap == null || !isGnssOn) {
             return;
@@ -354,6 +386,10 @@ public class TrajectoryMapFragment extends Fragment {
         }
         clearGNSS();
         currentLocation = null;
+        for (Marker marker : testPointMarkers) {
+            marker.remove();
+        }
+        testPointMarkers.clear();
 
         if (gMap != null) {
             polyline = gMap.addPolyline(new PolylineOptions().color(Color.RED).width(5f).add());

@@ -43,6 +43,10 @@ message Trajectory {
   SensorInfo proximity_info = 25;
 
   repeated GNSSPosition test_points = 26;
+  // Human-readable user-provided trajectory label.
+  string trajectory_name = 27;
+  // Venue selected during collection (if available).
+  string collection_venue = 28;
 
 }
 
@@ -176,6 +180,8 @@ message WiFiAPData {
   
   // Flag to indicate if the AP supports RTT measurements
   bool rtt_enabled = 4;
+  // Stable identifier for this AP record in exports.
+  string uuid = 5;
 }
 
 message BleData {

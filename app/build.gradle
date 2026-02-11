@@ -45,6 +45,10 @@ android {
                 "\"${secretsProperties.getProperty('MAPS_API_KEY') ?: ''}\""
         buildConfigField "String", "OPENPOSITIONING_API_KEY",
                 "\"${secretsProperties.getProperty('OPENPOSITIONING_API_KEY') ?: ''}\""
+        // New API path requires campaign in URL segment.
+        // Fall back to OPENPOSITIONING_MASTER_KEY for backward compatibility.
+        buildConfigField "String", "OPENPOSITIONING_CAMPAIGN",
+                "\"${secretsProperties.getProperty('OPENPOSITIONING_CAMPAIGN') ?: (secretsProperties.getProperty('OPENPOSITIONING_MASTER_KEY') ?: '')}\""
         buildConfigField "String", "OPENPOSITIONING_MASTER_KEY",
                 "\"${secretsProperties.getProperty('OPENPOSITIONING_MASTER_KEY') ?: ''}\""
     }

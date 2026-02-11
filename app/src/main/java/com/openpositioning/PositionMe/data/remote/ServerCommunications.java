@@ -86,18 +86,15 @@ public class ServerCommunications implements Observable {
     private List<Observer> observers;
 
     // Static constants necessary for communications
-    private static final String userKey = BuildConfig.OPENPOSITIONING_API_KEY;
-    private static final String masterKey = BuildConfig.OPENPOSITIONING_MASTER_KEY;
+    private static final String apiKey = BuildConfig.OPENPOSITIONING_API_KEY;
+    private static final String campaign = BuildConfig.OPENPOSITIONING_CAMPAIGN;
+    private static final String apiBase = "https://openpositioning.org/api/live";
     private static final String uploadURL =
-            "https://openpositioning.org/api/live/trajectory/upload/" + userKey
-                    + "/?key=" + masterKey;
+            apiBase + "/trajectory/upload/" + campaign + "/" + apiKey + "/";
     private static final String downloadURL =
-            "https://openpositioning.org/api/live/trajectory/download/" + userKey
-                    + "?skip=0&limit=30&key=" + masterKey;
+            apiBase + "/trajectory/download/" + apiKey;
     private static final String infoRequestURL =
-            "https://openpositioning.org/api/live/users/trajectories/" + userKey
-                    + "?key=" + masterKey;
-    private static final String PROTOCOL_CONTENT_TYPE = "multipart/form-data";
+            apiBase + "/users/trajectories/" + apiKey;
     private static final String PROTOCOL_ACCEPT_TYPE = "application/json";
 
 
@@ -128,6 +125,14 @@ public class ServerCommunications implements Observable {
      * @param trajectory    Traj object matching all the timing and formal restrictions.
      */
     public void sendTrajectory(Traj.Trajectory trajectory){
+        if (apiKey == null || apiKey.isEmpty() || campaign == null || campaign.isEmpty()) {
+            success = false;
+            infoResponse = "Upload failed: api_key/campaign is not configured in BuildConfig.";
+            new Handler(Looper.getMainLooper()).post(() ->
+                    Toast.makeText(context, infoResponse, Toast.LENGTH_SHORT).show());
+            notifyObservers(1);
+            return;
+        }
         logDataSize(trajectory);
 
         // Convert the trajectory to byte array
@@ -172,7 +177,7 @@ public class ServerCommunications implements Observable {
         if(this.isWifiConn || (enableMobileData && isMobileConn)) {
             // Instantiate client for HTTP requests
             OkHttpClient client = new OkHttpClient();
-            String venueTag = extractVenueFromTrajectoryId(trajectory.getTrajectoryId());
+            String venueTag = extractVenueTag(trajectory);
 
             // Creaet a equest body with a file to upload in multipart/form-data format
             RequestBody requestBody = new MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -184,7 +189,7 @@ public class ServerCommunications implements Observable {
             // Create a POST request with the required headers
             Request request = new Request.Builder().url(uploadURL).post(requestBody)
                     .addHeader("accept", PROTOCOL_ACCEPT_TYPE)
-                    .addHeader("Content-Type", PROTOCOL_CONTENT_TYPE).build();
+                    .build();
 
             // Enqueue the request to be executed asynchronously and handle the response
             client.newCall(request).enqueue(new Callback() {
@@ -220,7 +225,7 @@ public class ServerCommunications implements Observable {
 //                            System.err.println("POST error response: " + responseBody.string());
 
                             String errorBody = responseBody.string();
-                            infoResponse = "Upload failed: " + errorBody;
+                            infoResponse = "Upload failed (" + response.code() + "): " + errorBody;
                             new Handler(Looper.getMainLooper()).post(() ->
                                     Toast.makeText(context, infoResponse, Toast.LENGTH_SHORT).show()); // show error message to users
 
@@ -269,6 +274,17 @@ public class ServerCommunications implements Observable {
         }
     }
 
+    private String extractVenueTag(Traj.Trajectory trajectory) {
+        if (trajectory != null) {
+            String fromField = trajectory.getCollectionVenue();
+            if (fromField != null && !fromField.isEmpty()) {
+                return fromField;
+            }
+            return extractVenueFromTrajectoryId(trajectory.getTrajectoryId());
+        }
+        return "traj";
+    }
+
     private String extractVenueFromTrajectoryId(String trajectoryId) {
         if (trajectoryId == null || trajectoryId.isEmpty()) {
             return "traj";
@@ -287,34 +303,62 @@ public class ServerCommunications implements Observable {
      * @param localTrajectory the File object of the local trajectory to be uploaded
      */
     public void uploadLocalTrajectory(File localTrajectory) {
+        if (apiKey == null || apiKey.isEmpty() || campaign == null || campaign.isEmpty()) {
+            success = false;
+            infoResponse = "Upload failed: api_key/campaign is not configured in BuildConfig.";
+            new Handler(Looper.getMainLooper()).post(() ->
+                    Toast.makeText(context, infoResponse, Toast.LENGTH_SHORT).show());
+            notifyObservers(1);
+            return;
+        }
+        checkNetworkStatus();
+        boolean enableMobileData = this.settings.getBoolean("mobile_sync", false);
+        if (!(this.isWifiConn || (enableMobileData && this.isMobileConn))) {
+            success = false;
+            infoResponse = enableMobileData
+                    ? "No network connection available for upload."
+                    : "Upload requires Wi-Fi. Enable mobile sync in Settings if needed.";
+            new Handler(Looper.getMainLooper()).post(() ->
+                    Toast.makeText(context, infoResponse, Toast.LENGTH_SHORT).show());
+            notifyObservers(1);
+            return;
+        }
 
         // Instantiate client for HTTP requests
         OkHttpClient client = new OkHttpClient();
 
         // robustness improvement
+        byte[] fileBytes = null;
         RequestBody fileRequestBody;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        try {
+            fileBytes = Files.readAllBytes(localTrajectory.toPath());
+            fileRequestBody = RequestBody.create(MediaType.parse("application/octet-stream"), fileBytes);
+        } catch (IOException e) {
+            e.printStackTrace();
+            // if failed, use File object to construct RequestBody
+            fileRequestBody = RequestBody.create(MediaType.parse("application/octet-stream"), localTrajectory);
+        }
+
+        String venueTag = "traj";
+        if (fileBytes != null) {
             try {
-                byte[] fileBytes = Files.readAllBytes(localTrajectory.toPath());
-                fileRequestBody = RequestBody.create(MediaType.parse("text/plain"), fileBytes);
-            } catch (IOException e) {
-                e.printStackTrace();
-                // if failed, use File object to construct RequestBody
-                fileRequestBody = RequestBody.create(MediaType.parse("text/plain"), localTrajectory);
+                Traj.Trajectory parsedTrajectory = Traj.Trajectory.parseFrom(fileBytes);
+                venueTag = extractVenueTag(parsedTrajectory);
+            } catch (Exception ignored) {
+                // Fallback to default tag when local file cannot be parsed as protobuf.
             }
-        } else {
-            fileRequestBody = RequestBody.create(MediaType.parse("text/plain"), localTrajectory);
         }
 
         // Create request body with a file to upload in multipart/form-data format
         RequestBody requestBody = new MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("venue", venueTag)
                 .addFormDataPart("file", localTrajectory.getName(), fileRequestBody)
                 .build();
 
         // Create a POST request with the required headers
         okhttp3.Request request = new okhttp3.Request.Builder().url(uploadURL).post(requestBody)
                 .addHeader("accept", PROTOCOL_ACCEPT_TYPE)
-                .addHeader("Content-Type", PROTOCOL_CONTENT_TYPE).build();
+                .build();
 
         // Enqueue the request to be executed asynchronously and handle the response
         client.newCall(request).enqueue(new okhttp3.Callback() {
@@ -343,7 +387,7 @@ public class ServerCommunications implements Observable {
                         assert responseBody != null;
                         String errorBody = responseBody.string();
                         System.err.println("UPLOAD unsuccessful: " + errorBody);
-                        infoResponse = "Upload failed: " + errorBody;
+                        infoResponse = "Upload failed (" + response.code() + "): " + errorBody;
                         new Handler(Looper.getMainLooper()).post(() ->
                                 Toast.makeText(context, infoResponse, Toast.LENGTH_SHORT).show());
                         throw new IOException("UPLOAD failed with code " + response);

@@ -16,6 +16,20 @@
     <string name="show_storage">Show locally</string>
     <string name="setLocation">Set</string>
     <string name="cancel">Cancel</string>
+    <string name="skip">Skip</string>
+    <string name="add_test_point">Add Test Point</string>
+    <string name="test_point_added">Test point #%1$d added</string>
+    <string name="test_point_added_with_time">Test point #%1$d at %2$s</string>
+    <string name="test_point_unavailable">Current position unavailable</string>
+    <string name="test_point_time_none">Last test point: none</string>
+    <string name="test_point_time_format">Last test point: #%1$d at %2$s (+%3$d ms)</string>
+    <string name="test_point_marker_title">Test Point %1$d</string>
+    <string name="test_point_marker_snippet">Time: %1$s | +%2$d ms</string>
+    <string name="trajectory_name_title">Trajectory Name</string>
+    <string name="trajectory_name_message">Name this trajectory before recording.</string>
+    <string name="trajectory_name_hint">e.g. Murchison-GF-Loop1</string>
+    <string name="wifi_throttling_warning">Wi-Fi scan throttling appears enabled. Keep app in foreground and disable throttling in developer settings.</string>
+    <string name="wifi_scan_gap_warning">Wi-Fi scan results paused. Keep this screen foreground for stable fingerprint collection.</string>
 
     <!-- Sensors -->
     <string name="accelerometer">Accelerometer</string>

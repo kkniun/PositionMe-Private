@@ -1,14 +1,17 @@
 package com.openpositioning.PositionMe.presentation.fragment;
 
 import android.os.Bundle;
+import android.text.InputType;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.EditText;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.app.AlertDialog;
 import androidx.fragment.app.Fragment;
 
 import com.google.android.gms.maps.CameraUpdateFactory;
@@ -169,13 +172,8 @@ public class StartLocationFragment extends Fragment {
 
                 // If the Activity is RecordingActivity
                 if (requireActivity() instanceof RecordingActivity) {
-                    // Start sensor recording + set the start location
-                    sensorFusion.setCollectionVenue(null);
-                    sensorFusion.startRecording();
                     sensorFusion.setStartGNSSLatitude(startPosition);
-
-                    // Now switch to the recording screen
-                    ((RecordingActivity) requireActivity()).showRecordingScreen();
+                    promptTrajectoryNameAndStartRecording();
 
                     // If the Activity is ReplayActivity
                 } else if (requireActivity() instanceof ReplayActivity) {
@@ -190,6 +188,34 @@ public class StartLocationFragment extends Fragment {
                 }
             }
         });
+    }
+
+    private void promptTrajectoryNameAndStartRecording() {
+        EditText nameInput = new EditText(requireContext());
+        nameInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        nameInput.setHint(getString(R.string.trajectory_name_hint));
+        String currentName = sensorFusion.getTrajectoryName();
+        if (currentName != null && !currentName.isEmpty()) {
+            nameInput.setText(currentName);
+            nameInput.setSelection(currentName.length());
+        }
+
+        new AlertDialog.Builder(requireContext())
+                .setTitle(R.string.trajectory_name_title)
+                .setMessage(R.string.trajectory_name_message)
+                .setView(nameInput)
+                .setNegativeButton(R.string.skip, (dialog, which) -> startRecordingWithName(""))
+                .setPositiveButton(R.string.start_recording, (dialog, which) ->
+                        startRecordingWithName(nameInput.getText().toString()))
+                .setCancelable(false)
+                .show();
+    }
+
+    private void startRecordingWithName(@Nullable String name) {
+        sensorFusion.setCollectionVenue(null);
+        sensorFusion.setTrajectoryName(name);
+        sensorFusion.startRecording();
+        ((RecordingActivity) requireActivity()).showRecordingScreen();
     }
 
     /**

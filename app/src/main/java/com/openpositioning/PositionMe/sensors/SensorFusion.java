@@ -14,6 +14,7 @@ import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.preference.PreferenceManager;
 
 import com.google.android.gms.maps.model.LatLng;
@@ -120,6 +121,7 @@ public class SensorFusion implements SensorEventListener, Observer {
 
     // Settings
     private boolean saveRecording;
+    private boolean listening;
     private float filter_coefficient;
     // Variables to help with timed events
     private long absoluteStartTime;
@@ -150,12 +152,14 @@ public class SensorFusion implements SensorEventListener, Observer {
     // Location values
     private float latitude;
     private float longitude;
+    private float altitude;
     private float[] startLocation;
     // Wifi values
     private List<Wifi> wifiList;
     private Set<Long> recordedApMacs = new HashSet<>();
     private String lastFingerprintSignature;
     private String collectionVenue = DEFAULT_COLLECTION_VENUE;
+    private String trajectoryName = "";
 
 
     // Over time accelerometer magnitude values since last step
@@ -252,6 +256,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.bootTime = SystemClock.uptimeMillis();
         // Initialise saveRecording to false
         this.saveRecording = false;
+        this.listening = false;
 
         // Other initialisations...
         this.accelMagnitude = new ArrayList<>();
@@ -451,9 +456,9 @@ public class SensorFusion implements SensorEventListener, Observer {
             //Toast.makeText(context, "Location Changed", Toast.LENGTH_SHORT).show();
             latitude = (float) location.getLatitude();
             longitude = (float) location.getLongitude();
-            float altitude = (float) location.getAltitude();
-            float accuracy = (float) location.getAccuracy();
-            float speed = (float) location.getSpeed();
+            altitude = (float) location.getAltitude();
+            float accuracy = location.getAccuracy();
+            float speed = location.getSpeed();
             String provider = location.getProvider();
             if(saveRecording) {
                 long relativeTimestamp = System.currentTimeMillis() - absoluteStartTime;
@@ -487,17 +492,40 @@ public class SensorFusion implements SensorEventListener, Observer {
      */
     @Override
     public void update(Object[] wifiList) {
+        if (wifiList == null || wifiList.length == 0) {
+            this.wifiList = new ArrayList<>();
+            return;
+        }
+
         // Save newest wifi values to local variable
-        this.wifiList = Stream.of(wifiList).map(o -> (Wifi) o).collect(Collectors.toList());
+        this.wifiList = Stream.of(wifiList)
+                .filter(o -> o instanceof Wifi)
+                .map(o -> (Wifi) o)
+                .collect(Collectors.toList());
+        if (this.wifiList.isEmpty()) {
+            return;
+        }
 
         if(this.saveRecording) {
             List<Wifi> sortedWifi = new ArrayList<>(this.wifiList);
-            sortedWifi.sort((a, b) -> Long.compare(a.getBssid(), b.getBssid()));
+            sortedWifi.sort((a, b) -> {
+                int byMac = Long.compare(a.getBssid(), b.getBssid());
+                if (byMac != 0) {
+                    return byMac;
+                }
+                int byRssi = Integer.compare(a.getLevel(), b.getLevel());
+                if (byRssi != 0) {
+                    return byRssi;
+                }
+                return Long.compare(a.getFrequency(), b.getFrequency());
+            });
             StringBuilder signatureBuilder = new StringBuilder();
             for (Wifi data : sortedWifi) {
                 signatureBuilder.append(data.getBssid())
                         .append(':')
                         .append(data.getLevel())
+                        .append(':')
+                        .append(data.getFrequency())
                         .append(';');
             }
             String fingerprintSignature = signatureBuilder.toString();
@@ -511,7 +539,12 @@ public class SensorFusion implements SensorEventListener, Observer {
                     .setRelativeTimestamp(sampleTimestamp);
 
             if (!isDuplicateFingerprint) {
+                Set<String> scanKeys = new HashSet<>();
                 for (Wifi data : this.wifiList) {
+                    String scanKey = data.getBssid() + ":" + data.getLevel() + ":" + data.getFrequency();
+                    if (!scanKeys.add(scanKey)) {
+                        continue;
+                    }
                     fingerprint.addRfScans(Traj.RFScan.newBuilder()
                             .setRelativeTimestamp(sampleTimestamp)
                             .setMac(data.getBssid())
@@ -532,18 +565,21 @@ public class SensorFusion implements SensorEventListener, Observer {
                         if (frequency <= 0) {
                             frequency = 0; // unknown
                         }
+                        String uuid = buildWifiUuid(data.getBssid());
                         Traj.WiFiAPData.Builder apData = Traj.WiFiAPData.newBuilder()
                                 .setMac(data.getBssid())
                                 .setSsid(ssid)
                                 .setFrequency(frequency)
-                                .setRttEnabled(rttCapable);
+                                .setRttEnabled(rttCapable)
+                                .setUuid(uuid);
                         trajectory.addApsData(apData);
                         recordedApMacs.add(data.getBssid());
                         String freqLabel = (frequency == 0) ? "0(unknown)" : String.valueOf(frequency);
                         Log.d("SensorFusion", "AP data added: bssid=" + data.getBssid()
                                 + " ssid=" + ssid
                                 + " freq=" + freqLabel
-                                + " rtt=" + rttCapable);
+                                + " rtt=" + rttCapable
+                                + " uuid=" + uuid);
                     }
                 }
                 // Adding WiFi fingerprint data to Trajectory
@@ -725,7 +761,62 @@ public class SensorFusion implements SensorEventListener, Observer {
      * @param startPosition contains the initial location set by the user
      */
     public void setStartGNSSLatitude(float[] startPosition){
-        startLocation = startPosition;
+        if (startPosition == null || startPosition.length < 2) {
+            return;
+        }
+        startLocation = new float[]{startPosition[0], startPosition[1]};
+    }
+
+    public synchronized void setTrajectoryName(@Nullable String proposedName) {
+        if (proposedName == null) {
+            this.trajectoryName = "";
+            if (this.trajectory != null) {
+                this.trajectory.setTrajectoryName("");
+            }
+            return;
+        }
+
+        String normalised = proposedName.trim()
+                .replaceAll("[\\r\\n\\t]+", " ")
+                .replaceAll("\\s{2,}", " ");
+        this.trajectoryName = normalised;
+        if (this.trajectory != null) {
+            this.trajectory.setTrajectoryName(normalised);
+        }
+    }
+
+    @NonNull
+    public synchronized String getTrajectoryName() {
+        return trajectoryName;
+    }
+
+    public synchronized long addTestPoint(@NonNull LatLng location, @Nullable String floorLabel) {
+        return addTestPoint(location, floorLabel, System.currentTimeMillis());
+    }
+
+    public synchronized long addTestPoint(@NonNull LatLng location,
+                                          @Nullable String floorLabel,
+                                          long absoluteTimestampMs) {
+        if (this.trajectory == null || !this.saveRecording) {
+            return -1L;
+        }
+
+        long relativeTimestamp = Math.max(0L, absoluteTimestampMs - absoluteStartTime);
+        Traj.GNSSPosition.Builder pointBuilder = Traj.GNSSPosition.newBuilder()
+                .setRelativeTimestamp(relativeTimestamp)
+                .setLatitude(location.latitude)
+                .setLongitude(location.longitude)
+                .setAltitude(altitude);
+
+        if (floorLabel != null) {
+            String cleanFloor = floorLabel.trim();
+            if (!cleanFloor.isEmpty()) {
+                pointBuilder.setFloor(cleanFloor);
+            }
+        }
+
+        this.trajectory.addTestPoints(pointBuilder);
+        return relativeTimestamp;
     }
 
     public synchronized void setCollectionVenue(String venueId) {
@@ -733,6 +824,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         if (this.trajectory == null) {
             return;
         }
+        this.trajectory.setCollectionVenue(this.collectionVenue);
         String existingId = this.trajectory.getTrajectoryId();
         String suffix;
         String[] parts = existingId.split("_", 3);
@@ -763,6 +855,11 @@ public class SensorFusion implements SensorEventListener, Observer {
             return DEFAULT_COLLECTION_VENUE;
         }
         return normalised;
+    }
+
+    @NonNull
+    private String buildWifiUuid(long macAsLong) {
+        return "wifi-" + Long.toUnsignedString(macAsLong);
     }
 
 
@@ -825,6 +922,24 @@ public class SensorFusion implements SensorEventListener, Observer {
      */
     public List<Wifi> getWifiList() {
         return this.wifiList;
+    }
+
+    public boolean isWifiScanHealthy() {
+        return wifiProcessor != null && wifiProcessor.isScanFlowHealthy(15_000L);
+    }
+
+    public long getWifiScanGapMs() {
+        if (wifiProcessor == null) {
+            return Long.MAX_VALUE;
+        }
+        return wifiProcessor.getMillisSinceLastResult();
+    }
+
+    public int getWifiThrottleStatus() {
+        if (wifiProcessor == null) {
+            return -1;
+        }
+        return wifiProcessor.getLastThrottleStatus();
     }
 
     /**
@@ -905,6 +1020,9 @@ public class SensorFusion implements SensorEventListener, Observer {
      * @see GNSSDataProcessor handles location data.
      */
     public void resumeListening() {
+        if (listening) {
+            return;
+        }
         accelerometerSensor.sensorManager.registerListener(this, accelerometerSensor.sensor, 10000, (int) maxReportLatencyNs);
         accelerometerSensor.sensorManager.registerListener(this, linearAccelerationSensor.sensor, 10000, (int) maxReportLatencyNs);
         accelerometerSensor.sensorManager.registerListener(this, gravitySensor.sensor, 10000, (int) maxReportLatencyNs);
@@ -917,6 +1035,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         rotationSensor.sensorManager.registerListener(this, rotationSensor.sensor, (int) 1e6);
         wifiProcessor.startListening();
         gnssProcessor.startLocationUpdates();
+        listening = true;
     }
 
     /**
@@ -929,6 +1048,9 @@ public class SensorFusion implements SensorEventListener, Observer {
      * @see GNSSDataProcessor handles location data.
      */
     public void stopListening() {
+        if (!listening) {
+            return;
+        }
         if(!saveRecording) {
             // Unregister sensor-manager based devices
             accelerometerSensor.sensorManager.unregisterListener(this);
@@ -950,6 +1072,7 @@ public class SensorFusion implements SensorEventListener, Observer {
             }
             // Stop receiving location updates
             this.gnssProcessor.stopUpdating();
+            listening = false;
         }
     }
 
@@ -962,6 +1085,9 @@ public class SensorFusion implements SensorEventListener, Observer {
      * @see Traj object for storing data.
      */
     public void startRecording() {
+        if (!listening) {
+            resumeListening();
+        }
         // If wakeLock is null (e.g. not initialized or was cleared), reinitialize it.
         if (wakeLock == null) {
             PowerManager powerManager = (PowerManager) this.appContext.getSystemService(Context.POWER_SERVICE);
@@ -971,6 +1097,8 @@ public class SensorFusion implements SensorEventListener, Observer {
 
         this.saveRecording = true;
         this.stepCounter = 0;
+        this.lastStepTime = 0L;
+        this.accelMagnitude.clear();
         this.absoluteStartTime = System.currentTimeMillis();
         this.bootTime = SystemClock.uptimeMillis();
         String venueOrBuilding = sanitiseVenueTag(collectionVenue);
@@ -978,18 +1106,34 @@ public class SensorFusion implements SensorEventListener, Observer {
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmm", Locale.getDefault()).format(new Date());
         String shortUuid = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         String trajectoryId = venueOrBuilding + "_" + timestamp + "_" + shortUuid;
+        if (trajectoryName == null || trajectoryName.trim().isEmpty()) {
+            trajectoryName = "trajectory_" + timestamp;
+        }
 
         // Protobuf trajectory class for sending sensor data to restful API
         this.trajectory = Traj.Trajectory.newBuilder()
                 .setTrajectoryId(trajectoryId)
+                .setTrajectoryName(trajectoryName)
                 .setTrajectoryVersion(2.0f)
                 .setAndroidVersion(Build.VERSION.RELEASE)
                 .setStartTimestamp(absoluteStartTime)
+                .setCollectionVenue(this.collectionVenue)
                 .setAccelerometerInfo(createInfoBuilder(accelerometerSensor))
                 .setGyroscopeInfo(createInfoBuilder(gyroscopeSensor))
+                .setRotationVectorInfo(createInfoBuilder(rotationSensor))
                 .setMagnetometerInfo(createInfoBuilder(magnetometerSensor))
                 .setBarometerInfo(createInfoBuilder(barometerSensor))
-                .setLightSensorInfo(createInfoBuilder(lightSensor));
+                .setLightSensorInfo(createInfoBuilder(lightSensor))
+                .setProximityInfo(createInfoBuilder(proximitySensor));
+
+        Traj.GNSSPosition.Builder initialPosition = Traj.GNSSPosition.newBuilder()
+                .setRelativeTimestamp(0L)
+                .setLatitude(resolveStartLatitude())
+                .setLongitude(resolveStartLongitude())
+                .setAltitude(altitude);
+        this.trajectory.setInitialPosition(initialPosition);
+
+        addInitialImuSnapshot();
 
         this.recordedApMacs = new HashSet<>();
         this.lastFingerprintSignature = null;
@@ -1040,6 +1184,55 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.serverCommunications.sendTrajectory(sentTrajectory);
     }
 
+    private double resolveStartLatitude() {
+        if (startLocation != null && startLocation.length >= 2) {
+            if (startLocation[0] != 0f || startLocation[1] != 0f) {
+                return startLocation[0];
+            }
+        }
+        return latitude;
+    }
+
+    private double resolveStartLongitude() {
+        if (startLocation != null && startLocation.length >= 2) {
+            if (startLocation[0] != 0f || startLocation[1] != 0f) {
+                return startLocation[1];
+            }
+        }
+        return longitude;
+    }
+
+    private void addInitialImuSnapshot() {
+        if (trajectory == null) {
+            return;
+        }
+        Traj.Vector3 accVector = Traj.Vector3.newBuilder()
+                .setX(acceleration[0])
+                .setY(acceleration[1])
+                .setZ(acceleration[2])
+                .build();
+
+        Traj.Vector3 gyrVector = Traj.Vector3.newBuilder()
+                .setX(angularVelocity[0])
+                .setY(angularVelocity[1])
+                .setZ(angularVelocity[2])
+                .build();
+
+        Traj.Quaternion rotationQuat = Traj.Quaternion.newBuilder()
+                .setX(rotation[0])
+                .setY(rotation[1])
+                .setZ(rotation[2])
+                .setW(rotation[3])
+                .build();
+
+        trajectory.addImuData(Traj.IMUReading.newBuilder()
+                .setRelativeTimestamp(0L)
+                .setAcc(accVector)
+                .setGyr(gyrVector)
+                .setRotationVector(rotationQuat)
+                .setStepCount(stepCounter));
+    }
+
     /**
      * Creates a {@link Traj.SensorInfo} objects from the specified sensor's data.
      *
@@ -1056,7 +1249,9 @@ public class SensorFusion implements SensorEventListener, Observer {
                 .setResolution(sensor.sensorInfo.getResolution())
                 .setPower(sensor.sensorInfo.getPower())
                 .setVersion(sensor.sensorInfo.getVersion())
-                .setType(sensor.sensorInfo.getType());
+                .setType(sensor.sensorInfo.getType())
+                .setMaxRange(sensor.sensorInfo.getMaxRange())
+                .setFrequency(sensor.sensorInfo.getFrequency());
     }
 
     /**
@@ -1118,7 +1313,19 @@ public class SensorFusion implements SensorEventListener, Observer {
                             .addLightData(Traj.LightReading.newBuilder()
                                     .setLight(light)
                                     .setRelativeTimestamp(timestamp)
+                                    .build())
+                            .addProximityData(Traj.ProximityReading.newBuilder()
+                                    .setDistance(proximity)
+                                    .setRelativeTimestamp(timestamp)
                                     .build());
+                }
+
+                if (wifiProcessor != null && !wifiProcessor.isScanFlowHealthy(15_000L)) {
+                    Log.w("SensorFusion", "WiFi scan gap detected: " + wifiProcessor.getMillisSinceLastResult()
+                            + "ms since last scan result");
+                }
+                if (wifiProcessor != null && wifiProcessor.getLastThrottleStatus() == 1) {
+                    Log.w("SensorFusion", "WiFi throttling appears enabled; scan cadence may degrade.");
                 }
 
                 // Divide the timer for storing AP data every 5 seconds
@@ -1126,11 +1333,15 @@ public class SensorFusion implements SensorEventListener, Observer {
                     secondCounter = 0;
                     //Current Wifi Object
                     Wifi currentWifi = wifiProcessor.getCurrentWifiData();
-                    trajectory.addApsData(Traj.WiFiAPData.newBuilder()
-                            .setMac(currentWifi.getBssid())
-                            .setSsid(currentWifi.getSsid())
-                            .setFrequency(currentWifi.getFrequency())
-                            .setRttEnabled(currentWifi.isRttSupported()));
+                    if (currentWifi.getBssid() > 0 && !recordedApMacs.contains(currentWifi.getBssid())) {
+                        trajectory.addApsData(Traj.WiFiAPData.newBuilder()
+                                .setMac(currentWifi.getBssid())
+                                .setSsid(currentWifi.getSsid())
+                                .setFrequency(currentWifi.getFrequency())
+                                .setRttEnabled(currentWifi.isRttSupported())
+                                .setUuid(buildWifiUuid(currentWifi.getBssid())));
+                        recordedApMacs.add(currentWifi.getBssid());
+                    }
                 }
                 else {
                     secondCounter++;

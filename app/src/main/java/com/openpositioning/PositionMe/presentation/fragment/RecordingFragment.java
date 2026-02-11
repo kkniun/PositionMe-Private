@@ -18,6 +18,7 @@ import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.ProgressBar;
 import android.widget.TextView;
+import android.widget.Toast;
 import com.google.android.material.button.MaterialButton;
 
 import androidx.annotation.NonNull;
@@ -31,6 +32,10 @@ import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.sensors.SensorTypes;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
 import com.google.android.gms.maps.model.LatLng;
+
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 
 
 /**
@@ -59,10 +64,10 @@ import com.google.android.gms.maps.model.LatLng;
 public class RecordingFragment extends Fragment {
 
     // UI elements
-    private MaterialButton completeButton, cancelButton;
+    private MaterialButton completeButton, cancelButton, markPointButton;
     private ImageView recIcon;
     private ProgressBar timeRemaining;
-    private TextView elevation, distanceTravelled, gnssError;
+    private TextView elevation, distanceTravelled, gnssError, testPointTimeView;
 
     // App settings
     private SharedPreferences settings;
@@ -79,6 +84,8 @@ public class RecordingFragment extends Fragment {
 
     // References to the child map fragment
     private TrajectoryMapFragment trajectoryMapFragment;
+    private int testPointCounter = 0;
+    private long lastWifiWarningMs = 0L;
 
     private final Runnable refreshDataTask = new Runnable() {
         @Override
@@ -134,9 +141,11 @@ public class RecordingFragment extends Fragment {
         elevation = view.findViewById(R.id.currentElevation);
         distanceTravelled = view.findViewById(R.id.currentDistanceTraveled);
         gnssError = view.findViewById(R.id.gnssError);
+        testPointTimeView = view.findViewById(R.id.testPointTimeView);
 
         completeButton = view.findViewById(R.id.stopButton);
         cancelButton = view.findViewById(R.id.cancelButton);
+        markPointButton = view.findViewById(R.id.markPointButton);
         recIcon = view.findViewById(R.id.redDot);
         timeRemaining = view.findViewById(R.id.timeRemainingBar);
 
@@ -144,6 +153,7 @@ public class RecordingFragment extends Fragment {
         gnssError.setVisibility(View.GONE);
         elevation.setText(getString(R.string.elevation, "0"));
         distanceTravelled.setText(getString(R.string.meter, "0"));
+        testPointTimeView.setText(getString(R.string.test_point_time_none));
 
         // Buttons
         completeButton.setOnClickListener(v -> {
@@ -154,6 +164,8 @@ public class RecordingFragment extends Fragment {
             // Show Correction screen
             ((RecordingActivity) requireActivity()).showCorrectionScreen();
         });
+
+        markPointButton.setOnClickListener(v -> addTestPoint());
 
 
         // Cancel button with confirmation dialog
@@ -271,6 +283,70 @@ public class RecordingFragment extends Fragment {
         // Update previous
         previousPosX = pdrValues[0];
         previousPosY = pdrValues[1];
+
+        if (!sensorFusion.isWifiScanHealthy()) {
+            long now = System.currentTimeMillis();
+            if (now - lastWifiWarningMs > 20_000L) {
+                int throttle = sensorFusion.getWifiThrottleStatus();
+                if (throttle == 1) {
+                    Toast.makeText(requireContext(), R.string.wifi_throttling_warning, Toast.LENGTH_LONG).show();
+                } else {
+                    Toast.makeText(requireContext(), R.string.wifi_scan_gap_warning, Toast.LENGTH_LONG).show();
+                }
+                lastWifiWarningMs = now;
+            }
+        }
+    }
+
+    private void addTestPoint() {
+        if (trajectoryMapFragment == null) {
+            return;
+        }
+
+        LatLng markerLocation = trajectoryMapFragment.getCurrentLocation();
+        if (markerLocation == null) {
+            float[] startLatLng = sensorFusion.getGNSSLatitude(true);
+            if (startLatLng != null) {
+                if (!(startLatLng[0] == 0f && startLatLng[1] == 0f)) {
+                    markerLocation = new LatLng(startLatLng[0], startLatLng[1]);
+                }
+            }
+        }
+
+        if (markerLocation == null) {
+            Toast.makeText(requireContext(), R.string.test_point_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        long clickTimestampMs = System.currentTimeMillis();
+        int nextIndex = testPointCounter + 1;
+        long relativeTimestampMs = sensorFusion.addTestPoint(
+                markerLocation,
+                trajectoryMapFragment.getCurrentFloorLabel(),
+                clickTimestampMs
+        );
+        if (relativeTimestampMs < 0L) {
+            Toast.makeText(requireContext(), R.string.test_point_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        testPointCounter = nextIndex;
+        trajectoryMapFragment.addTestPointMarker(
+                markerLocation,
+                nextIndex,
+                clickTimestampMs,
+                relativeTimestampMs
+        );
+        String displayTime = new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
+                .format(new Date(clickTimestampMs));
+        testPointTimeView.setText(getString(
+                R.string.test_point_time_format,
+                nextIndex,
+                displayTime,
+                relativeTimestampMs
+        ));
+        Toast.makeText(requireContext(),
+                getString(R.string.test_point_added_with_time, nextIndex, displayTime),
+                Toast.LENGTH_SHORT).show();
     }
 
     /**
