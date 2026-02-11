@@ -12,7 +12,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 /**
  * Class for creating and handling POST requests for obtaining the current position using
- * WiFi positioning API from https://openpositioning.org/api/position/fine
+ * WiFi positioning API from https://openpositioning.org/api/live/position/fine
  *
  * The class creates POST requests based on WiFi fingerprints and obtains the user's location
  *
@@ -30,8 +30,9 @@ import org.json.JSONObject;
 public class WiFiPositioning {
     // Queue for storing the POST requests made
     private RequestQueue requestQueue;
-    // URL for WiFi positioning API
-    private static final String url="https://openpositioning.org/api/position/fine";
+    // Primary + fallback URL for WiFi positioning API
+    private static final String LIVE_URL = "https://openpositioning.org/api/live/position/fine";
+    private static final String LEGACY_URL = "https://openpositioning.org/api/position/fine";
 
     /**
      * Getter for the WiFi positioning coordinates obtained using openpositioning API
@@ -69,7 +70,7 @@ public class WiFiPositioning {
 
     /**
      * Creates a POST request using the WiFi fingerprint to obtain user's location
-     * The POST request is issued to https://openpositioning.org/api/position/fine
+     * The POST request is issued to https://openpositioning.org/api/live/position/fine
      * (the openpositioning API) with the WiFI fingerprint passed as the parameter.
      *
      * The response of the post request returns the coordinates of the WiFi position
@@ -81,45 +82,13 @@ public class WiFiPositioning {
      * @param jsonWifiFeatures WiFi Fingerprint from device
      */
     public void request(JSONObject jsonWifiFeatures) {
-        // Creating the POST request using WiFi fingerprint (a JSON object)
-        JsonObjectRequest jsonObjectRequest = new JsonObjectRequest(
-                Request.Method.POST, url, jsonWifiFeatures,
-                // Parses the response to obtain the WiFi location and WiFi floor
-                response -> {
-                    try {
-                            wifiLocation = new LatLng(response.getDouble("lat"),response.getDouble("lon"));
-                            floor = response.getInt("floor");
-                    } catch (JSONException e) {
-                        // Error log to keep record of errors (for secure programming and maintainability)
-                        Log.e("jsonErrors","Error parsing response: "+e.getMessage()+" "+ response);
-                    }
-                },
-                // Handles the errors obtained from the POST request
-                error -> {
-                    // Validation Error
-                    if (error.networkResponse!=null && error.networkResponse.statusCode==422){
-                        Log.e("WiFiPositioning", "Validation Error "+ error.getMessage());
-                    }
-                    // Other Errors
-                    else{
-                        // When Response code is available
-                        if (error.networkResponse!=null) {
-                            Log.e("WiFiPositioning","Response Code: " + error.networkResponse.statusCode + ", " + error.getMessage());
-                        }
-                        else{
-                            Log.e("WiFiPositioning","Error message: " + error.getMessage());
-                        }
-                    }
-                }
-        );
-        // Adds the request to the request queue
-        requestQueue.add(jsonObjectRequest);
+        enqueuePositionRequest(jsonWifiFeatures, null, false);
     }
 
 
     /**
      * Creates a POST request using the WiFi fingerprint to obtain user's location
-     * The POST request is issued to https://openpositioning.org/api/position/fine
+     * The POST request is issued to https://openpositioning.org/api/live/position/fine
      * (the openpositioning API) with the WiFI fingerprint passed as the parameter.
      *
      * The response of the post request returns the coordinates of the WiFi position
@@ -132,42 +101,65 @@ public class WiFiPositioning {
      * @param callback callback function to allow user to use location when ready
      */
     public void request( JSONObject jsonWifiFeatures, final VolleyCallback callback) {
-        // Creating the POST request using WiFi fingerprint (a JSON object)
+        enqueuePositionRequest(jsonWifiFeatures, callback, false);
+    }
+
+    private void enqueuePositionRequest(JSONObject jsonWifiFeatures,
+                                        VolleyCallback callback,
+                                        boolean useLegacyEndpoint) {
+        String requestUrl = useLegacyEndpoint ? LEGACY_URL : LIVE_URL;
         JsonObjectRequest jsonObjectRequest = new JsonObjectRequest(
-                Request.Method.POST, url, jsonWifiFeatures,
-                response -> {
-                    try {
-                        Log.d("jsonObject",response.toString());
-                        wifiLocation = new LatLng(response.getDouble("lat"),response.getDouble("lon"));
-                        floor = response.getInt("floor");
-                        callback.onSuccess(wifiLocation,floor);
-                    } catch (JSONException e) {
-                        Log.e("jsonErrors","Error parsing response: "+e.getMessage()+" "+ response);
-                        callback.onError("Error parsing response: " + e.getMessage());
-                    }
-                },
+                Request.Method.POST, requestUrl, jsonWifiFeatures,
+                response -> parseSuccessResponse(response, callback),
                 error -> {
-                    // Validation Error
-                    if (error.networkResponse!=null && error.networkResponse.statusCode==422){
-                        Log.e("WiFiPositioning", "Validation Error "+ error.getMessage());
-                        callback.onError( "Validation Error (422): "+ error.getMessage());
+                    int statusCode = error.networkResponse == null ? -1 : error.networkResponse.statusCode;
+                    if (!useLegacyEndpoint && statusCode == 404) {
+                        Log.w("WiFiPositioning", "Live endpoint returned 404, retrying legacy endpoint.");
+                        enqueuePositionRequest(jsonWifiFeatures, callback, true);
+                        return;
                     }
-                    // Other Errors
-                    else{
-                        // When Response code is available
-                        if (error.networkResponse!=null) {
-                            Log.e("WiFiPositioning","Response Code: " + error.networkResponse.statusCode + ", " + error.getMessage());
-                            callback.onError("Response Code: " + error.networkResponse.statusCode + ", " + error.getMessage());
-                        }
-                        else{
-                            Log.e("WiFiPositioning","Error message: " + error.getMessage());
-                            callback.onError("Error message: " + error.getMessage());
-                        }
-                    }
+                    handleRequestError(error, callback);
                 }
         );
-        // Adds the request to the request queue
         requestQueue.add(jsonObjectRequest);
+    }
+
+    private void parseSuccessResponse(JSONObject response, VolleyCallback callback) {
+        try {
+            wifiLocation = new LatLng(response.getDouble("lat"), response.getDouble("lon"));
+            floor = response.getInt("floor");
+            if (callback != null) {
+                callback.onSuccess(wifiLocation, floor);
+            }
+        } catch (JSONException e) {
+            Log.e("jsonErrors", "Error parsing response: " + e.getMessage() + " " + response);
+            if (callback != null) {
+                callback.onError("Error parsing response: " + e.getMessage());
+            }
+        }
+    }
+
+    private void handleRequestError(com.android.volley.VolleyError error, VolleyCallback callback) {
+        if (error.networkResponse != null && error.networkResponse.statusCode == 422) {
+            Log.e("WiFiPositioning", "Validation Error " + error.getMessage());
+            if (callback != null) {
+                callback.onError("Validation Error (422): " + error.getMessage());
+            }
+            return;
+        }
+
+        if (error.networkResponse != null) {
+            Log.e("WiFiPositioning", "Response Code: " + error.networkResponse.statusCode + ", " + error.getMessage());
+            if (callback != null) {
+                callback.onError("Response Code: " + error.networkResponse.statusCode + ", " + error.getMessage());
+            }
+            return;
+        }
+
+        Log.e("WiFiPositioning", "Error message: " + error.getMessage());
+        if (callback != null) {
+            callback.onError("Error message: " + error.getMessage());
+        }
     }
 
     /**

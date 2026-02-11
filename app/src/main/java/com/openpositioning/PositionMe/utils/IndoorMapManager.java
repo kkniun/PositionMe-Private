@@ -22,6 +22,7 @@ import com.google.android.gms.maps.model.LatLng;
 import com.google.android.gms.maps.model.LatLngBounds;
 import com.google.android.gms.maps.model.Polygon;
 import com.google.android.gms.maps.model.PolygonOptions;
+import com.openpositioning.PositionMe.BuildConfig;
 import com.openpositioning.PositionMe.sensors.Wifi;
 
 import org.json.JSONArray;
@@ -33,12 +34,15 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 import okhttp3.Call;
 import okhttp3.Callback;
+import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -48,7 +52,10 @@ import okhttp3.ResponseBody;
 
 public class IndoorMapManager {
     private static final String TAG = "IndoorMapManager";
-    private static final String FLOORPLAN_REQUEST_URL = "https://openpositioning.org/api/live/floorplan/request";
+    private static final String FLOORPLAN_REQUEST_BASE_URL =
+            "https://openpositioning.org/api/live/floorplan/request";
+    private static final String FLOORPLAN_API_KEY = BuildConfig.OPENPOSITIONING_API_KEY;
+    private static final int MAX_APS_IN_REQUEST = 20;
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
     private static final long REQUEST_INTERVAL_MS = 8_000L;
     private static final float REQUEST_DISTANCE_M = 8f;
@@ -103,6 +110,10 @@ public class IndoorMapManager {
         if (location == null || requestInFlight) {
             return;
         }
+        if (TextUtils.isEmpty(FLOORPLAN_API_KEY)) {
+            Log.w(TAG, "OPENPOSITIONING_API_KEY is empty; skipping nearby floorplan request.");
+            return;
+        }
         long now = System.currentTimeMillis();
         if (lastRequestLocation != null) {
             if (now - lastRequestTs < REQUEST_INTERVAL_MS
@@ -119,12 +130,18 @@ public class IndoorMapManager {
             return;
         }
 
+        HttpUrl requestUrl = buildFloorplanRequestUrl();
+        if (requestUrl == null) {
+            Log.e(TAG, "Cannot build floorplan request URL.");
+            return;
+        }
+
         requestInFlight = true;
         lastRequestTs = now;
         lastRequestLocation = location;
 
         Request request = new Request.Builder()
-                .url(FLOORPLAN_REQUEST_URL)
+                .url(requestUrl)
                 .post(RequestBody.create(payload.toString(), JSON))
                 .addHeader("accept", "application/json")
                 .build();
@@ -139,8 +156,14 @@ public class IndoorMapManager {
             @Override
             public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
                 try (ResponseBody body = response.body()) {
-                    if (!response.isSuccessful() || body == null) {
-                        Log.w(TAG, "Nearby floorplan request not successful: " + response.code());
+                    if (!response.isSuccessful()) {
+                        String errorBody = body == null ? "" : body.string();
+                        Log.w(TAG, "Nearby floorplan request not successful: "
+                                + response.code() + " body=" + errorBody);
+                        return;
+                    }
+                    if (body == null) {
+                        Log.w(TAG, "Nearby floorplan request returned empty body");
                         return;
                     }
                     List<VenueModel> venues = parseVenueResponse(body.string());
@@ -152,6 +175,20 @@ public class IndoorMapManager {
                 }
             }
         });
+    }
+
+    @Nullable
+    private HttpUrl buildFloorplanRequestUrl() {
+        if (TextUtils.isEmpty(FLOORPLAN_API_KEY)) {
+            return null;
+        }
+        HttpUrl url = HttpUrl.parse(FLOORPLAN_REQUEST_BASE_URL + "/" + FLOORPLAN_API_KEY);
+        if (url == null) {
+            return null;
+        }
+        return url.newBuilder()
+                .addQueryParameter("key", FLOORPLAN_API_KEY)
+                .build();
     }
 
     public boolean onVenuePolygonClicked(@Nullable Polygon polygon) {
@@ -367,29 +404,45 @@ public class IndoorMapManager {
         JSONObject root = new JSONObject();
         root.put("lat", location.latitude);
         root.put("lon", location.longitude);
-        root.put("latitude", location.latitude);
-        root.put("longitude", location.longitude);
-
-        JSONObject wf = new JSONObject();
-        JSONArray aps = new JSONArray();
+        JSONArray macs = new JSONArray();
         if (observedAps != null) {
-            for (Wifi wifi : observedAps) {
-                String mac = String.valueOf(wifi.getBssid());
-                wf.put(mac, wifi.getLevel());
-                JSONObject ap = new JSONObject();
-                ap.put("bssid", mac);
-                ap.put("rssi", wifi.getLevel());
-                ap.put("frequency", wifi.getFrequency());
-                String ssid = wifi.getSsid();
-                if (!TextUtils.isEmpty(ssid)) {
-                    ap.put("ssid", ssid);
+            List<Wifi> sorted = new ArrayList<>(observedAps);
+            sorted.sort((a, b) -> Integer.compare(b.getLevel(), a.getLevel()));
+
+            Set<String> macSeen = new LinkedHashSet<>();
+            for (Wifi wifi : sorted) {
+                if (macSeen.size() >= MAX_APS_IN_REQUEST) {
+                    break;
                 }
-                aps.put(ap);
+
+                String mac = toMacString(wifi.getBssid());
+                if (TextUtils.isEmpty(mac)) {
+                    continue;
+                }
+                if (macSeen.add(mac)) {
+                    macs.put(mac);
+                }
             }
         }
-        root.put("wf", wf);
-        root.put("aps", aps);
+        root.put("macs", macs);
         return root;
+    }
+
+    @Nullable
+    private String toMacString(long bssidAsLong) {
+        if (bssidAsLong <= 0) {
+            return null;
+        }
+        long masked = bssidAsLong & 0xFFFFFFFFFFFFL;
+        String hex = String.format(Locale.US, "%012x", masked);
+        StringBuilder mac = new StringBuilder(17);
+        for (int i = 0; i < 12; i += 2) {
+            if (i > 0) {
+                mac.append(':');
+            }
+            mac.append(hex, i, i + 2);
+        }
+        return mac.toString();
     }
 
     @NonNull
@@ -404,7 +457,7 @@ public class IndoorMapManager {
             venueArray = new JSONArray(trimmed);
         } else {
             JSONObject root = new JSONObject(trimmed);
-            String[] candidateKeys = new String[]{"venues", "results", "data", "maps", "floorplans"};
+            String[] candidateKeys = new String[]{"venues", "results", "data", "maps", "floorplans", "campaigns"};
             for (String key : candidateKeys) {
                 venueArray = root.optJSONArray(key);
                 if (venueArray != null) {
@@ -434,7 +487,11 @@ public class IndoorMapManager {
     }
 
     private boolean looksLikeVenue(@NonNull JSONObject obj) {
-        return obj.has("polygon") || obj.has("outline") || obj.has("geometry") || obj.has("floors");
+        return obj.has("polygon")
+                || obj.has("outline")
+                || obj.has("geometry")
+                || obj.has("floors")
+                || obj.has("map_shapes");
     }
 
     @Nullable
@@ -479,6 +536,27 @@ public class IndoorMapManager {
             }
         }
         if (arr == null) {
+            for (String key : keys) {
+                arr = parseArrayField(venue.opt(key));
+                if (arr != null) {
+                    break;
+                }
+            }
+        }
+        if (arr == null) {
+            JSONObject mapShapesObj = parseObjectField(venue.opt("map_shapes"));
+            if (mapShapesObj != null) {
+                for (String key : keys) {
+                    arr = parseArrayField(mapShapesObj.opt(key));
+                    if (arr != null) {
+                        break;
+                    }
+                }
+            } else {
+                arr = parseArrayField(venue.opt("map_shapes"));
+            }
+        }
+        if (arr == null) {
             return Collections.emptyList();
         }
 
@@ -516,6 +594,62 @@ public class IndoorMapManager {
     }
 
     @Nullable
+    private JSONArray parseArrayField(@Nullable Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof JSONArray) {
+            return (JSONArray) raw;
+        }
+        if (!(raw instanceof String)) {
+            return null;
+        }
+        String text = ((String) raw).trim();
+        if (text.isEmpty()) {
+            return null;
+        }
+        try {
+            if (text.startsWith("[")) {
+                return new JSONArray(text);
+            }
+            if (text.startsWith("{")) {
+                JSONObject obj = new JSONObject(text);
+                String[] keys = new String[]{
+                        "floors", "floorplans", "maps", "levels", "outline", "polygon", "coordinates"
+                };
+                for (String key : keys) {
+                    JSONArray arr = obj.optJSONArray(key);
+                    if (arr != null) {
+                        return arr;
+                    }
+                }
+            }
+        } catch (JSONException ignored) {
+            return null;
+        }
+        return null;
+    }
+
+    @Nullable
+    private JSONObject parseObjectField(@Nullable Object raw) {
+        if (raw instanceof JSONObject) {
+            return (JSONObject) raw;
+        }
+        if (!(raw instanceof String)) {
+            return null;
+        }
+        String text = ((String) raw).trim();
+        if (text.isEmpty() || !text.startsWith("{")) {
+            return null;
+        }
+        try {
+            return new JSONObject(text);
+        } catch (JSONException ignored) {
+            return null;
+        }
+    }
+
+    @Nullable
     private String normalizeUrl(@Nullable String url) {
         if (TextUtils.isEmpty(url)) {
             return null;
@@ -542,6 +676,27 @@ public class IndoorMapManager {
             JSONObject geometry = obj.optJSONObject("geometry");
             if (geometry != null) {
                 arr = geometry.optJSONArray("coordinates");
+            }
+        }
+        if (arr == null) {
+            arr = parseArrayField(obj.opt("outline"));
+        }
+        if (arr == null) {
+            arr = parseArrayField(obj.opt("polygon"));
+        }
+        if (arr == null) {
+            arr = parseArrayField(obj.opt("coordinates"));
+        }
+        if (arr == null) {
+            JSONObject mapShapes = parseObjectField(obj.opt("map_shapes"));
+            if (mapShapes != null) {
+                arr = parseArrayField(mapShapes.opt("outline"));
+                if (arr == null) {
+                    arr = parseArrayField(mapShapes.opt("polygon"));
+                }
+                if (arr == null) {
+                    arr = parseArrayField(mapShapes.opt("coordinates"));
+                }
             }
         }
         if (arr == null) {
@@ -645,6 +800,18 @@ public class IndoorMapManager {
         }
 
         JSONObject bounds = obj.optJSONObject("bounds");
+        if (bounds == null) {
+            bounds = parseObjectField(obj.opt("bounds"));
+        }
+        if (bounds == null) {
+            JSONObject mapShapes = parseObjectField(obj.opt("map_shapes"));
+            if (mapShapes != null) {
+                bounds = mapShapes.optJSONObject("bounds");
+                if (bounds == null) {
+                    bounds = parseObjectField(mapShapes.opt("bounds"));
+                }
+            }
+        }
         if (bounds == null) {
             return null;
         }
