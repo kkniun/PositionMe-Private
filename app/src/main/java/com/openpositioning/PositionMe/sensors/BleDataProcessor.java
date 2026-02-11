@@ -24,7 +24,9 @@ import android.bluetooth.le.BluetoothLeScanner;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * BLE data gathering and processing using BluetoothAdapter discovery + BroadcastReceiver.
@@ -44,6 +46,7 @@ public class BleDataProcessor implements Observable {
 
     // Use a dedicated TAG so you can filter Logcat by it.
     private static final String TAG = "BLE_PIPE";
+    private static final int DEFAULT_STRONGEST_RSSI = -100;
 
     private static final long SCAN_INTERVAL_MS = 5000;
     private static final long TOAST_DEBOUNCE_MS = 8000;
@@ -64,6 +67,9 @@ public class BleDataProcessor implements Observable {
     // MAC -> latest obs in current window
     private final Map<String, BLE> windowMap = new HashMap<>();
     private long lastLogSampleMs = 0L;
+    // 供 UI 只读展示的 BLE 概览统计，默认值与页面占位保持一致。
+    private volatile int latestBleDeviceCount = 0;
+    private volatile int latestStrongestBleRssi = DEFAULT_STRONGEST_RSSI;
 
     public BleDataProcessor(Context context) {
         this.context = context.getApplicationContext();
@@ -142,6 +148,8 @@ public class BleDataProcessor implements Observable {
         cancelFlush();
         synchronized (windowMap) {
             windowMap.clear();
+            latestBleDeviceCount = 0;
+            latestStrongestBleRssi = DEFAULT_STRONGEST_RSSI;
         }
 
         if (BuildConfig.DEBUG) {
@@ -215,28 +223,106 @@ public class BleDataProcessor implements Observable {
 
         BluetoothDevice device = result.getDevice();
         String mac = (device != null) ? device.getAddress() : null;
-        if (mac == null) return; // cannot dedup without id
+        String uuid = extractServiceUuid(result);
+        String dedupKey = buildDeviceDedupKey(mac, uuid);
+        if (dedupKey == null) return; // address / uuid 都不可用时无法去重
 
         BLE obs = new BLE();
         obs.setMac(mac);
         obs.setName(device != null ? device.getName() : null);
         obs.setRssi(result.getRssi());
-        obs.setUuid("unknown");
+        obs.setUuid(uuid == null ? "unknown" : uuid);
         long tsMs = result.getTimestampNanos() > 0
                 ? result.getTimestampNanos() / 1_000_000L
                 : SystemClock.elapsedRealtime();
         obs.setTimestampMs(tsMs);
 
         synchronized (windowMap) {
-            windowMap.put(mac, obs);
+            windowMap.put(dedupKey, obs);
+            updateLatestBleStatsLocked();
         }
 
         long now = SystemClock.elapsedRealtime();
         if (BuildConfig.DEBUG && (windowMap.size() <= 5 || now - lastLogSampleMs >= LOG_SAMPLE_DEBOUNCE_MS)) {
-            Log.d(TAG, "scan result mac=" + mac + " rssi=" + result.getRssi()
+            Log.d(TAG, "scan result key=" + dedupKey + " mac=" + mac + " rssi=" + result.getRssi()
                     + " unique=" + windowMap.size());
             lastLogSampleMs = now;
         }
+    }
+
+    // 根据 address/uuid 生成本次扫描窗口内的去重 key。
+    static String buildDeviceDedupKey(String mac, String uuid) {
+        if (mac != null && !mac.isEmpty()) {
+            return "mac:" + mac;
+        }
+        if (uuid != null && !uuid.isEmpty()) {
+            return "uuid:" + uuid;
+        }
+        return null;
+    }
+
+    // 提取扫描结果中的首个 service UUID，作为 address 缺失时的后备去重标识。
+    private String extractServiceUuid(ScanResult result) {
+        if (result.getScanRecord() == null || result.getScanRecord().getServiceUuids() == null
+                || result.getScanRecord().getServiceUuids().isEmpty()) {
+            return null;
+        }
+        return result.getScanRecord().getServiceUuids().get(0).toString();
+    }
+
+    // 在持有 windowMap 锁时更新 UI 统计，避免展示值与缓存状态不一致。
+    private void updateLatestBleStatsLocked() {
+        int size = windowMap.size();
+        int[] rssiValues = new int[size];
+        String[] dedupKeys = new String[size];
+        int index = 0;
+        for (Map.Entry<String, BLE> entry : windowMap.entrySet()) {
+            dedupKeys[index] = entry.getKey();
+            rssiValues[index] = entry.getValue().getRssi();
+            index++;
+        }
+        latestBleDeviceCount = countUniqueBleDeviceKeys(dedupKeys);
+        latestStrongestBleRssi = calculateStrongestBleRssi(rssiValues);
+    }
+
+    /**
+     * 计算最强 RSSI（越大信号越强，通常是负数）。空输入返回默认值 -100。
+     */
+    static int calculateStrongestBleRssi(int[] rssiValues) {
+        if (rssiValues == null || rssiValues.length == 0) {
+            return DEFAULT_STRONGEST_RSSI;
+        }
+        int maxRssi = rssiValues[0];
+        for (int value : rssiValues) {
+            if (value > maxRssi) {
+                maxRssi = value;
+            }
+        }
+        return maxRssi;
+    }
+
+    /**
+     * 按设备去重 key 统计数量，忽略 null/空字符串。
+     */
+    static int countUniqueBleDeviceKeys(String[] deviceKeys) {
+        if (deviceKeys == null || deviceKeys.length == 0) {
+            return 0;
+        }
+        Set<String> keySet = new HashSet<>();
+        for (String key : deviceKeys) {
+            if (key != null && !key.isEmpty()) {
+                keySet.add(key);
+            }
+        }
+        return keySet.size();
+    }
+
+    public int getLatestBleDeviceCount() {
+        return latestBleDeviceCount;
+    }
+
+    public int getLatestStrongestBleRssi() {
+        return latestStrongestBleRssi;
     }
 
     private void scheduleFlush() {
