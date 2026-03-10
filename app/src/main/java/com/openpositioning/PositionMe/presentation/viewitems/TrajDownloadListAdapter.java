@@ -198,20 +198,28 @@ public class TrajDownloadListAdapter extends RecyclerView.Adapter<TrajDownloadVi
         // Parse and format the submission date.
         String dateSubmittedStr = responseItems.get(position).get("date_submitted");
         assert dateSubmittedStr != null;
-        holder.getTrajDate().setText(
-                dateFormat.format(
-                        LocalDateTime.parse(dateSubmittedStr.split("\\.")[0])
-                )
+        String formattedDate = dateFormat.format(
+                LocalDateTime.parse(dateSubmittedStr.split("\\.")[0])
         );
 
         // Determine if the trajectory is already downloaded by checking the records.
         JSONObject recordDetails = ServerCommunications.downloadRecords.get(id);
         boolean matched = recordDetails != null;
         String filePath = null;
+        String displayName = formattedDate;
 
         if (matched) {
             try {
                 String fileName = recordDetails.optString("file_name", null);
+                String recordName = recordDetails.optString("trajectory_name", "").trim();
+                if (!recordName.isEmpty()) {
+                    displayName = recordName;
+                } else {
+                    String trajectoryId = recordDetails.optString("trajectory_id", "").trim();
+                    if (!trajectoryId.isEmpty()) {
+                        displayName = trajectoryId;
+                    }
+                }
                 if (fileName != null) {
                     File file = new File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), fileName);
                     filePath = file.getAbsolutePath();
@@ -228,6 +236,8 @@ public class TrajDownloadListAdapter extends RecyclerView.Adapter<TrajDownloadVi
             // Otherwise, the item is not downloaded.
             setButtonState(holder.downloadButton, 0);
         }
+
+        holder.getTrajDate().setText(displayName);
 
         // Copy matched status and filePath to final variables for use in the lambda expression.
         final boolean finalMatched = matched;

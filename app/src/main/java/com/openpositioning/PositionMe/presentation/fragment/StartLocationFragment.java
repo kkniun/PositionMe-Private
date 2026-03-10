@@ -23,6 +23,7 @@ import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
 import com.openpositioning.PositionMe.presentation.activity.ReplayActivity;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.utils.NucleusBuildingManager;
+import com.google.android.material.textfield.TextInputEditText;
 
 /**
  * A simple {@link Fragment} subclass. The startLocation fragment is displayed before the trajectory
@@ -38,6 +39,7 @@ public class StartLocationFragment extends Fragment {
 
     // Button to go to next fragment and save the location
     private Button button;
+    private TextInputEditText trajectoryNameInput;
     // Singleton SensorFusion class which stores data from all sensors
     private SensorFusion sensorFusion = SensorFusion.getInstance();
     // Google maps LatLng object to pass location to the map
@@ -156,6 +158,11 @@ public class StartLocationFragment extends Fragment {
         super.onViewCreated(view, savedInstanceState);
 
         this.button = view.findViewById(R.id.startLocationDone);
+        this.trajectoryNameInput = view.findViewById(R.id.trajectoryNameInput);
+        View trajectoryNameLayout = view.findViewById(R.id.trajectoryNameLayout);
+        if (trajectoryNameLayout != null && requireActivity() instanceof ReplayActivity) {
+            trajectoryNameLayout.setVisibility(View.GONE);
+        }
         this.button.setOnClickListener(new View.OnClickListener() {
             /**
              * {@inheritDoc}
@@ -171,8 +178,11 @@ public class StartLocationFragment extends Fragment {
                 if (requireActivity() instanceof RecordingActivity) {
                     // Start sensor recording + set the start location
                     sensorFusion.setCollectionVenue(null);
-                    sensorFusion.startRecording();
+                    sensorFusion.setTrajectoryName(trajectoryNameInput == null || trajectoryNameInput.getText() == null
+                            ? null
+                            : trajectoryNameInput.getText().toString());
                     sensorFusion.setStartGNSSLatitude(startPosition);
+                    sensorFusion.startRecording();
 
                     // Now switch to the recording screen
                     ((RecordingActivity) requireActivity()).showRecordingScreen();
