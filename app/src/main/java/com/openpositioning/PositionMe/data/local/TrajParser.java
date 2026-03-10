@@ -15,6 +15,7 @@ import com.openpositioning.PositionMe.sensors.SensorFusion;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -65,6 +66,9 @@ public class TrajParser {
         public float orientation;   // Orientation in degrees
         public float speed;         // Speed in meters per second
         public long timestamp;      // Relative timestamp
+        public int floor;          // Estimated floor relative to the starting floor
+        public boolean elevator;   // Elevator detection flag
+        public float elevation;    // Relative elevation in metres
 
         /**
          * Constructs a ReplayPoint.
@@ -74,13 +78,40 @@ public class TrajParser {
          * @param orientation  The orientation angle in degrees.
          * @param speed        The speed in meters per second.
          * @param timestamp    The timestamp associated with this point.
+         * @param floor        The estimated floor.
+         * @param elevator     The elevator detection state.
+         * @param elevation    The relative elevation in metres.
          */
-        public ReplayPoint(LatLng pdrLocation, LatLng gnssLocation, float orientation, float speed, long timestamp) {
+        public ReplayPoint(
+                LatLng pdrLocation,
+                LatLng gnssLocation,
+                float orientation,
+                float speed,
+                long timestamp,
+                int floor,
+                boolean elevator,
+                float elevation
+        ) {
             this.pdrLocation = pdrLocation;
             this.gnssLocation = gnssLocation;
             this.orientation = orientation;
             this.speed = speed;
             this.timestamp = timestamp;
+            this.floor = floor;
+            this.elevator = elevator;
+            this.elevation = elevation;
+        }
+    }
+
+    public static class ReplayTestPoint {
+        public final LatLng position;
+        public final int index;
+        public final int floor;
+
+        public ReplayTestPoint(LatLng position, int index, int floor) {
+            this.position = position;
+            this.index = index;
+            this.floor = floor;
         }
     }
 
@@ -96,12 +127,22 @@ public class TrajParser {
     private static class PdrRecord {
         public long relativeTimestamp;
         public float x, y; // Position relative to the starting point
+        public int floor;
+        public boolean elevator;
+        public float elevation;
     }
 
     /** Represents a GNSS (Global Navigation Satellite System) data record with latitude/longitude. */
     private static class GnssRecord {
         public long relativeTimestamp;
         public double latitude, longitude; // GNSS coordinates
+        public double altitude;
+        public String floor;
+    }
+
+    private static class TestPointRecord {
+        public int index;
+        public GnssRecord position;
     }
 
     /**
@@ -129,23 +170,12 @@ public class TrajParser {
         List<ReplayPoint> result = new ArrayList<>();
 
         try {
-            File file = new File(filePath);
-            if (!file.exists()) {
-                Log.e(TAG, "File does NOT exist: " + filePath);
+            JsonObject root = readRootObject(filePath);
+            if (root == null) {
                 return result;
             }
-            if (!file.canRead()) {
-                Log.e(TAG, "File is NOT readable: " + filePath);
-                return result;
-            }
-
-            BufferedReader br = new BufferedReader(new FileReader(file));
-            JsonObject root = new JsonParser().parse(br).getAsJsonObject();
-            br.close();
 
             Log.i(TAG, "Successfully read trajectory file: " + filePath);
-
-            long startTimestamp = root.has("startTimestamp") ? root.get("startTimestamp").getAsLong() : 0;
 
             List<ImuRecord> imuList = parseImuData(root.getAsJsonArray("imuData"));
             List<PdrRecord> pdrList = parsePdrData(root.getAsJsonArray("pdrData"));
@@ -185,8 +215,16 @@ public class TrajParser {
                 LatLng gnssLocation = closestGnss != null ?
                         new LatLng(closestGnss.latitude, closestGnss.longitude) : null;
 
-                result.add(new ReplayPoint(pdrLocation, gnssLocation, orientationDeg,
-                        0f, pdr.relativeTimestamp));
+                result.add(new ReplayPoint(
+                        pdrLocation,
+                        gnssLocation,
+                        orientationDeg,
+                        speed,
+                        pdr.relativeTimestamp,
+                        pdr.floor,
+                        pdr.elevator,
+                        pdr.elevation
+                ));
             }
 
             Collections.sort(result, Comparator.comparingLong(rp -> rp.timestamp));
@@ -199,58 +237,155 @@ public class TrajParser {
 
         return result;
     }
-/** Parses IMU data from JSON. */
-private static List<ImuRecord> parseImuData(JsonArray imuArray) {
-    List<ImuRecord> imuList = new ArrayList<>();
-    if (imuArray == null) return imuList;
-    Gson gson = new Gson();
-    for (int i = 0; i < imuArray.size(); i++) {
-        ImuRecord record = gson.fromJson(imuArray.get(i), ImuRecord.class);
-        imuList.add(record);
+
+    public static List<ReplayTestPoint> parseTestPoints(String filePath) {
+        List<ReplayTestPoint> result = new ArrayList<>();
+        try {
+            JsonObject root = readRootObject(filePath);
+            if (root == null) {
+                return result;
+            }
+
+            JsonArray testPointArray = root.getAsJsonArray("testPoints");
+            if (testPointArray == null) {
+                JsonArray legacyArray = root.getAsJsonArray("legacyTestPoints");
+                if (legacyArray == null) {
+                    return result;
+                }
+                for (int i = 0; i < legacyArray.size(); i++) {
+                    JsonObject legacyPoint = legacyArray.get(i).getAsJsonObject();
+                    if (legacyPoint == null
+                            || !legacyPoint.has("latitude")
+                            || !legacyPoint.has("longitude")) {
+                        continue;
+                    }
+                    LatLng latLng = new LatLng(
+                            legacyPoint.get("latitude").getAsDouble(),
+                            legacyPoint.get("longitude").getAsDouble()
+                    );
+                    int floor = parseFloor(legacyPoint.has("floor")
+                            ? legacyPoint.get("floor").getAsString()
+                            : null);
+                    result.add(new ReplayTestPoint(latLng, i + 1, floor));
+                }
+                return result;
+            }
+
+            Gson gson = new Gson();
+            for (int i = 0; i < testPointArray.size(); i++) {
+                TestPointRecord record = gson.fromJson(testPointArray.get(i), TestPointRecord.class);
+                if (record == null || record.position == null) {
+                    continue;
+                }
+                LatLng latLng = new LatLng(record.position.latitude, record.position.longitude);
+                int floor = parseFloor(record.position.floor);
+                result.add(new ReplayTestPoint(latLng, record.index, floor));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error parsing test points!", e);
+        }
+        return result;
     }
-    return imuList;
-}/** Parses PDR data from JSON. */
-private static List<PdrRecord> parsePdrData(JsonArray pdrArray) {
-    List<PdrRecord> pdrList = new ArrayList<>();
-    if (pdrArray == null) return pdrList;
-    Gson gson = new Gson();
-    for (int i = 0; i < pdrArray.size(); i++) {
-        PdrRecord record = gson.fromJson(pdrArray.get(i), PdrRecord.class);
-        pdrList.add(record);
+
+    private static JsonObject readRootObject(String filePath) throws IOException {
+        File file = new File(filePath);
+        if (!file.exists()) {
+            Log.e(TAG, "File does NOT exist: " + filePath);
+            return null;
+        }
+        if (!file.canRead()) {
+            Log.e(TAG, "File is NOT readable: " + filePath);
+            return null;
+        }
+
+        try (BufferedReader br = new BufferedReader(new FileReader(file))) {
+            return JsonParser.parseReader(br).getAsJsonObject();
+        }
     }
-    return pdrList;
-}/** Parses GNSS data from JSON. */
-private static List<GnssRecord> parseGnssData(JsonArray gnssArray) {
-    List<GnssRecord> gnssList = new ArrayList<>();
-    if (gnssArray == null) return gnssList;
-    Gson gson = new Gson();
-    for (int i = 0; i < gnssArray.size(); i++) {
-        GnssRecord record = gson.fromJson(gnssArray.get(i), GnssRecord.class);
-        gnssList.add(record);
+
+    private static int parseFloor(String floorValue) {
+        if (floorValue == null || floorValue.trim().isEmpty()) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(floorValue.trim());
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
-    return gnssList;
-}/** Finds the closest IMU record to the given timestamp. */
-private static ImuRecord findClosestImuRecord(List<ImuRecord> imuList, long targetTimestamp) {
-    return imuList.stream().min(Comparator.comparingLong(imu -> Math.abs(imu.relativeTimestamp - targetTimestamp)))
-            .orElse(null);
 
-}/** Finds the closest GNSS record to the given timestamp. */
-private static GnssRecord findClosestGnssRecord(List<GnssRecord> gnssList, long targetTimestamp) {
-    return gnssList.stream().min(Comparator.comparingLong(gnss -> Math.abs(gnss.relativeTimestamp - targetTimestamp)))
-            .orElse(null);
+    /** Parses IMU data from JSON. */
+    private static List<ImuRecord> parseImuData(JsonArray imuArray) {
+        List<ImuRecord> imuList = new ArrayList<>();
+        if (imuArray == null) {
+            return imuList;
+        }
+        Gson gson = new Gson();
+        for (int i = 0; i < imuArray.size(); i++) {
+            ImuRecord record = gson.fromJson(imuArray.get(i), ImuRecord.class);
+            imuList.add(record);
+        }
+        return imuList;
+    }
 
-}/** Computes the orientation from a rotation vector. */
-private static float computeOrientationFromRotationVector(float rx, float ry, float rz, float rw, Context context) {
-    float[] rotationVector = new float[]{rx, ry, rz, rw};
-    float[] rotationMatrix = new float[9];
-    float[] orientationAngles = new float[3];
+    /** Parses PDR data from JSON. */
+    private static List<PdrRecord> parsePdrData(JsonArray pdrArray) {
+        List<PdrRecord> pdrList = new ArrayList<>();
+        if (pdrArray == null) {
+            return pdrList;
+        }
+        Gson gson = new Gson();
+        for (int i = 0; i < pdrArray.size(); i++) {
+            PdrRecord record = gson.fromJson(pdrArray.get(i), PdrRecord.class);
+            pdrList.add(record);
+        }
+        return pdrList;
+    }
 
-    SensorManager sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
-    SensorManager.getRotationMatrixFromVector(rotationMatrix, rotationVector);
-    SensorManager.getOrientation(rotationMatrix, orientationAngles);
+    /** Parses GNSS data from JSON. */
+    private static List<GnssRecord> parseGnssData(JsonArray gnssArray) {
+        List<GnssRecord> gnssList = new ArrayList<>();
+        if (gnssArray == null) {
+            return gnssList;
+        }
+        Gson gson = new Gson();
+        for (int i = 0; i < gnssArray.size(); i++) {
+            GnssRecord record = gson.fromJson(gnssArray.get(i), GnssRecord.class);
+            gnssList.add(record);
+        }
+        return gnssList;
+    }
 
-    float azimuthDeg = (float) Math.toDegrees(orientationAngles[0]);
-    return azimuthDeg < 0 ? azimuthDeg + 360.0f : azimuthDeg;
-}
+    /** Finds the closest IMU record to the given timestamp. */
+    private static ImuRecord findClosestImuRecord(List<ImuRecord> imuList, long targetTimestamp) {
+        return imuList.stream()
+                .min(Comparator.comparingLong(imu -> Math.abs(imu.relativeTimestamp - targetTimestamp)))
+                .orElse(null);
+    }
 
+    /** Finds the closest GNSS record to the given timestamp. */
+    private static GnssRecord findClosestGnssRecord(List<GnssRecord> gnssList, long targetTimestamp) {
+        return gnssList.stream()
+                .min(Comparator.comparingLong(gnss -> Math.abs(gnss.relativeTimestamp - targetTimestamp)))
+                .orElse(null);
+    }
+
+    /** Computes the orientation from a rotation vector. */
+    private static float computeOrientationFromRotationVector(
+            float rx,
+            float ry,
+            float rz,
+            float rw,
+            Context context
+    ) {
+        float[] rotationVector = new float[]{rx, ry, rz, rw};
+        float[] rotationMatrix = new float[9];
+        float[] orientationAngles = new float[3];
+
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, rotationVector);
+        SensorManager.getOrientation(rotationMatrix, orientationAngles);
+
+        float azimuthDeg = (float) Math.toDegrees(orientationAngles[0]);
+        return azimuthDeg < 0 ? azimuthDeg + 360.0f : azimuthDeg;
+    }
 }

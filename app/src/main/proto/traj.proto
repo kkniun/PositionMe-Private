@@ -9,6 +9,8 @@ message Trajectory {
   float trajectory_version = 2;
   // trajectory id/name for identification
   string trajectory_id = 3;
+  // user-visible trajectory name
+  string trajectory_name = 27;
   repeated IMUReading imu_data = 4;
   repeated RelativePosition pdr_data = 5;
   repeated MagnetometerReading magnetometer_data = 6;
@@ -42,7 +44,8 @@ message Trajectory {
   SensorInfo light_sensor_info = 24;
   SensorInfo proximity_info = 25;
 
-  repeated GNSSPosition test_points = 26;
+  repeated GNSSPosition legacy_test_points = 26 [deprecated = true];
+  repeated TestPoint test_points = 28;
 
 }
 
@@ -55,6 +58,12 @@ message RelativePosition {
   // so the first entry should always be x = 0.0, y = 0.0
   float x = 2;
   float y = 3;
+  // floor relative to the starting floor
+  int32 floor = 4;
+  // true when elevator detection is active at this point
+  bool elevator = 5;
+  // elevation relative to the starting point in metres
+  float elevation = 6;
 }
 
 message IMUReading {
@@ -111,6 +120,13 @@ message GNSSPosition {
   double altitude = 4;
   // floor name
   optional string floor = 5;
+}
+
+message TestPoint {
+  // user-visible marker number
+  int32 index = 1;
+  // captured location of the marker
+  GNSSPosition position = 2;
 }
 
 message GNSSReading {
@@ -211,4 +227,3 @@ message SensorInfo {
   float max_range = 7;
   float frequency = 8;
 }
-

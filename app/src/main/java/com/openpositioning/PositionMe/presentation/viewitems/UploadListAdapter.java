@@ -9,10 +9,15 @@ import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.openpositioning.PositionMe.R;
+import com.openpositioning.PositionMe.Traj;
 import com.openpositioning.PositionMe.presentation.fragment.UploadFragment;
 
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.HashMap;
 import java.io.File;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -29,6 +34,7 @@ public class UploadListAdapter extends RecyclerView.Adapter<UploadViewHolder> {
     private final Context context;
     private final List<File> uploadItems;
     private final DownloadClickListener listener;
+    private final Map<String, String> trajectoryNameCache = new HashMap<>();
 
     /**
      * Default public constructor with context for inflating views and list to be displayed.
@@ -65,12 +71,12 @@ public class UploadListAdapter extends RecyclerView.Adapter<UploadViewHolder> {
      */
     @Override
     public void onBindViewHolder(@NonNull UploadViewHolder holder, int position) {
-        holder.trajId.setText(String.valueOf(position));
+        holder.trajId.setText(String.valueOf(position + 1));
         Pattern datePattern = Pattern.compile("_(.*?)\\.txt");
         Matcher dateMatcher = datePattern.matcher(uploadItems.get(position).getName());
         String dateString = dateMatcher.find() ? dateMatcher.group(1) : "N/A";
-        System.err.println("UPLOAD - Date string: " + dateString);
-        holder.trajDate.setText(dateString);
+        String trajectoryName = getTrajectoryName(uploadItems.get(position), dateString);
+        holder.trajDate.setText(trajectoryName);
 
         // Set click listener for the delete button
         holder.deletebutton.setOnClickListener(v -> deleteFileAtPosition(position));
@@ -91,6 +97,7 @@ public class UploadListAdapter extends RecyclerView.Adapter<UploadViewHolder> {
         if (position >= 0 && position < uploadItems.size())
         {
             File fileToDelete = uploadItems.get(position);
+            trajectoryNameCache.remove(fileToDelete.getAbsolutePath());
 
             if (fileToDelete.exists() && fileToDelete.delete())
             {
@@ -104,5 +111,28 @@ public class UploadListAdapter extends RecyclerView.Adapter<UploadViewHolder> {
                 Toast.makeText(context, "Failed to delete file", Toast.LENGTH_SHORT).show();
             }
         }
+    }
+
+    private String getTrajectoryName(File file, String fallback) {
+        String cacheKey = file.getAbsolutePath();
+        String cached = trajectoryNameCache.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        String name = fallback;
+        try (FileInputStream inputStream = new FileInputStream(file)) {
+            Traj.Trajectory trajectory = Traj.Trajectory.parseFrom(inputStream);
+            if (!trajectory.getTrajectoryName().trim().isEmpty()) {
+                name = trajectory.getTrajectoryName().trim();
+            } else if (!trajectory.getTrajectoryId().trim().isEmpty()) {
+                name = trajectory.getTrajectoryId().trim();
+            }
+        } catch (IOException ignored) {
+            // Fallback to the filename timestamp when the local file cannot be parsed.
+        }
+
+        trajectoryNameCache.put(cacheKey, name);
+        return name;
     }
 }

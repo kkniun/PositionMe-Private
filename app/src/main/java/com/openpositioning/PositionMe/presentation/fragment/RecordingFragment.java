@@ -68,7 +68,7 @@ public class RecordingFragment extends Fragment {
     private MaterialButton completeButton, cancelButton, addMarkerButton;
     private ImageView recIcon;
     private ProgressBar timeRemaining;
-    private TextView elevation, distanceTravelled, gnssError;
+    private TextView elevation, distanceTravelled, gnssError, floorStatus, elevatorStatus;
 
     // Marker data  elements
     private final List<MarkerPoint> markerPoints = new ArrayList<>();
@@ -163,6 +163,8 @@ public class RecordingFragment extends Fragment {
         elevation = view.findViewById(R.id.currentElevation);
         distanceTravelled = view.findViewById(R.id.currentDistanceTraveled);
         gnssError = view.findViewById(R.id.gnssError);
+        floorStatus = view.findViewById(R.id.currentFloorStatus);
+        elevatorStatus = view.findViewById(R.id.elevatorStatus);
 
         // Marker button and data
         markerPoints.clear();
@@ -191,6 +193,8 @@ public class RecordingFragment extends Fragment {
         gnssError.setVisibility(View.GONE);
         elevation.setText(getString(R.string.elevation, "0"));
         distanceTravelled.setText(getString(R.string.meter, "0"));
+        floorStatus.setText(getString(R.string.floor_status_value, 0));
+        elevatorStatus.setText(getString(R.string.elevator_status_value, getString(R.string.elevator_inactive)));
 
         // Buttons
         completeButton.setOnClickListener(v -> {
@@ -233,7 +237,7 @@ public class RecordingFragment extends Fragment {
         // MarkerButton event
         addMarkerButton.setOnClickListener(v -> {
             long tMs = SystemClock.elapsedRealtime() - recordingStartElapsedMs;
-            int idx = ++markerIndex;
+            int nextIndex = markerIndex + 1;
 
             // Prefer GNSS; fall back to current fused/PDR map location; then start location.
             LatLng pos = sensorFusion.getCurrentGnssLatLng();
@@ -249,21 +253,26 @@ public class RecordingFragment extends Fragment {
 
             boolean hasValidPos = pos != null && !(pos.latitude == 0 && pos.longitude == 0);
 
-            markerPoints.add(new MarkerPoint(idx, tMs, pos));
-
             if (hasValidPos) {
                 double altitude = sensorFusion.getCurrentGnssAltitude();
-                sensorFusion.addTestPoint(pos, altitude);
+                boolean saved = sensorFusion.addTestPoint(pos, altitude, nextIndex);
+                if (!saved) {
+                    Toast.makeText(requireContext(), "Marker not saved to trajectory", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                markerIndex = nextIndex;
+                markerPoints.add(new MarkerPoint(markerIndex, tMs, pos));
                 if (trajectoryMapFragment != null) {
-                    trajectoryMapFragment.addTestPointMarker(pos, idx);
+                    trajectoryMapFragment.addTestPointMarker(pos, markerIndex);
                 }
             } else {
                 Toast.makeText(requireContext(), "No location yet — marker not saved to trajectory", Toast.LENGTH_SHORT).show();
+                return;
             }
 
-            Log.d("MARKER", "TP" + idx + " tMs=" + tMs + " pos=" + pos);
+            Log.d("MARKER", "TP" + markerIndex + " tMs=" + tMs + " pos=" + pos);
             Toast.makeText(requireContext(),
-                    "Marker TP" + idx + " @" + (tMs / 1000.0) + "s",
+                    "Marker TP" + markerIndex + " @" + (tMs / 1000.0) + "s",
                     Toast.LENGTH_SHORT).show();
         });
 
@@ -315,6 +324,11 @@ public class RecordingFragment extends Fragment {
         // Elevation
         float elevationVal = sensorFusion.getElevation();
         elevation.setText(getString(R.string.elevation, String.format("%.1f", elevationVal)));
+        floorStatus.setText(getString(R.string.floor_status_value, sensorFusion.getCurrentFloor()));
+        elevatorStatus.setText(getString(
+                R.string.elevator_status_value,
+                getString(sensorFusion.getElevator() ? R.string.elevator_active : R.string.elevator_inactive)
+        ));
 
         // Current location
         // Convert PDR coordinates to actual LatLng if you have a known starting lat/lon

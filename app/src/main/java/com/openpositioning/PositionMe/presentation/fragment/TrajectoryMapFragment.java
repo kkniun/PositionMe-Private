@@ -1,12 +1,15 @@
 package com.openpositioning.PositionMe.presentation.fragment;
 
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.SystemClock;
-import android.util.Log;
 import android.text.TextUtils;
+import android.util.Log;
+import android.util.TypedValue;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -27,16 +30,22 @@ import com.bumptech.glide.request.transition.Transition;
 import com.google.android.gms.maps.CameraUpdateFactory;
 import com.google.android.gms.maps.GoogleMap;
 import com.google.android.gms.maps.OnMapReadyCallback;
+import com.google.android.gms.maps.SupportMapFragment;
+import com.google.android.gms.maps.model.BitmapDescriptor;
+import com.google.android.gms.maps.model.BitmapDescriptorFactory;
+import com.google.android.gms.maps.model.GroundOverlay;
+import com.google.android.gms.maps.model.GroundOverlayOptions;
+import com.google.android.gms.maps.model.LatLng;
+import com.google.android.gms.maps.model.LatLngBounds;
+import com.google.android.gms.maps.model.Marker;
+import com.google.android.gms.maps.model.MarkerOptions;
+import com.google.android.gms.maps.model.Polygon;
+import com.google.android.gms.maps.model.PolygonOptions;
+import com.google.android.gms.maps.model.Polyline;
+import com.google.android.gms.maps.model.PolylineOptions;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.android.gms.maps.SupportMapFragment;
-import com.google.android.gms.maps.model.BitmapDescriptorFactory;
-import com.google.android.gms.maps.model.LatLng;
-import com.google.android.gms.maps.model.Marker;
-import com.google.android.gms.maps.model.MarkerOptions;
-import com.google.android.gms.maps.model.Polyline;
-import com.google.android.gms.maps.model.PolylineOptions;
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
 import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.openpositioning.PositionMe.R;
@@ -44,14 +53,12 @@ import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.utils.IndoorMapManager;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
-import com.google.android.gms.maps.CameraUpdateFactory;
-import com.google.android.gms.maps.GoogleMap;
-import com.google.android.gms.maps.SupportMapFragment;
-import com.google.android.gms.maps.model.*;
 import com.openpositioning.PositionMe.viewmodels.MapViewModel;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class TrajectoryMapFragment extends Fragment {
     private GoogleMap gMap;
@@ -88,6 +95,7 @@ public class TrajectoryMapFragment extends Fragment {
 
     // Marker
     private final List<Marker> testPointMarkers = new ArrayList<>();
+    private final Map<Integer, BitmapDescriptor> testPointIconCache = new HashMap<>();
 
 
 
@@ -234,6 +242,7 @@ public class TrajectoryMapFragment extends Fragment {
         map.setMapType(GoogleMap.MAP_TYPE_HYBRID);
 
         indoorMapManager = new IndoorMapManager(requireContext(), map);
+        indoorMapManager.setAutoSelectFirstVenue(!venueSelectionEnabled);
         indoorMapManager.setVenueSelectionListener((venueId, venueName) -> {
             if (venueSelectionEnabled) {
                 sensorFusion.setCollectionVenue(venueId);
@@ -327,9 +336,7 @@ public class TrajectoryMapFragment extends Fragment {
 
         if (indoorMapManager != null) {
             indoorMapManager.setCurrentLocation(newLocation);
-            if (venueSelectionEnabled) {
-                indoorMapManager.refreshNearbyVenues(newLocation, sensorFusion.getWifiList());
-            }
+            indoorMapManager.refreshNearbyVenues(newLocation, sensorFusion.getWifiList());
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
             updateVenueLabel();
         }
@@ -459,7 +466,9 @@ public class TrajectoryMapFragment extends Fragment {
 
         Marker m = gMap.addMarker(new MarkerOptions()
                 .position(pos)
-                .title("TP " + idx));
+                .title("TP " + idx)
+                .anchor(0.5f, 0.5f)
+                .icon(getNumberedTestPointIcon(idx)));
 
         if (m != null) testPointMarkers.add(m);
     }
@@ -469,6 +478,53 @@ public class TrajectoryMapFragment extends Fragment {
             if (m != null) m.remove();
         }
         testPointMarkers.clear();
+    }
+
+    public void syncDisplayedFloor(int floor) {
+        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
+            return;
+        }
+        indoorMapManager.setCurrentFloor(floor, true);
+        updateVenueLabel();
+    }
+
+    private BitmapDescriptor getNumberedTestPointIcon(int idx) {
+        BitmapDescriptor cached = testPointIconCache.get(idx);
+        if (cached != null) {
+            return cached;
+        }
+
+        int sizePx = (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP,
+                36,
+                getResources().getDisplayMetrics()
+        );
+
+        Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+
+        Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        fillPaint.setColor(Color.parseColor("#D9485F"));
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 2f, fillPaint);
+
+        Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        strokePaint.setColor(Color.WHITE);
+        strokePaint.setStyle(Paint.Style.STROKE);
+        strokePaint.setStrokeWidth(3f);
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 2f, strokePaint);
+
+        Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        textPaint.setColor(Color.WHITE);
+        textPaint.setTextAlign(Paint.Align.CENTER);
+        textPaint.setFakeBoldText(true);
+        textPaint.setTextSize(idx >= 10 ? sizePx * 0.34f : sizePx * 0.42f);
+        Paint.FontMetrics fontMetrics = textPaint.getFontMetrics();
+        float textY = (sizePx / 2f) - ((fontMetrics.ascent + fontMetrics.descent) / 2f);
+        canvas.drawText(String.valueOf(idx), sizePx / 2f, textY, textPaint);
+
+        BitmapDescriptor icon = BitmapDescriptorFactory.fromBitmap(bitmap);
+        testPointIconCache.put(idx, icon);
+        return icon;
     }
 
 

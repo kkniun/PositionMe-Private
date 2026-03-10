@@ -11,6 +11,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.SeekBar;
+import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -80,6 +81,7 @@ public class ReplayFragment extends Fragment {
     private final Handler playbackHandler = new Handler();
     private final long PLAYBACK_INTERVAL_MS = 500; // milliseconds
     private List<TrajParser.ReplayPoint> replayData = new ArrayList<>();
+    private List<TrajParser.ReplayTestPoint> replayTestPoints = new ArrayList<>();
     private int currentIndex = 0;
     private boolean isPlaying = false;
 
@@ -87,6 +89,8 @@ public class ReplayFragment extends Fragment {
     private MapViewModel mapViewModel;
     private List<Polygon> venuePolygons = new ArrayList<>();
     private GroundOverlay floorplanOverlay;
+    private TextView replayFloorStatus;
+    private TextView replayElevatorStatus;
 
     @Override
     public void onCreate(@Nullable Bundle savedInstanceState) {
@@ -120,6 +124,7 @@ public class ReplayFragment extends Fragment {
 
         // Parse the JSON file and prepare replayData using TrajParser
         replayData = TrajParser.parseTrajectoryData(filePath, requireContext(), initialLat, initialLon);
+        replayTestPoints = TrajParser.parseTestPoints(filePath);
 
         // Log the number of parsed points
         if (replayData != null && !replayData.isEmpty()) {
@@ -185,6 +190,8 @@ public class ReplayFragment extends Fragment {
                 }
             });
 
+            renderReplayTestPoints();
+
             // b. Run the original logic to determine the starting position.
             boolean gnssExists = hasAnyGnssData(replayData);
             if (gnssExists) {
@@ -206,6 +213,13 @@ public class ReplayFragment extends Fragment {
         exitButton      = view.findViewById(R.id.exitButton);
         goEndButton     = view.findViewById(R.id.goEndButton);
         playbackSeekBar = view.findViewById(R.id.playbackSeekBar);
+        replayFloorStatus = view.findViewById(R.id.replayFloorStatus);
+        replayElevatorStatus = view.findViewById(R.id.replayElevatorStatus);
+        replayFloorStatus.setText(getString(R.string.floor_status_value, 0));
+        replayElevatorStatus.setText(getString(
+                R.string.elevator_status_value,
+                getString(R.string.elevator_inactive)
+        ));
 
         // Set SeekBar max value based on replay data
         if (!replayData.isEmpty()) {
@@ -328,10 +342,6 @@ public class ReplayFragment extends Fragment {
         LatLng startPoint = new LatLng(latitude, longitude);
         Log.i(TAG, "Setting initial map position: " + startPoint.toString());
         trajectoryMapFragment.setInitialCameraPosition(startPoint);
-
-        // NEW FEATURE: When the map position is set, trigger a fetch for nearby floorplans.
-        Log.d(TAG, "Triggering fetch for nearby floorplans at " + latitude + ", " + longitude);
-        mapViewModel.fetchNearbyFloorplans(latitude, longitude);
     }
 
     /**
@@ -392,6 +402,7 @@ public class ReplayFragment extends Fragment {
             for (int i = 0; i <= newIndex; i++) {
                 TrajParser.ReplayPoint p = replayData.get(i);
                 trajectoryMapFragment.updateUserLocation(p.pdrLocation, p.orientation);
+                trajectoryMapFragment.syncDisplayedFloor(p.floor);
                 if (p.gnssLocation != null) {
                     trajectoryMapFragment.updateGNSS(p.gnssLocation);
                 }
@@ -400,12 +411,33 @@ public class ReplayFragment extends Fragment {
             // Normal sequential forward step: add just the new point
             TrajParser.ReplayPoint p = replayData.get(newIndex);
             trajectoryMapFragment.updateUserLocation(p.pdrLocation, p.orientation);
+            trajectoryMapFragment.syncDisplayedFloor(p.floor);
             if (p.gnssLocation != null) {
                 trajectoryMapFragment.updateGNSS(p.gnssLocation);
             }
         }
 
+        TrajParser.ReplayPoint currentPoint = replayData.get(newIndex);
+        replayFloorStatus.setText(getString(R.string.floor_status_value, currentPoint.floor));
+        replayElevatorStatus.setText(getString(
+                R.string.elevator_status_value,
+                getString(currentPoint.elevator ? R.string.elevator_active : R.string.elevator_inactive)
+        ));
+
         lastIndex = newIndex;
+    }
+
+    private void renderReplayTestPoints() {
+        if (trajectoryMapFragment == null) {
+            return;
+        }
+        trajectoryMapFragment.clearTestPointMarkers();
+        for (TrajParser.ReplayTestPoint point : replayTestPoints) {
+            if (point == null || point.position == null) {
+                continue;
+            }
+            trajectoryMapFragment.addTestPointMarker(point.position, point.index);
+        }
     }
 
     @Override

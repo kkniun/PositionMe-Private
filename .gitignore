@@ -17,3 +17,5 @@ local.properties
 
 # local-only docs
 local_cache/
+temp_folder/
+temp_logs.md

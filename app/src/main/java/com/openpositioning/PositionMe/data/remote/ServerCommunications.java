@@ -418,7 +418,14 @@ public class ServerCommunications implements Observable {
      * @param id the ID of the trajectory
      * @param dateSubmitted the date the trajectory was submitted
      */
-    private void saveDownloadRecord(long startTimestamp, String fileName, String id, String dateSubmitted) {
+    private void saveDownloadRecord(
+            long startTimestamp,
+            String fileName,
+            String id,
+            String dateSubmitted,
+            String trajectoryName,
+            String trajectoryId
+    ) {
         File recordsDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
         File recordsFile = new File(recordsDir, "download_records.json");
         JSONObject jsonObject;
@@ -458,6 +465,8 @@ public class ServerCommunications implements Observable {
             recordDetails.put("startTimeStamp", startTimestamp);
             recordDetails.put("date_submitted", dateSubmitted);
             recordDetails.put("id", id);
+            recordDetails.put("trajectory_name", trajectoryName);
+            recordDetails.put("trajectory_id", trajectoryId);
 
             // Insert or update in the main JSON
             jsonObject.put(id, recordDetails);
@@ -546,6 +555,11 @@ public class ServerCommunications implements Observable {
                     // Print a message in the console
                     long startTimestamp = receivedTrajectory.getStartTimestamp();
                     String fileName = "trajectory_" + dateSubmitted + ".txt";
+                    String trajectoryName = receivedTrajectory.getTrajectoryName();
+                    if (trajectoryName == null || trajectoryName.trim().isEmpty()) {
+                        trajectoryName = receivedTrajectory.getTrajectoryId();
+                    }
+                    String trajectoryId = receivedTrajectory.getTrajectoryId();
 
                     // Place the file in your app-specific "Downloads" folder
                     File appSpecificDownloads = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
@@ -570,7 +584,7 @@ public class ServerCommunications implements Observable {
                     }
 
                     // Save the download record
-                    saveDownloadRecord(startTimestamp, fileName, id, dateSubmitted);
+                    saveDownloadRecord(startTimestamp, fileName, id, dateSubmitted, trajectoryName, trajectoryId);
                     loadDownloadRecords();
                 }
             }

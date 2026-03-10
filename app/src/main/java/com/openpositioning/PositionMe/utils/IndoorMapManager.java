@@ -90,6 +90,7 @@ public class IndoorMapManager {
     private float floorHeight = DEFAULT_FLOOR_HEIGHT_M;
     private int floorImageToken;
     private String selectedVenueId;
+    private boolean autoSelectFirstVenue;
     private VenueSelectionListener venueSelectionListener;
 
     public interface VenueSelectionListener {
@@ -107,6 +108,10 @@ public class IndoorMapManager {
 
     public void setVenueSelectionListener(@Nullable VenueSelectionListener listener) {
         this.venueSelectionListener = listener;
+    }
+
+    public void setAutoSelectFirstVenue(boolean autoSelectFirstVenue) {
+        this.autoSelectFirstVenue = autoSelectFirstVenue;
     }
 
     public void setCurrentLocation(@Nullable LatLng location) {
@@ -663,6 +668,8 @@ public class IndoorMapManager {
 
         if (!TextUtils.isEmpty(selectedVenueId) && venuesById.containsKey(selectedVenueId)) {
             selectVenue(selectedVenueId);
+        } else if (autoSelectFirstVenue && !venues.isEmpty()) {
+            selectVenue(venues.get(0).id);
         } else {
             selectedVenueId = null;
             currentFloor = 0;
