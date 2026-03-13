@@ -9,16 +9,22 @@ public class Particle {
     private double y;
     private int floor;
     private double weight;
+    private double headingRad;
 
     public Particle(double x, double y, int floor, double weight) {
+        this(x, y, floor, weight, 0.0);
+    }
+
+    public Particle(double x, double y, int floor, double weight, double headingRad) {
         this.x = x;
         this.y = y;
         this.floor = floor;
         this.weight = weight;
+        this.headingRad = headingRad;
     }
 
     public Particle(Particle other) {
-        this(other.x, other.y, other.floor, other.weight);
+        this(other.x, other.y, other.floor, other.weight, other.headingRad);
     }
 
     public double getX() {
@@ -51,5 +57,13 @@ public class Particle {
 
     public void setWeight(double weight) {
         this.weight = weight;
+    }
+
+    public double getHeadingRad() {
+        return headingRad;
+    }
+
+    public void setHeadingRad(double headingRad) {
+        this.headingRad = headingRad;
     }
 }

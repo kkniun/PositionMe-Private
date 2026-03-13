@@ -46,6 +46,7 @@ message Trajectory {
 
   repeated GNSSPosition legacy_test_points = 26 [deprecated = true];
   repeated TestPoint test_points = 28;
+  repeated FusedPoseRecord fused_pose = 29;
 
 }
 
@@ -64,6 +65,16 @@ message RelativePosition {
   bool elevator = 5;
   // elevation relative to the starting point in metres
   float elevation = 6;
+}
+
+message FusedPoseRecord {
+  // milliseconds from the start_timestamp
+  int64 relative_timestamp = 1;
+  // local metric position relative to the selected start point
+  double x = 2;
+  double y = 3;
+  int32 floor = 4;
+  float confidence = 5;
 }
 
 message IMUReading {

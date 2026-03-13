@@ -6,6 +6,8 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.location.LocationManager;
 import android.os.Bundle;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -15,6 +17,7 @@ import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.fragment.app.Fragment;
@@ -29,6 +32,8 @@ import com.google.android.gms.maps.OnMapReadyCallback;
 import com.google.android.gms.maps.SupportMapFragment;
 import com.google.android.gms.maps.model.LatLng;
 import com.google.android.gms.maps.model.MarkerOptions;
+import com.google.android.material.textfield.TextInputEditText;
+import com.google.android.material.textfield.TextInputLayout;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
 
@@ -97,11 +102,7 @@ public class HomeFragment extends Fragment implements OnMapReadyCallback {
         start = view.findViewById(R.id.startStopButton);
         start.setEnabled(!PreferenceManager.getDefaultSharedPreferences(getContext())
                 .getBoolean("permanentDeny", false));
-        start.setOnClickListener(v -> {
-            Intent intent = new Intent(requireContext(), RecordingActivity.class);
-            startActivity(intent);
-            ((AppCompatActivity) getActivity()).getSupportActionBar().hide();
-        });
+        start.setOnClickListener(v -> showTrajectoryNameDialog());
 
         // Measurements button
         measurements = view.findViewById(R.id.measurementButton);
@@ -217,5 +218,54 @@ public class HomeFragment extends Fragment implements OnMapReadyCallback {
             // If GNSS is disabled, show University of Edinburgh + message
             showEdinburghAndMessage("GNSS is disabled. Please enable in settings.");
         }
+    }
+
+    private void showTrajectoryNameDialog() {
+        View dialogView = LayoutInflater.from(requireContext())
+                .inflate(R.layout.dialog_trajectory_name, null, false);
+        TextInputLayout inputLayout = dialogView.findViewById(R.id.trajectoryNameDialogLayout);
+        TextInputEditText input = dialogView.findViewById(R.id.trajectoryNameDialogInput);
+
+        AlertDialog dialog = new AlertDialog.Builder(requireContext())
+                .setTitle(R.string.trajectory_name_dialog_title)
+                .setView(dialogView)
+                .setNegativeButton(R.string.cancel, (dialogInterface, which) -> dialogInterface.dismiss())
+                .setPositiveButton(R.string.trajectory_name_confirm, null)
+                .create();
+
+        input.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                inputLayout.setError(null);
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {}
+        });
+
+        dialog.setOnShowListener(dialogInterface -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(v -> {
+                    String trajectoryName = input.getText() == null
+                            ? ""
+                            : input.getText().toString().trim();
+                    if (trajectoryName.isEmpty()) {
+                        inputLayout.setError(getString(R.string.trajectory_name_required));
+                        return;
+                    }
+                    launchRecordingActivity(trajectoryName);
+                    dialog.dismiss();
+                }));
+
+        dialog.show();
+    }
+
+    private void launchRecordingActivity(@NonNull String trajectoryName) {
+        Intent intent = new Intent(requireContext(), RecordingActivity.class);
+        intent.putExtra(RecordingActivity.EXTRA_TRAJECTORY_NAME, trajectoryName);
+        startActivity(intent);
+        ((AppCompatActivity) requireActivity()).getSupportActionBar().hide();
     }
 }

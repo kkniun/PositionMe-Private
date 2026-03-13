@@ -31,6 +31,7 @@ import androidx.preference.PreferenceManager;
 
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
+import com.openpositioning.PositionMe.sensors.FusedPose;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.sensors.SensorTypes;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
@@ -99,8 +100,8 @@ public class RecordingFragment extends Fragment {
 
     // Distance tracking
     private float distance = 0f;
-    private float previousPosX = 0f;
-    private float previousPosY = 0f;
+    private double previousLocalX = 0.0;
+    private double previousLocalY = 0.0;
 
     // References to the child map fragment
     private TrajectoryMapFragment trajectoryMapFragment;
@@ -313,35 +314,36 @@ public class RecordingFragment extends Fragment {
      * Update the UI with sensor data and pass map updates to TrajectoryMapFragment.
      */
     private void updateUIandPosition() {
-        float[] pdrValues = sensorFusion.getSensorValueMap().get(SensorTypes.PDR);
-        if (pdrValues == null) return;
+        FusedPose fusedPose = sensorFusion.getLatestFusedPose();
+        if (fusedPose == null) {
+            if (sensorFusion.isWaitingForAbsoluteFix()) {
+                gnssError.setVisibility(View.VISIBLE);
+                gnssError.setText(getString(R.string.waiting_for_absolute_fix));
+            } else {
+                gnssError.setVisibility(View.GONE);
+            }
+            return;
+        }
+        sensorFusion.recordLatestFusedPoseIfNeeded();
 
         // Distance
-        distance += Math.sqrt(Math.pow(pdrValues[0] - previousPosX, 2)
-                + Math.pow(pdrValues[1] - previousPosY, 2));
+        distance += Math.sqrt(
+                Math.pow(fusedPose.getX() - previousLocalX, 2)
+                        + Math.pow(fusedPose.getY() - previousLocalY, 2)
+        );
         distanceTravelled.setText(getString(R.string.meter, String.format("%.2f", distance)));
 
         // Elevation
         float elevationVal = sensorFusion.getElevation();
         elevation.setText(getString(R.string.elevation, String.format("%.1f", elevationVal)));
-        floorStatus.setText(getString(R.string.floor_status_value, sensorFusion.getCurrentFloor()));
+        floorStatus.setText(getString(R.string.floor_status_value, fusedPose.getFloor()));
         elevatorStatus.setText(getString(
                 R.string.elevator_status_value,
                 getString(sensorFusion.getElevator() ? R.string.elevator_active : R.string.elevator_inactive)
         ));
 
-        // Current location
-        // Convert PDR coordinates to actual LatLng if you have a known starting lat/lon
-        // Or simply pass relative data for the TrajectoryMapFragment to handle
-        // For example:
-        float[] latLngArray = sensorFusion.getGNSSLatitude(true);
-        if (latLngArray != null) {
-            LatLng oldLocation = trajectoryMapFragment.getCurrentLocation(); // or store locally
-            LatLng newLocation = UtilFunctions.calculateNewPos(
-                    oldLocation == null ? new LatLng(latLngArray[0], latLngArray[1]) : oldLocation,
-                    new float[]{ pdrValues[0] - previousPosX, pdrValues[1] - previousPosY }
-            );
-
+        LatLng newLocation = sensorFusion.getLatLngForFusedPose(fusedPose);
+        if (newLocation != null) {
             double orientationDeg = Math.toDegrees(sensorFusion.passOrientation());
             if (SensorFusion.DEBUG_HEADING) {
                 long now = SystemClock.elapsedRealtime();
@@ -351,10 +353,9 @@ public class RecordingFragment extends Fragment {
                 }
             }
 
-            // Pass the location + orientation to the map
             if (trajectoryMapFragment != null) {
-                trajectoryMapFragment.updateUserLocation(newLocation,
-                        (float) orientationDeg);
+                trajectoryMapFragment.updateUserLocation(newLocation, (float) orientationDeg);
+                trajectoryMapFragment.syncDisplayedFloor(fusedPose.getFloor());
             }
         }
 
@@ -378,8 +379,8 @@ public class RecordingFragment extends Fragment {
         }
 
         // Update previous
-        previousPosX = pdrValues[0];
-        previousPosY = pdrValues[1];
+        previousLocalX = fusedPose.getX();
+        previousLocalY = fusedPose.getY();
     }
 
     /**

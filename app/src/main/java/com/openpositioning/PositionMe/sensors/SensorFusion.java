@@ -23,6 +23,7 @@ import androidx.preference.PreferenceManager;
 
 import com.google.android.gms.maps.model.LatLng;
 import com.openpositioning.PositionMe.presentation.activity.MainActivity;
+import com.openpositioning.PositionMe.utils.CoordinateConverter;
 import com.openpositioning.PositionMe.utils.PathView;
 import com.openpositioning.PositionMe.utils.PdrProcessing;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
@@ -94,6 +95,8 @@ public class SensorFusion implements SensorEventListener, Observer {
     // String for creating WiFi fingerprint JSO N object
     private static final String WIFI_FINGERPRINT= "wf";
     private static final String DEFAULT_COLLECTION_VENUE = "traj";
+    private static final float DEFAULT_WIFI_ACCURACY_M = 8.0f;
+    private static final double MIN_ABSOLUTE_FIX_START_STD_M = 1.0;
     //endregion
 
     //region Instance variables
@@ -196,8 +199,11 @@ public class SensorFusion implements SensorEventListener, Observer {
     private ParticleFilterEngine particleFilterEngine;
     private boolean pfInitialized;
     private FusedPose latestFusedPose;
-    private float lastPfPdrX;
-    private float lastPfPdrY;
+    private CoordinateConverter coordinateConverter;
+    private boolean hasManualStartLocation;
+    private float lastPredictHeadingRad;
+    private float lastPredictElevation;
+    private long lastRecordedFusedPoseTimestampMs;
 
     // Trajectory displaying class
     private PathView pathView;
@@ -322,8 +328,11 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.particleFilterEngine = new ParticleFilterEngine();
         this.pfInitialized = false;
         this.latestFusedPose = null;
-        this.lastPfPdrX = 0f;
-        this.lastPfPdrY = 0f;
+        this.coordinateConverter = null;
+        this.hasManualStartLocation = false;
+        this.lastPredictHeadingRad = 0f;
+        this.lastPredictElevation = 0f;
+        this.lastRecordedFusedPoseTimestampMs = -1L;
 
         if(settings.getBoolean("overwrite_constants", false)) {
             this.filter_coefficient = Float.parseFloat(settings.getString("accel_filter", "0.96"));
@@ -478,20 +487,25 @@ public class SensorFusion implements SensorEventListener, Observer {
                                 "stepDetection triggered, accelMagnitude size = " + accelMagnitude.size());
                     }
 
-                    float[] newCords = this.pdrProcessing.updatePdr(
-                            stepTime,
+                    float currentHeadingRad = getCurrentHeadingRad();
+                    float deltaHeadingRad = normalizeHeadingDelta(currentHeadingRad - lastPredictHeadingRad);
+                    float heightDeltaMeters = this.elevation - lastPredictElevation;
+                    PdrDelta pdrDelta = this.pdrProcessing.buildStepDelta(
                             this.accelMagnitude,
-                            this.orientation[0]
+                            deltaHeadingRad,
+                            heightDeltaMeters
                     );
+                    float[] newCords = this.pdrProcessing.applyStepDelta(pdrDelta, currentHeadingRad);
 
                     // Clear the accelMagnitude after using it
                     this.accelMagnitude.clear();
                     handlePdrPredict(
-                            newCords[0],
-                            newCords[1],
+                            pdrDelta,
                             this.pdrProcessing.getCurrentFloor(),
                             currentTime
                     );
+                    this.lastPredictHeadingRad = currentHeadingRad;
+                    this.lastPredictElevation = this.elevation;
 
 
                     if (saveRecording) {
@@ -559,7 +573,15 @@ public class SensorFusion implements SensorEventListener, Observer {
                 }
 
                 trajectory.addGnssData(gnssBuilder);
-                handleAbsoluteFix(latitude, longitude, pdrProcessing.getCurrentFloor(), System.currentTimeMillis());
+                handleAbsoluteFix(
+                        new AbsoluteFix(
+                                System.currentTimeMillis(),
+                                latitude,
+                                longitude,
+                                accuracy
+                        ),
+                        pdrProcessing.getCurrentFloor()
+                );
             }
             gnssAltitude = location.getAltitude();
 
@@ -849,39 +871,26 @@ public class SensorFusion implements SensorEventListener, Observer {
             if (trajectoryId != null && !trajectoryId.isEmpty()) {
                 wifiFingerPrint.put("trajectory_id", trajectoryId);
             }
-            this.wiFiPositioning.request(wifiFingerPrint);
-            // TODO: 后续将 WiFi absolute fix 统一接入 handleAbsoluteFix(...)，
-            // 与 GNSS 共用同一条 PF 主循环入口。
-        } catch (JSONException e) {
-            // Catching error while making JSON object, to prevent crashes
-            // Error log to keep record of errors (for secure programming and maintainability)
-            Log.e("jsonErrors","Error creating json object"+e.toString());
-        }
-    }
-    // Callback Example Function
-    /**
-     * Function to create a request to obtain a wifi location for the obtained wifi fingerprint
-     * using Volley Callback
-     */
-    private void createWifiPositionRequestCallback(){
-        try {
-            // Creating a JSON object to store the WiFi access points
-            JSONObject wifiAccessPoints=new JSONObject();
-            for (Wifi data : this.wifiList){
-                wifiAccessPoints.put(String.valueOf(data.getBssid()), data.getLevel());
-            }
-            // Creating POST Request
-            JSONObject wifiFingerPrint = new JSONObject();
-            wifiFingerPrint.put(WIFI_FINGERPRINT, wifiAccessPoints);
             this.wiFiPositioning.request(wifiFingerPrint, new WiFiPositioning.VolleyCallback() {
                 @Override
                 public void onSuccess(LatLng wifiLocation, int floor) {
-                    // TODO: 后续把 WiFi callback 返回的 absolute fix 统一转到 handleAbsoluteFix(...)。
+                    if (wifiLocation == null) {
+                        return;
+                    }
+                    handleAbsoluteFix(
+                            new AbsoluteFix(
+                                    System.currentTimeMillis(),
+                                    wifiLocation.latitude,
+                                    wifiLocation.longitude,
+                                    DEFAULT_WIFI_ACCURACY_M
+                            ),
+                            floor
+                    );
                 }
 
                 @Override
                 public void onError(String message) {
-                    // Handle the error response
+                    Log.w("SensorFusion", "WiFi absolute fix failed: " + message);
                 }
             });
         } catch (JSONException e) {
@@ -889,7 +898,6 @@ public class SensorFusion implements SensorEventListener, Observer {
             // Error log to keep record of errors (for secure programming and maintainability)
             Log.e("jsonErrors","Error creating json object"+e.toString());
         }
-
     }
 
     /**
@@ -908,7 +916,27 @@ public class SensorFusion implements SensorEventListener, Observer {
         return this.wiFiPositioning.getFloor();
     }
 
-    private void handleAbsoluteFix(double latitudeDeg, double longitudeDeg, int floor, long timestampMs) {
+    public void handleAbsoluteFix(@NonNull AbsoluteFix absoluteFix, int floor) {
+        handleAbsoluteFix(
+                absoluteFix.getLatitudeDeg(),
+                absoluteFix.getLongitudeDeg(),
+                floor,
+                absoluteFix.getTimestampMs(),
+                absoluteFix.getAccuracyMeters()
+        );
+    }
+
+    public void handleAbsoluteFix(double latitudeDeg, double longitudeDeg, int floor, long timestampMs) {
+        handleAbsoluteFix(latitudeDeg, longitudeDeg, floor, timestampMs, DEFAULT_WIFI_ACCURACY_M);
+    }
+
+    public void handleAbsoluteFix(
+            double latitudeDeg,
+            double longitudeDeg,
+            int floor,
+            long timestampMs,
+            float accuracyMeters
+    ) {
         if (!saveRecording) {
             return;
         }
@@ -917,61 +945,133 @@ public class SensorFusion implements SensorEventListener, Observer {
             this.particleFilterEngine = new ParticleFilterEngine();
         }
 
-        // 当前 PF 内部统一使用“相对起点的本地米制坐标”。
-        // 后续应抽出正式 CoordinateConverter，统一 GNSS/WiFi/PDR 坐标系转换。
-        float[] origin = getGNSSLatitude(true);
-        double originLat = latitudeDeg;
-        double originLon = longitudeDeg;
-        if (origin != null
-                && origin.length >= 2
-                && !(origin[0] == 0f && origin[1] == 0f)) {
-            originLat = origin[0];
-            originLon = origin[1];
+        CoordinateConverter converter = getOrCreateCoordinateConverter(latitudeDeg, longitudeDeg);
+        if (converter == null) {
+            return;
         }
-
-        double fixX = UtilFunctions.degreesToMetersLng(longitudeDeg - originLon, originLat);
-        double fixY = UtilFunctions.degreesToMetersLat(latitudeDeg - originLat);
+        maybeSetInitialPositionIfAbsent(this.trajectory, latitudeDeg, longitudeDeg);
+        double[] localFix = converter.toLocalMeters(latitudeDeg, longitudeDeg);
 
         if (!pfInitialized) {
-            this.particleFilterEngine.initialize(fixX, fixY, floor, timestampMs);
+            this.particleFilterEngine.initialize(
+                    localFix[0],
+                    localFix[1],
+                    floor,
+                    timestampMs,
+                    getCurrentHeadingRad(),
+                    Math.max(MIN_ABSOLUTE_FIX_START_STD_M, accuracyMeters)
+            );
         } else {
-            this.particleFilterEngine.updateWithAbsoluteFix(fixX, fixY, floor, timestampMs);
+            this.particleFilterEngine.updateWithAbsoluteFix(
+                    localFix[0],
+                    localFix[1],
+                    floor,
+                    timestampMs,
+                    accuracyMeters
+            );
         }
         this.latestFusedPose = this.particleFilterEngine.estimatePose();
         this.pfInitialized = this.latestFusedPose != null;
-
-        // absolute fix 到来后，将累计 PDR 当前位置记为下一次 predict 的基线。
-        float[] currentPdr = this.pdrProcessing == null ? null : this.pdrProcessing.getPDRMovement();
-        if (currentPdr != null && currentPdr.length >= 2) {
-            this.lastPfPdrX = currentPdr[0];
-            this.lastPfPdrY = currentPdr[1];
-        }
+        this.lastPredictHeadingRad = getCurrentHeadingRad();
+        this.lastPredictElevation = this.elevation;
+        recordLatestFusedPoseIfNeeded();
     }
 
-    private void handlePdrPredict(float currentPdrX, float currentPdrY, int floor, long timestampMs) {
+    public void handlePdrPredict(@Nullable PdrDelta pdrDelta, int floor, long timestampMs) {
         if (!saveRecording) {
             return;
         }
 
-        if (!pfInitialized || this.particleFilterEngine == null) {
-            this.lastPfPdrX = currentPdrX;
-            this.lastPfPdrY = currentPdrY;
+        // Formal fusion flow must wait for the first real absolute fix.
+        // PDR-only prediction is ignored until GNSS/WiFi/other absolute positioning arrives.
+        if (!pfInitialized || this.particleFilterEngine == null || pdrDelta == null) {
             return;
         }
 
-        double deltaX = currentPdrX - lastPfPdrX;
-        double deltaY = currentPdrY - lastPfPdrY;
-        this.lastPfPdrX = currentPdrX;
-        this.lastPfPdrY = currentPdrY;
-
-        // 当前仓库还没有 standalone PdrDelta 模型，这里先用累计 PDR 的前后差值驱动 predict。
-        // 后续应替换为正式 PdrDelta，并在此接入更完整的运动噪声模型。
-        this.particleFilterEngine.predict(deltaX, deltaY, floor, timestampMs);
+        this.particleFilterEngine.predict(pdrDelta, floor, timestampMs);
         this.latestFusedPose = this.particleFilterEngine.estimatePose();
+        recordLatestFusedPoseIfNeeded();
     }
 
     public FusedPose getLatestFusedPose() {
         return latestFusedPose;
+    }
+
+    public boolean isWaitingForAbsoluteFix() {
+        return saveRecording && !pfInitialized;
+    }
+
+    @Nullable
+    public LatLng getLatLngForFusedPose(@Nullable FusedPose fusedPose) {
+        if (fusedPose == null) {
+            return null;
+        }
+        CoordinateConverter converter = getOrCreateCoordinateConverter(latitude, longitude);
+        if (converter == null) {
+            return null;
+        }
+        return converter.toLatLng(fusedPose.getX(), fusedPose.getY());
+    }
+
+    public void recordLatestFusedPoseIfNeeded() {
+        if (!saveRecording || trajectory == null || latestFusedPose == null) {
+            return;
+        }
+        long poseTimestampMs = latestFusedPose.getTimestampMs();
+        if (poseTimestampMs <= 0 || poseTimestampMs == lastRecordedFusedPoseTimestampMs) {
+            return;
+        }
+
+        long relativeTimestampMs = Math.max(0L, poseTimestampMs - absoluteStartTime);
+        trajectory.addFusedPose(Traj.FusedPoseRecord.newBuilder()
+                .setRelativeTimestamp(relativeTimestampMs)
+                .setX(latestFusedPose.getX())
+                .setY(latestFusedPose.getY())
+                .setFloor(latestFusedPose.getFloor())
+                .setConfidence((float) latestFusedPose.getConfidence())
+                .build());
+        lastRecordedFusedPoseTimestampMs = poseTimestampMs;
+    }
+
+    @Nullable
+    private CoordinateConverter getOrCreateCoordinateConverter(double fallbackLatitudeDeg, double fallbackLongitudeDeg) {
+        if (coordinateConverter != null) {
+            return coordinateConverter;
+        }
+        if (hasManualStartLocation && startLocation != null && startLocation.length >= 2) {
+            // Legacy developer-only manual origin. Formal recording flow clears this before start.
+            coordinateConverter = new CoordinateConverter(startLocation[0], startLocation[1]);
+            return coordinateConverter;
+        }
+        if (fallbackLatitudeDeg == 0.0 && fallbackLongitudeDeg == 0.0) {
+            return null;
+        }
+        setTrajectoryOrigin(fallbackLatitudeDeg, fallbackLongitudeDeg, false);
+        return coordinateConverter;
+    }
+
+    private void setTrajectoryOrigin(double latitudeDeg, double longitudeDeg, boolean manualOrigin) {
+        this.startLocation = new float[]{(float) latitudeDeg, (float) longitudeDeg};
+        this.hasManualStartLocation = manualOrigin;
+        this.coordinateConverter = new CoordinateConverter(latitudeDeg, longitudeDeg);
+    }
+
+    private float getCurrentHeadingRad() {
+        if (orientation == null || orientation.length == 0 || Float.isNaN(orientation[0])) {
+            return 0f;
+        }
+        return orientation[0];
+    }
+
+    private float normalizeHeadingDelta(float deltaHeadingRad) {
+        float twoPi = (float) (Math.PI * 2.0);
+        float normalized = deltaHeadingRad % twoPi;
+        if (normalized > Math.PI) {
+            normalized -= twoPi;
+        } else if (normalized < -Math.PI) {
+            normalized += twoPi;
+        }
+        return normalized;
     }
 
     /**
@@ -1058,8 +1158,9 @@ public class SensorFusion implements SensorEventListener, Observer {
             latLong[0] = latitude;
             latLong[1] = longitude;
         }
-        else{
-            latLong = startLocation;
+        else if (startLocation != null && startLocation.length >= 2) {
+            latLong[0] = startLocation[0];
+            latLong[1] = startLocation[1];
         }
         return latLong;
     }
@@ -1070,7 +1171,19 @@ public class SensorFusion implements SensorEventListener, Observer {
      * @param startPosition contains the initial location set by the user
      */
     public void setStartGNSSLatitude(float[] startPosition){
-        startLocation = startPosition;
+        if (startPosition == null || startPosition.length < 2) {
+            startLocation = null;
+            hasManualStartLocation = false;
+            coordinateConverter = null;
+            return;
+        }
+        setTrajectoryOrigin(startPosition[0], startPosition[1], true);
+    }
+
+    public void clearLegacyManualStartLocation() {
+        startLocation = null;
+        hasManualStartLocation = false;
+        coordinateConverter = null;
     }
 
     public synchronized void setCollectionVenue(String venueId) {
@@ -1425,7 +1538,9 @@ public class SensorFusion implements SensorEventListener, Observer {
                 .setBarometerInfo(createInfoBuilder(barometerSensor))
                 .setLightSensorInfo(createInfoBuilder(lightSensor));
 
-        maybeSetInitialPosition(trajectoryBuilder, startLocation);
+        if (hasManualStartLocation) {
+            maybeSetInitialPosition(trajectoryBuilder, startLocation);
+        }
 
         this.trajectory = trajectoryBuilder;
 
@@ -1438,11 +1553,17 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.storeTrajectoryTimer = new Timer();
         this.storeTrajectoryTimer.schedule(new storeDataInTrajectory(), 0, TIME_CONST);
         this.pdrProcessing.resetPDR();
+        this.elevation = 0f;
+        this.elevator = false;
         this.particleFilterEngine = new ParticleFilterEngine();
         this.pfInitialized = false;
         this.latestFusedPose = null;
-        this.lastPfPdrX = 0f;
-        this.lastPfPdrY = 0f;
+        this.coordinateConverter = hasManualStartLocation && startLocation != null && startLocation.length >= 2
+                ? new CoordinateConverter(startLocation[0], startLocation[1])
+                : null;
+        this.lastPredictHeadingRad = getCurrentHeadingRad();
+        this.lastPredictElevation = this.elevation;
+        this.lastRecordedFusedPoseTimestampMs = -1L;
         if(settings.getBoolean("overwrite_constants", false)) {
             this.filter_coefficient = Float.parseFloat(settings.getString("accel_filter", "0.96"));
         } else {
@@ -1502,6 +1623,7 @@ public class SensorFusion implements SensorEventListener, Observer {
      * @see SettingsFragment navigation that might cancel recording.
      */
     public void stopRecording() {
+        recordLatestFusedPoseIfNeeded();
         // Only cancel if we are running
         if(this.saveRecording) {
             this.saveRecording = false;
@@ -1552,6 +1674,20 @@ public class SensorFusion implements SensorEventListener, Observer {
         Traj.GNSSPosition.Builder pos = Traj.GNSSPosition.newBuilder()
                 .setLatitude(startLoc[0])
                 .setLongitude(startLoc[1]);
+        builder.setInitialPosition(pos);
+    }
+
+    static void maybeSetInitialPositionIfAbsent(
+            @Nullable Traj.Trajectory.Builder builder,
+            double latitudeDeg,
+            double longitudeDeg
+    ) {
+        if (builder == null || builder.hasInitialPosition()) {
+            return;
+        }
+        Traj.GNSSPosition.Builder pos = Traj.GNSSPosition.newBuilder()
+                .setLatitude(latitudeDeg)
+                .setLongitude(longitudeDeg);
         builder.setInitialPosition(pos);
     }
 
