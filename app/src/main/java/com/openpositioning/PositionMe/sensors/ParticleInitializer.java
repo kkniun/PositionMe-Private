@@ -32,7 +32,7 @@ public class ParticleInitializer {
     }
 
     public List<Particle> initialize(double fixX, double fixY, int floor, int particleCount) {
-        return initialize(fixX, fixY, floor, particleCount, DEFAULT_POSITION_STD_M, allowAll());
+        return initialize(fixX, fixY, floor, particleCount, DEFAULT_POSITION_STD_M, 0.0, allowAll());
     }
 
     public List<Particle> initialize(
@@ -41,6 +41,18 @@ public class ParticleInitializer {
             int floor,
             int particleCount,
             double positionStdMeters,
+            SpawnValidator validator
+    ) {
+        return initialize(fixX, fixY, floor, particleCount, positionStdMeters, 0.0, validator);
+    }
+
+    public List<Particle> initialize(
+            double fixX,
+            double fixY,
+            int floor,
+            int particleCount,
+            double positionStdMeters,
+            double headingRad,
             SpawnValidator validator
     ) {
         List<Particle> particles = new ArrayList<>();
@@ -73,7 +85,7 @@ public class ParticleInitializer {
                 sampleY = fixY;
             }
 
-            particles.add(new Particle(sampleX, sampleY, floor, initialWeight));
+            particles.add(new Particle(sampleX, sampleY, floor, initialWeight, headingRad));
         }
 
         return particles;

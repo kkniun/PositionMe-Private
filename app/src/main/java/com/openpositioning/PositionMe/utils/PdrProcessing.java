@@ -6,6 +6,7 @@ import android.hardware.SensorManager;
 
 import androidx.preference.PreferenceManager;
 
+import com.openpositioning.PositionMe.sensors.PdrDelta;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 
 import java.util.Arrays;
@@ -140,41 +141,34 @@ public class PdrProcessing {
      * @param headingRad                heading relative to magnetic north in radians.
      */
     public float[] updatePdr(long currentStepEnd, List<Double> accelMagnitudeOvertime, float headingRad) {
-        if (accelMagnitudeOvertime == null || accelMagnitudeOvertime.size() < MIN_REQUIRED_SAMPLES) {
-            return new float[]{this.positionX, this.positionY};  // Return current position without update
-                                                                // - TODO - temporary solution of the empty list issue
+        PdrDelta delta = buildStepDelta(accelMagnitudeOvertime, 0f, 0f);
+        return applyStepDelta(delta, headingRad);
+    }
+
+    public PdrDelta buildStepDelta(
+            List<Double> accelMagnitudeOvertime,
+            float deltaHeadingRad,
+            float heightDeltaMeters
+    ) {
+        float computedStepLength = computeStepLength(accelMagnitudeOvertime);
+        if (computedStepLength > 0f) {
+            sumStepLength += computedStepLength;
+            stepCount++;
         }
+        return new PdrDelta(computedStepLength, deltaHeadingRad, heightDeltaMeters);
+    }
 
-        // Change angle so zero rad is east
-        float adaptedHeading = (float) (Math.PI/2 - headingRad);
-
-        // check if accelMagnitudeOvertime is empty
-        if (accelMagnitudeOvertime == null || accelMagnitudeOvertime.isEmpty()) {
-            // return current position, do not update
+    public float[] applyStepDelta(PdrDelta delta, float headingRad) {
+        if (delta == null || delta.getStepLengthMeters() <= 0f) {
             return new float[]{this.positionX, this.positionY};
         }
-        
-        // Calculate step length
-        if(!useManualStep) {
-            //ArrayList<Double> accelMagnitudeFiltered = filter(accelMagnitudeOvertime);
-            // Estimate stride
-            this.stepLength = weibergMinMax(accelMagnitudeOvertime);
-            // System.err.println("Step Length" + stepLength);
-        }
 
-        // Increment aggregate variables
-        sumStepLength += stepLength;
-        stepCount++;
+        float adaptedHeading = (float) (Math.PI / 2 - headingRad);
+        float x = (float) (delta.getStepLengthMeters() * Math.cos(adaptedHeading));
+        float y = (float) (delta.getStepLengthMeters() * Math.sin(adaptedHeading));
 
-        // Translate to cartesian coordinate system
-        float x = (float) (stepLength * Math.cos(adaptedHeading));
-        float y = (float) (stepLength * Math.sin(adaptedHeading));
-
-        // Update position values
         this.positionX += x;
         this.positionY += y;
-
-        // return current position
         return new float[]{this.positionX, this.positionY};
     }
 
@@ -259,6 +253,20 @@ public class PdrProcessing {
         }
 
         return bounce * K * 2;
+    }
+
+    private float computeStepLength(List<Double> accelMagnitudeOvertime) {
+        if (useManualStep) {
+            return this.stepLength;
+        }
+        if (accelMagnitudeOvertime == null || accelMagnitudeOvertime.size() < MIN_REQUIRED_SAMPLES) {
+            return 0f;
+        }
+        if (accelMagnitudeOvertime.isEmpty()) {
+            return 0f;
+        }
+        this.stepLength = weibergMinMax(accelMagnitudeOvertime);
+        return this.stepLength;
     }
 
     /**
@@ -403,6 +411,9 @@ public class PdrProcessing {
      * @return  average step length in meters.
      */
     public float getAverageStepLength(){
+        if (stepCount == 0) {
+            return 0f;
+        }
         //Calculate average step length
         float averageStepLength = sumStepLength/(float) stepCount;
 

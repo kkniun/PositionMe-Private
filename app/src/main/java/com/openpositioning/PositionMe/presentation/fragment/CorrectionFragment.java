@@ -160,13 +160,6 @@ public class CorrectionFragment extends Fragment {
         this.button.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                // ************* CHANGED CODE HERE *************
-                // Before:
-                //   NavDirections action = CorrectionFragmentDirections.actionCorrectionFragmentToHomeFragment();
-                //   Navigation.findNavController(view).navigate(action);
-                //   ((AppCompatActivity)getActivity()).getSupportActionBar().show();
-
-                // Now, simply tell the Activity we are done:
                 ((RecordingActivity) requireActivity()).finishFlow();
             }
         });

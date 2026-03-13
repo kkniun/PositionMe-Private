@@ -4,13 +4,17 @@ import android.content.Context;
 import android.hardware.SensorManager;
 import android.util.Log;
 
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+
 import com.google.android.gms.maps.model.LatLng;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonObject;
 import com.openpositioning.PositionMe.presentation.fragment.ReplayFragment;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
+import com.openpositioning.PositionMe.utils.CoordinateConverter;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -61,7 +65,7 @@ public class TrajParser {
      * orientation, speed, and timestamp.
      */
     public static class ReplayPoint {
-        public LatLng pdrLocation;  // PDR-derived location estimate
+        public LatLng trackLocation;  // Fused track estimate (or legacy PDR fallback)
         public LatLng gnssLocation; // GNSS location (may be null if unavailable)
         public float orientation;   // Orientation in degrees
         public float speed;         // Speed in meters per second
@@ -73,7 +77,7 @@ public class TrajParser {
         /**
          * Constructs a ReplayPoint.
          *
-         * @param pdrLocation  The pedestrian dead reckoning (PDR) location.
+         * @param trackLocation The fused or fallback track location.
          * @param gnssLocation The GNSS location, or null if unavailable.
          * @param orientation  The orientation angle in degrees.
          * @param speed        The speed in meters per second.
@@ -83,7 +87,7 @@ public class TrajParser {
          * @param elevation    The relative elevation in metres.
          */
         public ReplayPoint(
-                LatLng pdrLocation,
+                LatLng trackLocation,
                 LatLng gnssLocation,
                 float orientation,
                 float speed,
@@ -92,7 +96,7 @@ public class TrajParser {
                 boolean elevator,
                 float elevation
         ) {
-            this.pdrLocation = pdrLocation;
+            this.trackLocation = trackLocation;
             this.gnssLocation = gnssLocation;
             this.orientation = orientation;
             this.speed = speed;
@@ -115,6 +119,49 @@ public class TrajParser {
         }
     }
 
+    public enum ReplayInitializationSource {
+        FUSED_POSE,
+        ABSOLUTE_FIX,
+        LEGACY_FALLBACK,
+        UNAVAILABLE
+    }
+
+    public static final class ReplayInitialization {
+        @Nullable
+        public final LatLng origin;
+        public final boolean useFusedPose;
+        @NonNull
+        public final ReplayInitializationSource source;
+
+        public ReplayInitialization(
+                @Nullable LatLng origin,
+                boolean useFusedPose,
+                @NonNull ReplayInitializationSource source
+        ) {
+            this.origin = origin;
+            this.useFusedPose = useFusedPose;
+            this.source = source;
+        }
+
+        public boolean hasOrigin() {
+            return origin != null;
+        }
+
+        public static ReplayInitialization unavailable(boolean useFusedPose) {
+            return new ReplayInitialization(null, useFusedPose, ReplayInitializationSource.UNAVAILABLE);
+        }
+    }
+
+    private static final class TimestampedLatLng {
+        private final long relativeTimestamp;
+        private final LatLng latLng;
+
+        private TimestampedLatLng(long relativeTimestamp, @NonNull LatLng latLng) {
+            this.relativeTimestamp = relativeTimestamp;
+            this.latLng = latLng;
+        }
+    }
+
     /** Represents an IMU (Inertial Measurement Unit) data record used for orientation calculations. */
     private static class ImuRecord {
         public long relativeTimestamp;
@@ -130,6 +177,13 @@ public class TrajParser {
         public int floor;
         public boolean elevator;
         public float elevation;
+    }
+
+    private static class FusedPoseRecord {
+        public long relativeTimestamp;
+        public double x, y;
+        public int floor;
+        public float confidence;
     }
 
     /** Represents a GNSS (Global Navigation Satellite System) data record with latitude/longitude. */
@@ -180,51 +234,97 @@ public class TrajParser {
             List<ImuRecord> imuList = parseImuData(root.getAsJsonArray("imuData"));
             List<PdrRecord> pdrList = parsePdrData(root.getAsJsonArray("pdrData"));
             List<GnssRecord> gnssList = parseGnssData(root.getAsJsonArray("gnssData"));
+            List<FusedPoseRecord> fusedPoseList = parseFusedPoseData(root.getAsJsonArray("fusedPose"));
+            CoordinateConverter coordinateConverter = new CoordinateConverter(originLat, originLng);
 
             Log.i(TAG, "Parsed data - IMU: " + imuList.size() + " records, PDR: "
-                    + pdrList.size() + " records, GNSS: " + gnssList.size() + " records");
+                    + pdrList.size() + " records, GNSS: " + gnssList.size() + " records, Fused: "
+                    + fusedPoseList.size() + " records");
 
-            for (int i = 0; i < pdrList.size(); i++) {
-                PdrRecord pdr = pdrList.get(i);
+            if (!fusedPoseList.isEmpty()) {
+                for (int i = 0; i < fusedPoseList.size(); i++) {
+                    FusedPoseRecord fusedPose = fusedPoseList.get(i);
 
-                ImuRecord closestImu = findClosestImuRecord(imuList, pdr.relativeTimestamp);
-                float orientationDeg = closestImu != null ? computeOrientationFromRotationVector(
-                        closestImu.rotationVectorX,
-                        closestImu.rotationVectorY,
-                        closestImu.rotationVectorZ,
-                        closestImu.rotationVectorW,
-                        context
-                ) : 0f;
+                    ImuRecord closestImu = findClosestImuRecord(imuList, fusedPose.relativeTimestamp);
+                    float orientationDeg = closestImu != null ? computeOrientationFromRotationVector(
+                            closestImu.rotationVectorX,
+                            closestImu.rotationVectorY,
+                            closestImu.rotationVectorZ,
+                            closestImu.rotationVectorW,
+                            context
+                    ) : 0f;
 
-                float speed = 0f;
-                if (i > 0) {
-                    PdrRecord prev = pdrList.get(i - 1);
-                    double dt = (pdr.relativeTimestamp - prev.relativeTimestamp) / 1000.0;
-                    double dx = pdr.x - prev.x;
-                    double dy = pdr.y - prev.y;
-                    double distance = Math.sqrt(dx * dx + dy * dy);
-                    if (dt > 0) speed = (float) (distance / dt);
+                    float speed = 0f;
+                    if (i > 0) {
+                        FusedPoseRecord previous = fusedPoseList.get(i - 1);
+                        double dt = (fusedPose.relativeTimestamp - previous.relativeTimestamp) / 1000.0;
+                        double dx = fusedPose.x - previous.x;
+                        double dy = fusedPose.y - previous.y;
+                        double distance = Math.sqrt(dx * dx + dy * dy);
+                        if (dt > 0) {
+                            speed = (float) (distance / dt);
+                        }
+                    }
+
+                    LatLng trackLocation = coordinateConverter.toLatLng(fusedPose.x, fusedPose.y);
+                    GnssRecord closestGnss = findClosestGnssRecord(gnssList, fusedPose.relativeTimestamp);
+                    LatLng gnssLocation = closestGnss != null
+                            ? new LatLng(closestGnss.latitude, closestGnss.longitude)
+                            : null;
+                    PdrRecord closestPdr = findClosestPdrRecord(pdrList, fusedPose.relativeTimestamp);
+                    boolean elevator = closestPdr != null && closestPdr.elevator;
+                    float elevation = closestPdr != null ? closestPdr.elevation : 0f;
+
+                    result.add(new ReplayPoint(
+                            trackLocation,
+                            gnssLocation,
+                            orientationDeg,
+                            speed,
+                            fusedPose.relativeTimestamp,
+                            fusedPose.floor,
+                            elevator,
+                            elevation
+                    ));
                 }
+            } else {
+                for (int i = 0; i < pdrList.size(); i++) {
+                    PdrRecord pdr = pdrList.get(i);
 
+                    ImuRecord closestImu = findClosestImuRecord(imuList, pdr.relativeTimestamp);
+                    float orientationDeg = closestImu != null ? computeOrientationFromRotationVector(
+                            closestImu.rotationVectorX,
+                            closestImu.rotationVectorY,
+                            closestImu.rotationVectorZ,
+                            closestImu.rotationVectorW,
+                            context
+                    ) : 0f;
 
-                double lat = originLat + pdr.y * 1E-5;
-                double lng = originLng + pdr.x * 1E-5;
-                LatLng pdrLocation = new LatLng(lat, lng);
+                    float speed = 0f;
+                    if (i > 0) {
+                        PdrRecord prev = pdrList.get(i - 1);
+                        double dt = (pdr.relativeTimestamp - prev.relativeTimestamp) / 1000.0;
+                        double dx = pdr.x - prev.x;
+                        double dy = pdr.y - prev.y;
+                        double distance = Math.sqrt(dx * dx + dy * dy);
+                        if (dt > 0) speed = (float) (distance / dt);
+                    }
 
-                GnssRecord closestGnss = findClosestGnssRecord(gnssList, pdr.relativeTimestamp);
-                LatLng gnssLocation = closestGnss != null ?
-                        new LatLng(closestGnss.latitude, closestGnss.longitude) : null;
+                    LatLng trackLocation = coordinateConverter.toLatLng(pdr.x, pdr.y);
+                    GnssRecord closestGnss = findClosestGnssRecord(gnssList, pdr.relativeTimestamp);
+                    LatLng gnssLocation = closestGnss != null ?
+                            new LatLng(closestGnss.latitude, closestGnss.longitude) : null;
 
-                result.add(new ReplayPoint(
-                        pdrLocation,
-                        gnssLocation,
-                        orientationDeg,
-                        speed,
-                        pdr.relativeTimestamp,
-                        pdr.floor,
-                        pdr.elevator,
-                        pdr.elevation
-                ));
+                    result.add(new ReplayPoint(
+                            trackLocation,
+                            gnssLocation,
+                            orientationDeg,
+                            speed,
+                            pdr.relativeTimestamp,
+                            pdr.floor,
+                            pdr.elevator,
+                            pdr.elevation
+                    ));
+                }
             }
 
             Collections.sort(result, Comparator.comparingLong(rp -> rp.timestamp));
@@ -238,6 +338,206 @@ public class TrajParser {
         return result;
     }
 
+    public static List<ReplayPoint> parseTrajectoryData(
+            String filePath,
+            Context context,
+            @Nullable ReplayInitialization replayInitialization
+    ) {
+        List<ReplayPoint> result = new ArrayList<>();
+
+        try {
+            JsonObject root = readRootObject(filePath);
+            if (root == null) {
+                return result;
+            }
+
+            ReplayInitialization effectiveInitialization = replayInitialization != null
+                    ? replayInitialization
+                    : resolveReplayInitialization(root);
+            if (!effectiveInitialization.hasOrigin()) {
+                Log.w(TAG, "No replay origin found in file. Replay data cannot be reconstructed.");
+                return result;
+            }
+
+            LatLng origin = effectiveInitialization.origin;
+            CoordinateConverter coordinateConverter =
+                    new CoordinateConverter(origin.latitude, origin.longitude);
+
+            Log.i(TAG, "Successfully read trajectory file: " + filePath);
+            Log.i(TAG, "Replay initialization source: " + effectiveInitialization.source
+                    + ", useFusedPose=" + effectiveInitialization.useFusedPose
+                    + ", origin=" + origin);
+
+            List<ImuRecord> imuList = parseImuData(getArray(root, "imuData", "imu_data"));
+            List<PdrRecord> pdrList = parsePdrData(getArray(root, "pdrData", "pdr_data"));
+            List<GnssRecord> gnssList = parseGnssData(getArray(root, "gnssData", "gnss_data"));
+            List<FusedPoseRecord> fusedPoseList =
+                    parseFusedPoseData(getArray(root, "fusedPose", "fused_pose"));
+
+            Log.i(TAG, "Parsed data - IMU: " + imuList.size() + " records, PDR: "
+                    + pdrList.size() + " records, GNSS: " + gnssList.size() + " records, Fused: "
+                    + fusedPoseList.size() + " records");
+
+            boolean useFusedPose = effectiveInitialization.useFusedPose && !fusedPoseList.isEmpty();
+            if (useFusedPose) {
+                for (int i = 0; i < fusedPoseList.size(); i++) {
+                    FusedPoseRecord fusedPose = fusedPoseList.get(i);
+
+                    ImuRecord closestImu = findClosestImuRecord(imuList, fusedPose.relativeTimestamp);
+                    float orientationDeg = closestImu != null ? computeOrientationFromRotationVector(
+                            closestImu.rotationVectorX,
+                            closestImu.rotationVectorY,
+                            closestImu.rotationVectorZ,
+                            closestImu.rotationVectorW,
+                            context
+                    ) : 0f;
+
+                    float speed = 0f;
+                    if (i > 0) {
+                        FusedPoseRecord previous = fusedPoseList.get(i - 1);
+                        double dt = (fusedPose.relativeTimestamp - previous.relativeTimestamp) / 1000.0;
+                        double dx = fusedPose.x - previous.x;
+                        double dy = fusedPose.y - previous.y;
+                        double distance = Math.sqrt(dx * dx + dy * dy);
+                        if (dt > 0) {
+                            speed = (float) (distance / dt);
+                        }
+                    }
+
+                    LatLng trackLocation = coordinateConverter.toLatLng(fusedPose.x, fusedPose.y);
+                    GnssRecord closestGnss = findClosestGnssRecord(gnssList, fusedPose.relativeTimestamp);
+                    LatLng gnssLocation = closestGnss != null
+                            ? new LatLng(closestGnss.latitude, closestGnss.longitude)
+                            : null;
+                    PdrRecord closestPdr = findClosestPdrRecord(pdrList, fusedPose.relativeTimestamp);
+                    boolean elevator = closestPdr != null && closestPdr.elevator;
+                    float elevation = closestPdr != null ? closestPdr.elevation : 0f;
+
+                    result.add(new ReplayPoint(
+                            trackLocation,
+                            gnssLocation,
+                            orientationDeg,
+                            speed,
+                            fusedPose.relativeTimestamp,
+                            fusedPose.floor,
+                            elevator,
+                            elevation
+                    ));
+                }
+            } else {
+                for (int i = 0; i < pdrList.size(); i++) {
+                    PdrRecord pdr = pdrList.get(i);
+
+                    ImuRecord closestImu = findClosestImuRecord(imuList, pdr.relativeTimestamp);
+                    float orientationDeg = closestImu != null ? computeOrientationFromRotationVector(
+                            closestImu.rotationVectorX,
+                            closestImu.rotationVectorY,
+                            closestImu.rotationVectorZ,
+                            closestImu.rotationVectorW,
+                            context
+                    ) : 0f;
+
+                    float speed = 0f;
+                    if (i > 0) {
+                        PdrRecord prev = pdrList.get(i - 1);
+                        double dt = (pdr.relativeTimestamp - prev.relativeTimestamp) / 1000.0;
+                        double dx = pdr.x - prev.x;
+                        double dy = pdr.y - prev.y;
+                        double distance = Math.sqrt(dx * dx + dy * dy);
+                        if (dt > 0) {
+                            speed = (float) (distance / dt);
+                        }
+                    }
+
+                    LatLng trackLocation = coordinateConverter.toLatLng(pdr.x, pdr.y);
+                    GnssRecord closestGnss = findClosestGnssRecord(gnssList, pdr.relativeTimestamp);
+                    LatLng gnssLocation = closestGnss != null
+                            ? new LatLng(closestGnss.latitude, closestGnss.longitude)
+                            : null;
+
+                    result.add(new ReplayPoint(
+                            trackLocation,
+                            gnssLocation,
+                            orientationDeg,
+                            speed,
+                            pdr.relativeTimestamp,
+                            pdr.floor,
+                            pdr.elevator,
+                            pdr.elevation
+                    ));
+                }
+            }
+
+            Collections.sort(result, Comparator.comparingLong(rp -> rp.timestamp));
+            Log.i(TAG, "Final ReplayPoints count: " + result.size());
+        } catch (Exception e) {
+            Log.e(TAG, "Error parsing trajectory file!", e);
+        }
+
+        return result;
+    }
+
+    public static ReplayInitialization resolveReplayInitialization(String filePath) {
+        try {
+            JsonObject root = readRootObject(filePath);
+            if (root == null) {
+                return ReplayInitialization.unavailable(false);
+            }
+            return resolveReplayInitialization(root);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to resolve replay initialization for file: " + filePath, e);
+            return ReplayInitialization.unavailable(false);
+        }
+    }
+
+    static ReplayInitialization resolveReplayInitialization(@Nullable JsonObject root) {
+        if (root == null) {
+            return ReplayInitialization.unavailable(false);
+        }
+
+        boolean hasFusedPose = hasReplayRecords(getArray(root, "fusedPose", "fused_pose"));
+        TimestampedLatLng firstAbsoluteFix = findFirstAbsoluteFix(root);
+        LatLng legacyInitialPosition = findLegacyInitialPosition(root);
+
+        if (hasFusedPose) {
+            if (firstAbsoluteFix != null) {
+                return new ReplayInitialization(
+                        firstAbsoluteFix.latLng,
+                        true,
+                        ReplayInitializationSource.FUSED_POSE
+                );
+            }
+            if (legacyInitialPosition != null) {
+                // Legacy manual-start trajectories may contain fused_pose but no recorded
+                // absolute fix. We keep this fallback for backwards compatibility only.
+                return new ReplayInitialization(
+                        legacyInitialPosition,
+                        true,
+                        ReplayInitializationSource.LEGACY_FALLBACK
+                );
+            }
+            return ReplayInitialization.unavailable(true);
+        }
+
+        if (firstAbsoluteFix != null) {
+            return new ReplayInitialization(
+                    firstAbsoluteFix.latLng,
+                    false,
+                    ReplayInitializationSource.ABSOLUTE_FIX
+            );
+        }
+        if (legacyInitialPosition != null) {
+            // Legacy PDR-only trajectories may still rely on initialPosition/manual start.
+            // This fallback is intentionally last and is not part of the formal fusion path.
+            return new ReplayInitialization(
+                    legacyInitialPosition,
+                    false,
+                    ReplayInitializationSource.LEGACY_FALLBACK
+            );
+        }
+        return ReplayInitialization.unavailable(false);
+    }
+
     public static List<ReplayTestPoint> parseTestPoints(String filePath) {
         List<ReplayTestPoint> result = new ArrayList<>();
         try {
@@ -246,9 +546,9 @@ public class TrajParser {
                 return result;
             }
 
-            JsonArray testPointArray = root.getAsJsonArray("testPoints");
+            JsonArray testPointArray = getArray(root, "testPoints", "test_points");
             if (testPointArray == null) {
-                JsonArray legacyArray = root.getAsJsonArray("legacyTestPoints");
+                JsonArray legacyArray = getArray(root, "legacyTestPoints", "legacy_test_points");
                 if (legacyArray == null) {
                     return result;
                 }
@@ -342,6 +642,184 @@ public class TrajParser {
         return pdrList;
     }
 
+    private static List<FusedPoseRecord> parseFusedPoseData(JsonArray fusedPoseArray) {
+        List<FusedPoseRecord> fusedPoseList = new ArrayList<>();
+        if (fusedPoseArray == null) {
+            return fusedPoseList;
+        }
+        Gson gson = new Gson();
+        for (int i = 0; i < fusedPoseArray.size(); i++) {
+            FusedPoseRecord record = gson.fromJson(fusedPoseArray.get(i), FusedPoseRecord.class);
+            if (record != null) {
+                fusedPoseList.add(record);
+            }
+        }
+        return fusedPoseList;
+    }
+
+    private static boolean hasReplayRecords(@Nullable JsonArray array) {
+        return array != null && array.size() > 0;
+    }
+
+    @Nullable
+    private static TimestampedLatLng findFirstAbsoluteFix(@NonNull JsonObject root) {
+        TimestampedLatLng firstGnssFix = findFirstGnssFix(getArray(root, "gnssData", "gnss_data"));
+        TimestampedLatLng firstWifiFix =
+                findFirstWifiFix(getArray(root, "wifiFingerprints", "wifi_fingerprints"));
+        return earlierOf(firstGnssFix, firstWifiFix);
+    }
+
+    @Nullable
+    private static TimestampedLatLng findFirstGnssFix(@Nullable JsonArray gnssArray) {
+        TimestampedLatLng earliest = null;
+        if (gnssArray == null) {
+            return null;
+        }
+        for (int i = 0; i < gnssArray.size(); i++) {
+            JsonObject reading = gnssArray.get(i).getAsJsonObject();
+            JsonObject position = getObject(reading, "position");
+            TimestampedLatLng candidate = parseTimestampedLatLng(
+                    position,
+                    getLong(reading, -1L, "relativeTimestamp", "relative_timestamp")
+            );
+            earliest = earlierOf(earliest, candidate);
+        }
+        return earliest;
+    }
+
+    @Nullable
+    private static TimestampedLatLng findFirstWifiFix(@Nullable JsonArray wifiFingerprintsArray) {
+        TimestampedLatLng earliest = null;
+        if (wifiFingerprintsArray == null) {
+            return null;
+        }
+        for (int i = 0; i < wifiFingerprintsArray.size(); i++) {
+            JsonObject fingerprint = wifiFingerprintsArray.get(i).getAsJsonObject();
+            long fingerprintTimestamp = getLong(
+                    fingerprint,
+                    -1L,
+                    "relativeTimestamp",
+                    "relative_timestamp"
+            );
+            JsonArray rfScans = getArray(fingerprint, "rfScans", "rf_scans");
+            if (rfScans == null) {
+                continue;
+            }
+            for (int j = 0; j < rfScans.size(); j++) {
+                JsonObject rfScan = rfScans.get(j).getAsJsonObject();
+                JsonObject position = getObject(rfScan, "position");
+                TimestampedLatLng candidate = parseTimestampedLatLng(
+                        position,
+                        getLong(rfScan, fingerprintTimestamp, "relativeTimestamp", "relative_timestamp")
+                );
+                earliest = earlierOf(earliest, candidate);
+            }
+        }
+        return earliest;
+    }
+
+    @Nullable
+    private static LatLng findLegacyInitialPosition(@NonNull JsonObject root) {
+        JsonObject initialPosition = getObject(root, "initialPosition", "initial_position");
+        TimestampedLatLng parsed = parseTimestampedLatLng(initialPosition, -1L);
+        return parsed == null ? null : parsed.latLng;
+    }
+
+    @Nullable
+    private static TimestampedLatLng parseTimestampedLatLng(
+            @Nullable JsonObject positionObject,
+            long fallbackTimestamp
+    ) {
+        if (positionObject == null) {
+            return null;
+        }
+        Double latitude = getDouble(positionObject, "latitude");
+        Double longitude = getDouble(positionObject, "longitude");
+        if (latitude == null || longitude == null) {
+            return null;
+        }
+        long relativeTimestamp = getLong(
+                positionObject,
+                fallbackTimestamp,
+                "relativeTimestamp",
+                "relative_timestamp"
+        );
+        return new TimestampedLatLng(relativeTimestamp, new LatLng(latitude, longitude));
+    }
+
+    @Nullable
+    private static TimestampedLatLng earlierOf(
+            @Nullable TimestampedLatLng first,
+            @Nullable TimestampedLatLng second
+    ) {
+        if (first == null) {
+            return second;
+        }
+        if (second == null) {
+            return first;
+        }
+        return second.relativeTimestamp < first.relativeTimestamp ? second : first;
+    }
+
+    @Nullable
+    private static JsonArray getArray(@Nullable JsonObject object, String... keys) {
+        if (object == null) {
+            return null;
+        }
+        for (String key : keys) {
+            if (object.has(key) && object.get(key).isJsonArray()) {
+                return object.getAsJsonArray(key);
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    private static JsonObject getObject(@Nullable JsonObject object, String... keys) {
+        if (object == null) {
+            return null;
+        }
+        for (String key : keys) {
+            if (object.has(key) && object.get(key).isJsonObject()) {
+                return object.getAsJsonObject(key);
+            }
+        }
+        return null;
+    }
+
+    private static long getLong(@Nullable JsonObject object, long defaultValue, String... keys) {
+        if (object == null) {
+            return defaultValue;
+        }
+        for (String key : keys) {
+            if (object.has(key) && object.get(key).isJsonPrimitive()) {
+                try {
+                    return object.get(key).getAsLong();
+                } catch (NumberFormatException ignored) {
+                    return defaultValue;
+                }
+            }
+        }
+        return defaultValue;
+    }
+
+    @Nullable
+    private static Double getDouble(@Nullable JsonObject object, String... keys) {
+        if (object == null) {
+            return null;
+        }
+        for (String key : keys) {
+            if (object.has(key) && object.get(key).isJsonPrimitive()) {
+                try {
+                    return object.get(key).getAsDouble();
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
     /** Parses GNSS data from JSON. */
     private static List<GnssRecord> parseGnssData(JsonArray gnssArray) {
         List<GnssRecord> gnssList = new ArrayList<>();
@@ -367,6 +845,12 @@ public class TrajParser {
     private static GnssRecord findClosestGnssRecord(List<GnssRecord> gnssList, long targetTimestamp) {
         return gnssList.stream()
                 .min(Comparator.comparingLong(gnss -> Math.abs(gnss.relativeTimestamp - targetTimestamp)))
+                .orElse(null);
+    }
+
+    private static PdrRecord findClosestPdrRecord(List<PdrRecord> pdrList, long targetTimestamp) {
+        return pdrList.stream()
+                .min(Comparator.comparingLong(pdr -> Math.abs(pdr.relativeTimestamp - targetTimestamp)))
                 .orElse(null);
     }
 

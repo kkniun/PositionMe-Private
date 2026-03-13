@@ -15,12 +15,11 @@ import com.openpositioning.PositionMe.sensors.SensorFusion;
 
 
 /**
- * The RecordingActivity manages the recording flow of the application, guiding the user through a sequence
- * of screens for location selection, recording, and correction before finalizing the process.
+ * The RecordingActivity manages the recording flow of the application, guiding the user through
+ * recording and correction before finalizing the process.
  * <p>
  * This activity follows a structured workflow:
  * <ol>
- *     <li>StartLocationFragment - Allows users to select their starting location.</li>
  *     <li>RecordingFragment - Handles the recording process and contains a TrajectoryMapFragment.</li>
  *     <li>CorrectionFragment - Enables users to review and correct recorded data before completion.</li>
  * </ol>
@@ -28,10 +27,9 @@ import com.openpositioning.PositionMe.sensors.SensorFusion;
  * The activity ensures that the screen remains on during the recording process to prevent interruptions.
  * It also provides fragment transactions for seamless navigation between different stages of the workflow.
  * <p>
- * This class is referenced in various fragments such as HomeFragment, StartLocationFragment,
- * RecordingFragment, and CorrectionFragment to control navigation through the recording flow.
+ * This class is referenced in various fragments such as HomeFragment, RecordingFragment, and
+ * CorrectionFragment to control navigation through the recording flow.
  *
- * @see StartLocationFragment The first step in the recording process where users select their starting location.
  * @see RecordingFragment Handles data recording and map visualization.
  * @see CorrectionFragment Allows users to review and make corrections before finalizing the process.
  * @see com.openpositioning.PositionMe.R.layout#activity_recording The associated layout for this activity.
@@ -41,16 +39,21 @@ import com.openpositioning.PositionMe.sensors.SensorFusion;
 
 public class RecordingActivity extends AppCompatActivity {
 
+    public static final String EXTRA_TRAJECTORY_NAME = "extra_trajectory_name";
+
     private SensorFusion sensorFusion;
+    private String requestedTrajectoryName;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_recording);
         this.sensorFusion = SensorFusion.getInstance();
+        this.requestedTrajectoryName = getIntent().getStringExtra(EXTRA_TRAJECTORY_NAME);
 
         if (savedInstanceState == null) {
-            showStartLocationScreen(); // Start with the user selecting the start location
+            startFormalRecordingSession(requestedTrajectoryName);
+            showRecordingScreen();
         }
 
         // Keep screen on
@@ -64,8 +67,16 @@ public class RecordingActivity extends AppCompatActivity {
         sensorFusion.resumeListening();
     }
 
+    private void startFormalRecordingSession(@Nullable String trajectoryName) {
+        sensorFusion.clearLegacyManualStartLocation();
+        sensorFusion.setCollectionVenue(null);
+        sensorFusion.setTrajectoryName(trajectoryName);
+        sensorFusion.startRecording();
+    }
+
     /**
-     * Show the StartLocationFragment (beginning of flow).
+     * Legacy developer-only manual-start tool. This is intentionally not used in the default
+     * recording path so manual set cannot affect the formal fusion flow.
      */
     public void showStartLocationScreen() {
         FragmentTransaction ft = getSupportFragmentManager().beginTransaction();

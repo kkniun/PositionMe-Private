@@ -14,6 +14,7 @@ public class ParticleFilterEngine {
     private static final int DEFAULT_PARTICLE_COUNT = 100;
     private static final double DEFAULT_INITIAL_STD_M = 2.0;
     private static final double DEFAULT_PREDICTION_NOISE_STD_M = 0.35;
+    private static final double DEFAULT_HEADING_NOISE_STD_RAD = Math.toRadians(4.0);
     private static final double DEFAULT_ABSOLUTE_FIX_STD_M = 4.0;
     private static final double FLOOR_MISMATCH_PENALTY = 0.2;
     private static final double RESAMPLE_THRESHOLD_RATIO = 0.5;
@@ -50,36 +51,79 @@ public class ParticleFilterEngine {
     }
 
     public void initialize(double fixX, double fixY, int floor, long timestampMs) {
-        initialize(fixX, fixY, floor, timestampMs, DEFAULT_PARTICLE_COUNT);
+        initialize(fixX, fixY, floor, timestampMs, 0.0, DEFAULT_PARTICLE_COUNT, DEFAULT_INITIAL_STD_M);
+    }
+
+    public void initialize(double fixX, double fixY, int floor, long timestampMs, double headingRad) {
+        initialize(fixX, fixY, floor, timestampMs, headingRad, DEFAULT_PARTICLE_COUNT, DEFAULT_INITIAL_STD_M);
+    }
+
+    public void initialize(
+            double fixX,
+            double fixY,
+            int floor,
+            long timestampMs,
+            double headingRad,
+            double positionStdMeters
+    ) {
+        initialize(fixX, fixY, floor, timestampMs, headingRad, DEFAULT_PARTICLE_COUNT, positionStdMeters);
     }
 
     public void initialize(double fixX, double fixY, int floor, long timestampMs, int particleCount) {
+        initialize(fixX, fixY, floor, timestampMs, 0.0, particleCount, DEFAULT_INITIAL_STD_M);
+    }
+
+    public void initialize(
+            double fixX,
+            double fixY,
+            int floor,
+            long timestampMs,
+            double headingRad,
+            int particleCount,
+            double positionStdMeters
+    ) {
         particles.clear();
         particles.addAll(particleInitializer.initialize(
                 fixX,
                 fixY,
                 floor,
                 particleCount,
-                DEFAULT_INITIAL_STD_M,
+                positionStdMeters,
+                headingRad,
                 spawnValidator
         ));
         lastTimestampMs = timestampMs;
         normalizeWeights();
     }
 
-    public void predict(double deltaX, double deltaY, int floor, long timestampMs) {
-        if (particles.isEmpty()) {
+    public void predict(PdrDelta delta, int floor, long timestampMs) {
+        if (particles.isEmpty() || delta == null) {
             return;
         }
 
+        double stepLengthMeters = delta.getStepLengthMeters();
+        double deltaHeadingRad = delta.getDeltaHeadingRad();
+        double heightDeltaMeters = delta.getHeightDeltaMeters();
         for (Particle particle : particles) {
             double previousX = particle.getX();
             double previousY = particle.getY();
             int previousFloor = particle.getFloor();
+            double previousHeadingRad = particle.getHeadingRad();
 
-            double predictedX = previousX + deltaX + random.nextGaussian() * DEFAULT_PREDICTION_NOISE_STD_M;
-            double predictedY = previousY + deltaY + random.nextGaussian() * DEFAULT_PREDICTION_NOISE_STD_M;
-            int predictedFloor = floor;
+            double predictedHeadingRad = normalizeHeading(
+                    previousHeadingRad
+                            + deltaHeadingRad
+                            + random.nextGaussian() * DEFAULT_HEADING_NOISE_STD_RAD
+            );
+            double predictedX = previousX
+                    + stepLengthMeters * Math.cos(predictedHeadingRad)
+                    + random.nextGaussian() * DEFAULT_PREDICTION_NOISE_STD_M;
+            double predictedY = previousY
+                    + stepLengthMeters * Math.sin(predictedHeadingRad)
+                    + random.nextGaussian() * DEFAULT_PREDICTION_NOISE_STD_M;
+            int predictedFloor = Math.abs(heightDeltaMeters) > 1e-3 || floor != previousFloor
+                    ? floor
+                    : previousFloor;
 
             // 这里先保留最小运动模型。
             // 后续应在此接入墙体约束、楼梯/电梯约束和 map matching。
@@ -87,23 +131,44 @@ public class ParticleFilterEngine {
                 predictedX = previousX;
                 predictedY = previousY;
                 predictedFloor = previousFloor;
+                predictedHeadingRad = previousHeadingRad;
             }
 
             particle.setX(predictedX);
             particle.setY(predictedY);
             particle.setFloor(predictedFloor);
+            particle.setHeadingRad(predictedHeadingRad);
         }
 
         lastTimestampMs = timestampMs;
     }
 
     public void updateWithAbsoluteFix(double fixX, double fixY, int floor, long timestampMs) {
+        updateWithAbsoluteFix(fixX, fixY, floor, timestampMs, DEFAULT_ABSOLUTE_FIX_STD_M);
+    }
+
+    public void updateWithAbsoluteFix(
+            double fixX,
+            double fixY,
+            int floor,
+            long timestampMs,
+            double accuracyMeters
+    ) {
         if (particles.isEmpty()) {
-            initialize(fixX, fixY, floor, timestampMs);
+            initialize(
+                    fixX,
+                    fixY,
+                    floor,
+                    timestampMs,
+                    0.0,
+                    DEFAULT_PARTICLE_COUNT,
+                    sanitizeAccuracyMeters(accuracyMeters)
+            );
             return;
         }
 
-        double variance = DEFAULT_ABSOLUTE_FIX_STD_M * DEFAULT_ABSOLUTE_FIX_STD_M;
+        double measurementStdMeters = sanitizeAccuracyMeters(accuracyMeters);
+        double variance = measurementStdMeters * measurementStdMeters;
         for (Particle particle : particles) {
             double dx = particle.getX() - fixX;
             double dy = particle.getY() - fixY;
@@ -179,7 +244,13 @@ public class ParticleFilterEngine {
             }
 
             Particle source = particles.get(sourceIndex);
-            resampledParticles.add(new Particle(source.getX(), source.getY(), source.getFloor(), step));
+            resampledParticles.add(new Particle(
+                    source.getX(),
+                    source.getY(),
+                    source.getFloor(),
+                    step,
+                    source.getHeadingRad()
+            ));
             target += step;
         }
 
@@ -232,5 +303,21 @@ public class ParticleFilterEngine {
         long timestamp = lastTimestampMs > 0 ? lastTimestampMs : System.currentTimeMillis();
 
         return new FusedPose(meanX, meanY, estimatedFloor, confidence, timestamp);
+    }
+
+    private double sanitizeAccuracyMeters(double accuracyMeters) {
+        if (Double.isNaN(accuracyMeters) || Double.isInfinite(accuracyMeters) || accuracyMeters <= 0.0) {
+            return DEFAULT_ABSOLUTE_FIX_STD_M;
+        }
+        return Math.max(1.0, accuracyMeters);
+    }
+
+    private double normalizeHeading(double headingRad) {
+        double twoPi = Math.PI * 2.0;
+        double normalized = headingRad % twoPi;
+        if (normalized < 0.0) {
+            normalized += twoPi;
+        }
+        return normalized;
     }
 }

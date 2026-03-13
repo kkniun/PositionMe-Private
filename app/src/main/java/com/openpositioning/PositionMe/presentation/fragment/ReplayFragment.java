@@ -15,7 +15,6 @@ import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.appcompat.app.AlertDialog;
 import androidx.fragment.app.Fragment;
 import androidx.lifecycle.ViewModelProvider;
 
@@ -66,11 +65,10 @@ public class ReplayFragment extends Fragment {
 
     private static final String TAG = "ReplayFragment";
 
-    // GPS start location (received from ReplayActivity)
-    private float initialLat = 0f;
-    private float initialLon = 0f;
     private String filePath = "";
     private int lastIndex = -1;
+    private TrajParser.ReplayInitialization replayInitialization =
+            TrajParser.ReplayInitialization.unavailable(false);
 
     // UI Controls
     private TrajectoryMapFragment trajectoryMapFragment;
@@ -85,7 +83,6 @@ public class ReplayFragment extends Fragment {
     private int currentIndex = 0;
     private boolean isPlaying = false;
 
-    // NEW FEATURE: Variables for indoor map display functionality.
     private MapViewModel mapViewModel;
     private List<Polygon> venuePolygons = new ArrayList<>();
     private GroundOverlay floorplanOverlay;
@@ -99,15 +96,11 @@ public class ReplayFragment extends Fragment {
         // Retrieve transferred data from ReplayActivity
         if (getArguments() != null) {
             filePath = getArguments().getString(ReplayActivity.EXTRA_TRAJECTORY_FILE_PATH, "");
-            initialLat = getArguments().getFloat(ReplayActivity.EXTRA_INITIAL_LAT, 0f);
-            initialLon = getArguments().getFloat(ReplayActivity.EXTRA_INITIAL_LON, 0f);
         }
 
         // Log the received data
         Log.i(TAG, "ReplayFragment received data:");
         Log.i(TAG, "Trajectory file path: " + filePath);
-        Log.i(TAG, "Initial latitude: " + initialLat);
-        Log.i(TAG, "Initial longitude: " + initialLon);
 
         // Check if file exists before parsing
         File trajectoryFile = new File(filePath);
@@ -122,8 +115,13 @@ public class ReplayFragment extends Fragment {
 
         Log.i(TAG, "Trajectory file confirmed to exist and is readable.");
 
-        // Parse the JSON file and prepare replayData using TrajParser
-        replayData = TrajParser.parseTrajectoryData(filePath, requireContext(), initialLat, initialLon);
+        replayInitialization = TrajParser.resolveReplayInitialization(filePath);
+        Log.i(TAG, "Replay auto-init source: " + replayInitialization.source
+                + ", useFusedPose=" + replayInitialization.useFusedPose
+                + ", hasOrigin=" + replayInitialization.hasOrigin());
+
+        // Parse the trajectory file using the auto-selected replay initialization.
+        replayData = TrajParser.parseTrajectoryData(filePath, requireContext(), replayInitialization);
         replayTestPoints = TrajParser.parseTestPoints(filePath);
 
         // Log the number of parsed points
@@ -142,30 +140,20 @@ public class ReplayFragment extends Fragment {
                              @Nullable Bundle savedInstanceState) {
         return inflater.inflate(R.layout.fragment_replay, container, false);
     }
-
-    // In ReplayFragment.java
-
     @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
 
-        // 1. Initialize MapViewModel (as we planned)
         mapViewModel = new ViewModelProvider(this).get(MapViewModel.class);
 
-        // 2. Observe LiveData for API responses (as we planned)
         mapViewModel.getFloorplanResponse().observe(getViewLifecycleOwner(), response -> {
-            // This part remains the same. When data comes back, it will be drawn.
             if (response != null && trajectoryMapFragment.getMap() != null) {
-                // The logic to draw outlines is now inside TrajectoryMapFragment,
-                // so we don't call drawVenueOutlines() from here anymore.
-                // The observer in TrajectoryMapFragment will handle it.
                 Log.d(TAG, "Floorplan response received and observed by child fragment.");
             } else {
                 Log.d(TAG, "Failed to fetch floorplans or no floorplans nearby.");
             }
         });
 
-        // 3. Initialize the map fragment
         trajectoryMapFragment = (TrajectoryMapFragment)
                 getChildFragmentManager().findFragmentById(R.id.replayMapFragmentContainer);
         if (trajectoryMapFragment == null) {
@@ -176,15 +164,9 @@ public class ReplayFragment extends Fragment {
                     .commit();
         }
 
-        // 4. CRITICAL STEP: Use getMapAsync to connect everything when the map is ready.
         trajectoryMapFragment.getMapAsync(googleMap -> {
-            // This code block is guaranteed to run ONLY when the map is fully loaded.
-
-            // a. Set the polygon click listener on the now-ready map.
             googleMap.setOnPolygonClickListener(polygon -> {
-                Log.d(TAG, "A polygon was clicked!");//Debug logs
-                // The selectVenue() method is now inside TrajectoryMapFragment,
-                // so we don't need to do anything here. The child fragment handles its own clicks.
+                Log.d(TAG, "A polygon was clicked!");
                 if (trajectoryMapFragment != null) {
                     trajectoryMapFragment.handlePolygonClick(polygon);
                 }
@@ -192,20 +174,16 @@ public class ReplayFragment extends Fragment {
 
             renderReplayTestPoints();
 
-            // b. Run the original logic to determine the starting position.
-            boolean gnssExists = hasAnyGnssData(replayData);
-            if (gnssExists) {
-                showGnssChoiceDialog();
+            LatLng replayStartLocation = getReplayStartLocation();
+            if (replayStartLocation != null) {
+                setupInitialMapPosition(
+                        (float) replayStartLocation.latitude,
+                        (float) replayStartLocation.longitude
+                );
             } else {
-                if (initialLat != 0f || initialLon != 0f) {
-                    // This call will now trigger the API request inside TrajectoryMapFragment.
-                    setupInitialMapPosition(initialLat, initialLon);
-                }
+                Log.w(TAG, "Replay start location unavailable. Camera will remain at map default.");
             }
         });
-
-
-        // --- The rest of your original UI setup code remains unchanged ---
 
         // Initialize UI controls
         playPauseButton = view.findViewById(R.id.playPauseButton);
@@ -226,7 +204,6 @@ public class ReplayFragment extends Fragment {
             playbackSeekBar.setMax(replayData.size() - 1);
         }
 
-        // Button Listeners (No changes needed here)
         playPauseButton.setOnClickListener(v -> {
             if (replayData.isEmpty()) {
                 Log.w(TAG, "Play/Pause button pressed but replayData is empty.");
@@ -270,13 +247,10 @@ public class ReplayFragment extends Fragment {
             if (getActivity() instanceof ReplayActivity) {
                 ((ReplayActivity) getActivity()).finishFlow();
             } else {
-                // NEW: Use the OnBackPressedDispatcher to handle the back press.
-                // This is the modern, recommended way.
                 requireActivity().getOnBackPressedDispatcher().onBackPressed();
             }
         });
 
-        // SeekBar listener (No changes needed here)
         playbackSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
@@ -295,49 +269,6 @@ public class ReplayFragment extends Fragment {
         }
     }
 
-
-
-    /**
-     * Checks if any ReplayPoint contains a non-null gnssLocation.
-     */
-    private boolean hasAnyGnssData(List<TrajParser.ReplayPoint> data) {
-        for (TrajParser.ReplayPoint point : data) {
-            if (point.gnssLocation != null) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-
-    /**
-     * Show a simple dialog asking user to pick:
-     * 1) GNSS from file
-     * 2) Lat/Lon from ReplayActivity arguments
-     */
-    private void showGnssChoiceDialog() {
-        new AlertDialog.Builder(requireContext())
-                .setTitle("Choose Starting Location")
-                .setMessage("GNSS data is found in the file. Would you like to use the file's GNSS as the start, or the one you manually picked?")
-                .setPositiveButton("Use File's GNSS", (dialog, which) -> {
-                    LatLng firstGnss = getFirstGnssLocation(replayData);
-                    if (firstGnss != null) {
-                        setupInitialMapPosition((float) firstGnss.latitude, (float) firstGnss.longitude);
-                    } else {
-                        // Fallback if no valid GNSS found
-                        setupInitialMapPosition(initialLat, initialLon);
-                    }
-                    dialog.dismiss();
-                })
-                .setNegativeButton("Use Manual Set", (dialog, which) -> {
-                    setupInitialMapPosition(initialLat, initialLon);
-                    dialog.dismiss();
-                })
-                .setCancelable(false)
-                .show();
-    }
-
-    // NEW FEATURE: Modified this method to also trigger the API call.
     private void setupInitialMapPosition(float latitude, float longitude) {
         LatLng startPoint = new LatLng(latitude, longitude);
         Log.i(TAG, "Setting initial map position: " + startPoint.toString());
@@ -345,16 +276,21 @@ public class ReplayFragment extends Fragment {
     }
 
     /**
-     * Retrieve the first available GNSS location from the replay data.
+     * Replay camera priority:
+     * 1) parsed replay origin (fused_pose or first absolute fix)
+     * 2) first reconstructed track point if available
      */
-    private LatLng getFirstGnssLocation(List<TrajParser.ReplayPoint> data) {
-        for (TrajParser.ReplayPoint point : data) {
-            if (point.gnssLocation != null) {
-                // BUG FIX: Was using replayData.get(0), should use the current point.
-                return new LatLng(point.gnssLocation.latitude, point.gnssLocation.longitude);
+    @Nullable
+    private LatLng getReplayStartLocation() {
+        if (replayInitialization.origin != null) {
+            return replayInitialization.origin;
+        }
+        for (TrajParser.ReplayPoint point : replayData) {
+            if (point.trackLocation != null) {
+                return point.trackLocation;
             }
         }
-        return null; // None found
+        return null;
     }
 
 
@@ -401,7 +337,7 @@ public class ReplayFragment extends Fragment {
             trajectoryMapFragment.clearMapAndReset();
             for (int i = 0; i <= newIndex; i++) {
                 TrajParser.ReplayPoint p = replayData.get(i);
-                trajectoryMapFragment.updateUserLocation(p.pdrLocation, p.orientation);
+                trajectoryMapFragment.updateUserLocation(p.trackLocation, p.orientation);
                 trajectoryMapFragment.syncDisplayedFloor(p.floor);
                 if (p.gnssLocation != null) {
                     trajectoryMapFragment.updateGNSS(p.gnssLocation);
@@ -410,7 +346,7 @@ public class ReplayFragment extends Fragment {
         } else {
             // Normal sequential forward step: add just the new point
             TrajParser.ReplayPoint p = replayData.get(newIndex);
-            trajectoryMapFragment.updateUserLocation(p.pdrLocation, p.orientation);
+            trajectoryMapFragment.updateUserLocation(p.trackLocation, p.orientation);
             trajectoryMapFragment.syncDisplayedFloor(p.floor);
             if (p.gnssLocation != null) {
                 trajectoryMapFragment.updateGNSS(p.gnssLocation);
@@ -453,14 +389,12 @@ public class ReplayFragment extends Fragment {
         playbackHandler.removeCallbacks(playbackRunnable);
     }
 
-    // --- NEW FEATURE: All methods below are added for the indoor map display functionality. ---
-
     /**
      * Draws venue outlines on the map based on the API response.
+     *
      * @param apiResponse The JSON object received from the floorplan API.
      */
     private void drawVenueOutlines(JsonObject apiResponse) {
-        // Clear any previously drawn polygons before adding new ones.
         for (Polygon p : venuePolygons) {
             p.remove();
         }
@@ -471,42 +405,36 @@ public class ReplayFragment extends Fragment {
 
         for (JsonElement venueElement : venues) {
             JsonObject venue = venueElement.getAsJsonObject();
-            // The API returns coordinates in a nested array: [[lng, lat], [lng, lat], ...]
             JsonArray outlineCoords = venue.getAsJsonObject("outline").getAsJsonArray("coordinates").get(0).getAsJsonArray();
 
             PolygonOptions polygonOptions = new PolygonOptions()
                     .strokeColor(Color.BLUE)
                     .strokeWidth(5)
-                    .fillColor(Color.argb(50, 0, 0, 255)) // Semi-transparent blue
+                    .fillColor(Color.argb(50, 0, 0, 255))
                     .clickable(true);
 
             for (JsonElement coordElement : outlineCoords) {
                 JsonArray lngLat = coordElement.getAsJsonArray();
-                // Note: API returns [longitude, latitude], Google Maps LatLng is (latitude, longitude).
                 polygonOptions.add(new LatLng(lngLat.get(1).getAsDouble(), lngLat.get(0).getAsDouble()));
             }
 
             Polygon polygon = trajectoryMapFragment.getMap().addPolygon(polygonOptions);
-            polygon.setTag(venue); // Attach the full venue data to the polygon for later use on click.
+            polygon.setTag(venue);
             venuePolygons.add(polygon);
         }
     }
 
     /**
-     * Handles the event when a user clicks on a venue polygon on the map.
-     * @param venueData The JSON data of the selected venue, retrieved from the polygon's tag.
+     * Updates the selected venue and displays the first available floorplan.
+     *
+     * @param venueData The JSON data attached to the selected polygon.
      */
     private void selectVenue(JsonObject venueData) {
         String venueId = venueData.get("id").getAsString();
         Log.d(TAG, "Venue selected: " + venueId);
 
-        // Update the ViewModel with the selected venue ID. This makes it available to other parts
-        // of the app, like the data recording service.
         mapViewModel.setSelectedVenueId(venueId);
 
-        // TODO: Implement a UI element (e.g., a dropdown menu) to allow the user to select a floor.
-
-        // For now, automatically display the first floorplan available for the selected venue.
         JsonArray floorplans = venueData.getAsJsonArray("floorplans");
         if (floorplans != null && floorplans.size() > 0) {
             JsonObject firstFloor = floorplans.get(0).getAsJsonObject();
@@ -515,24 +443,22 @@ public class ReplayFragment extends Fragment {
     }
 
     /**
-     * Displays a specific floorplan image as a GroundOverlay on the map.
-     * @param floorplan The JSON object for a single floor, containing URL and bounding box.
+     * Displays a floorplan image as a ground overlay.
+     *
+     * @param floorplan The floor definition containing the image URL and bounding box.
      */
     private void displayFloorplan(JsonObject floorplan) {
-        // Remove the previous floorplan overlay if it exists.
         if (floorplanOverlay != null) {
             floorplanOverlay.remove();
         }
 
         String imageUrl = floorplan.get("url").getAsString();
-        // The bounding box is defined as [minLng, minLat, maxLng, maxLat].
         JsonArray bbox = floorplan.getAsJsonArray("bbox");
         LatLngBounds bounds = new LatLngBounds(
-                new LatLng(bbox.get(1).getAsDouble(), bbox.get(0).getAsDouble()), // Southwest corner
-                new LatLng(bbox.get(3).getAsDouble(), bbox.get(2).getAsDouble())  // Northeast corner
+                new LatLng(bbox.get(1).getAsDouble(), bbox.get(0).getAsDouble()),
+                new LatLng(bbox.get(3).getAsDouble(), bbox.get(2).getAsDouble())
         );
 
-        // Use Glide to asynchronously load the image from the URL. This prevents blocking the main thread.
         Glide.with(this)
                 .asBitmap()
                 .load(imageUrl)
@@ -549,7 +475,6 @@ public class ReplayFragment extends Fragment {
 
                     @Override
                     public void onLoadCleared(@Nullable Drawable placeholder) {
-                        // This is called when the resource is no longer needed.
                     }
                 });
     }

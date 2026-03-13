@@ -104,7 +104,6 @@ public class StartLocationFragment extends Fragment {
                 mMap.getUiSettings().setRotateGesturesEnabled(true);
                 mMap.getUiSettings().setScrollGesturesEnabled(true);
 
-                // *** FIX: Clear any existing markers so the start marker isn’t duplicated ***
                 mMap.clear();
 
                 // Create NucleusBuildingManager instance (if needed)

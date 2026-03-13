@@ -53,6 +53,9 @@
     <string name="correctionInstructions">Zoom, scroll and rotate the map \n to correct the path</string>
     <string name="trajectory_name_hint">Trajectory name</string>
     <string name="trajectory_name_helper">Leave blank to auto-generate a default name</string>
+    <string name="trajectory_name_dialog_title">Name trajectory</string>
+    <string name="trajectory_name_required">Enter a trajectory name</string>
+    <string name="trajectory_name_confirm">Start recording</string>
 
     <!-- Sensor Info -->
     <string name="vendor">Vendor:\t\t\t\t\t\t\t %1$s</string>
@@ -127,6 +130,7 @@
     <string name="choose_map">Choose Map</string>
     <string name="auto_floor">❇️ Auto Floor </string>
     <string name="gnss_error">GNSS error:</string>
+    <string name="waiting_for_absolute_fix">Waiting for first absolute fix...</string>
     <string name="satellite">Satellite</string>
     <string name="normal">Normal</string>
     <string name="hybrid">Hybrid</string>
