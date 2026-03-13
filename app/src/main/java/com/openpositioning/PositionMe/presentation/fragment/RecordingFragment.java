@@ -355,7 +355,9 @@ public class RecordingFragment extends Fragment {
 
             if (trajectoryMapFragment != null) {
                 trajectoryMapFragment.updateUserLocation(newLocation, (float) orientationDeg);
-                trajectoryMapFragment.syncDisplayedFloor(fusedPose.getFloor());
+                if (trajectoryMapFragment.isAutoFloorEnabled()) {
+                    trajectoryMapFragment.syncDisplayedFloor(fusedPose.getFloor());
+                }
             }
         }
 

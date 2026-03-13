@@ -199,19 +199,13 @@ public class PdrProcessing {
             // Add to buffer
             this.elevationList.putNewest(absoluteElevation);
 
-            // Check if there was floor movement
-            // Check if there is enough data to evaluate
-            if(this.elevationList.isFull()) {
-                // Check average of elevation array
+            // Convert the smoothed relative height into an absolute floor candidate.
+            if(this.elevationList.isFull() && this.floorHeight > 0) {
                 List<Float> elevationMemory = this.elevationList.getListCopy();
                 OptionalDouble currentAvg = elevationMemory.stream().mapToDouble(f -> f).average();
                 float finishAvg = currentAvg.isPresent() ? (float) currentAvg.getAsDouble() : 0;
-
-                // Check if we moved floor by comparing with start position
-                if(Math.abs(finishAvg - startElevation) > this.floorHeight) {
-                    // Change floors - 'floor' division
-                    this.currentFloor += (finishAvg - startElevation)/this.floorHeight;
-                }
+                float relativeElevation = finishAvg - startElevation;
+                this.currentFloor = Math.round(relativeElevation / this.floorHeight);
             }
             // Return current elevation
             return elevation;

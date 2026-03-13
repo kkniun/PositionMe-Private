@@ -474,6 +474,10 @@ public class TrajectoryMapFragment extends Fragment {
         updateVenueLabel();
     }
 
+    public boolean isAutoFloorEnabled() {
+        return autoFloorSwitch != null && autoFloorSwitch.isChecked();
+    }
+
     private BitmapDescriptor getNumberedTestPointIcon(int idx) {
         BitmapDescriptor cached = testPointIconCache.get(idx);
         if (cached != null) {
