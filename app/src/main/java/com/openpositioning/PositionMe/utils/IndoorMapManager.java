@@ -391,11 +391,13 @@ public class IndoorMapManager {
     private void loadFloorplanForVenue(@NonNull VenueModel venue) {
         clearFloorShapeOverlays();
         if (!venue.floors.isEmpty()) {
+            MapConstraintRepository.clear();
             renderCurrentFloor();
             return;
         }
         removeGroundOverlay();
         if (TextUtils.isEmpty(venue.mapShapesPayload)) {
+            MapConstraintRepository.clear();
             isIndoorMapSet = false;
             return;
         }
@@ -414,6 +416,15 @@ public class IndoorMapManager {
         currentFloor = Math.max(0, Math.min(currentFloor, keys.size() - 1));
         String key = keys.get(currentFloor);
 
+        List<List<LatLng>> wallPolygons = extractWallPolygonsForKey(payload, key);
+        MapConstraintRepository.updateCurrentFloorConstraints(
+                venue.id,
+                key,
+                currentFloor,
+                venue.outline,
+                wallPolygons
+        );
+
         int[] counts = new int[]{0, 0};
         drawMapShapesForKey(payload, key, counts);
 
@@ -424,6 +435,124 @@ public class IndoorMapManager {
                     + " drawnPolylines=" + counts[0] + " drawnPolygons=" + counts[1]);
         }
 
+    }
+
+    @NonNull
+    private List<List<LatLng>> extractWallPolygonsForKey(@NonNull String payload, @NonNull String floorKey) {
+        List<List<LatLng>> wallPolygons = new ArrayList<>();
+        try {
+            JSONObject root = new JSONObject(payload.trim());
+            Object child = root.opt(floorKey);
+            if (child instanceof JSONObject) {
+                collectWallPolygonsFromObject((JSONObject) child, wallPolygons);
+            } else if (child instanceof String) {
+                String raw = ((String) child).trim();
+                if (raw.startsWith("{")) {
+                    collectWallPolygonsFromObject(new JSONObject(raw), wallPolygons);
+                }
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "Failed to extract wall polygons for key=" + floorKey, e);
+        }
+        return wallPolygons;
+    }
+
+    private void collectWallPolygonsFromObject(@NonNull JSONObject obj, @NonNull List<List<LatLng>> wallPolygons) {
+        if ("FeatureCollection".equalsIgnoreCase(obj.optString("type")) || obj.has("features")) {
+            JSONArray features = obj.optJSONArray("features");
+            if (features == null) {
+                return;
+            }
+            for (int i = 0; i < features.length(); i++) {
+                JSONObject feature = features.optJSONObject(i);
+                if (feature == null) {
+                    continue;
+                }
+                JSONObject properties = feature.optJSONObject("properties");
+                if (!isWallFeature(properties)) {
+                    continue;
+                }
+                JSONObject geometry = feature.optJSONObject("geometry");
+                collectWallPolygonsFromGeometry(geometry, wallPolygons);
+            }
+            return;
+        }
+
+        JSONArray names = obj.names();
+        if (names == null) {
+            return;
+        }
+        for (int i = 0; i < names.length(); i++) {
+            String key = names.optString(i, "");
+            Object child = obj.opt(key);
+            if (child instanceof JSONObject) {
+                collectWallPolygonsFromObject((JSONObject) child, wallPolygons);
+            } else if (child instanceof String) {
+                String raw = ((String) child).trim();
+                try {
+                    if (raw.startsWith("{")) {
+                        collectWallPolygonsFromObject(new JSONObject(raw), wallPolygons);
+                    }
+                } catch (JSONException ignored) {
+                }
+            }
+        }
+    }
+
+    private boolean isWallFeature(@Nullable JSONObject properties) {
+        if (properties == null) {
+            return false;
+        }
+        String[] candidateKeys = new String[]{
+                "indoor_type", "feature_type", "type", "class", "kind", "category", "subtype"
+        };
+        for (String key : candidateKeys) {
+            String value = properties.optString(key, "").toLowerCase(Locale.US);
+            if (value.contains("wall")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void collectWallPolygonsFromGeometry(
+            @Nullable JSONObject geometry,
+            @NonNull List<List<LatLng>> wallPolygons
+    ) {
+        if (geometry == null) {
+            return;
+        }
+        String type = geometry.optString("type", "");
+        JSONArray coordinates = geometry.optJSONArray("coordinates");
+        if (coordinates == null) {
+            return;
+        }
+
+        if ("Polygon".equalsIgnoreCase(type)) {
+            JSONArray outerRing = coordinates.optJSONArray(0);
+            addWallPolygonIfValid(outerRing, wallPolygons);
+            return;
+        }
+        if ("MultiPolygon".equalsIgnoreCase(type)) {
+            for (int i = 0; i < coordinates.length(); i++) {
+                JSONArray polygon = coordinates.optJSONArray(i);
+                if (polygon == null) {
+                    continue;
+                }
+                JSONArray outerRing = polygon.optJSONArray(0);
+                addWallPolygonIfValid(outerRing, wallPolygons);
+            }
+        }
+    }
+
+    private void addWallPolygonIfValid(@Nullable JSONArray ring, @NonNull List<List<LatLng>> wallPolygons) {
+        if (ring == null) {
+            return;
+        }
+        List<LatLng> points = parsePointArray(ring);
+        if (points.size() >= 3) {
+            wallPolygons.add(points);
+        }
     }
 
     private void clearFloorShapeOverlays() {
@@ -671,6 +800,7 @@ public class IndoorMapManager {
         } else if (autoSelectFirstVenue && !venues.isEmpty()) {
             selectVenue(venues.get(0).id);
         } else {
+            MapConstraintRepository.clear();
             selectedVenueId = null;
             currentFloor = 0;
             floorHeight = DEFAULT_FLOOR_HEIGHT_M;

@@ -23,7 +23,9 @@ import androidx.preference.PreferenceManager;
 
 import com.google.android.gms.maps.model.LatLng;
 import com.openpositioning.PositionMe.presentation.activity.MainActivity;
+import com.openpositioning.PositionMe.utils.BuildingPolygon;
 import com.openpositioning.PositionMe.utils.CoordinateConverter;
+import com.openpositioning.PositionMe.utils.MapConstraintRepository;
 import com.openpositioning.PositionMe.utils.PathView;
 import com.openpositioning.PositionMe.utils.PdrProcessing;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
@@ -71,6 +73,9 @@ import java.util.stream.Stream;
  * @author Virginia Cangelosi
  */
 public class SensorFusion implements SensorEventListener, Observer {
+    private static final String VENUE_KEY_NUCLEUS = "nucleus";
+    private static final String VENUE_KEY_LIBRARY = "library";
+    private static final String VENUE_KEY_MURCHISON = "murchison";
 
     // Store the last event timestamps for each sensor type
     private HashMap<Integer, Long> lastEventTimestamps = new HashMap<>();
@@ -325,7 +330,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.settings = PreferenceManager.getDefaultSharedPreferences(context);
         this.pathView = new PathView(context, null);
         this.wiFiPositioning = new WiFiPositioning(context);
-        this.particleFilterEngine = new ParticleFilterEngine();
+        this.particleFilterEngine = createParticleFilterEngine();
         this.pfInitialized = false;
         this.latestFusedPose = null;
         this.coordinateConverter = null;
@@ -942,7 +947,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         }
 
         if (this.particleFilterEngine == null) {
-            this.particleFilterEngine = new ParticleFilterEngine();
+            this.particleFilterEngine = createParticleFilterEngine();
         }
 
         CoordinateConverter converter = getOrCreateCoordinateConverter(latitudeDeg, longitudeDeg);
@@ -1061,6 +1066,63 @@ public class SensorFusion implements SensorEventListener, Observer {
             return 0f;
         }
         return orientation[0];
+    }
+
+    private ParticleFilterEngine createParticleFilterEngine() {
+        return new ParticleFilterEngine(new ParticleInitializer(), this::isValidParticlePrediction);
+    }
+
+    private boolean isValidParticlePrediction(double x, double y, int floor) {
+        if (coordinateConverter == null) {
+            // Fail-open: map constraints are unavailable before origin/converter is ready.
+            return true;
+        }
+
+        LatLng candidateLatLng = coordinateConverter.toLatLng(x, y);
+        if (candidateLatLng == null) {
+            return true;
+        }
+
+        if (MapConstraintRepository.hasWallConstraints()
+                && MapConstraintRepository.isPointInsideWall(candidateLatLng)) {
+            return false;
+        }
+
+        if (MapConstraintRepository.hasVenueOutline()) {
+            return MapConstraintRepository.isPointInsideVenueOutline(candidateLatLng);
+        }
+
+        int buildingMode = resolveConstraintBuildingMode();
+        if (buildingMode == 1) {
+            return BuildingPolygon.inNucleus(candidateLatLng);
+        }
+        if (buildingMode == 2) {
+            return BuildingPolygon.inLibrary(candidateLatLng);
+        }
+        return true;
+    }
+
+    private int resolveConstraintBuildingMode() {
+        String venue = collectionVenue == null ? "" : collectionVenue.toLowerCase(Locale.US);
+        if (venue.contains(VENUE_KEY_NUCLEUS)) {
+            return 1;
+        }
+        if (venue.contains(VENUE_KEY_LIBRARY) || venue.contains(VENUE_KEY_MURCHISON)) {
+            return 2;
+        }
+
+        if (startLocation == null || startLocation.length < 2) {
+            return 0;
+        }
+
+        LatLng origin = new LatLng(startLocation[0], startLocation[1]);
+        if (BuildingPolygon.inNucleus(origin)) {
+            return 1;
+        }
+        if (BuildingPolygon.inLibrary(origin)) {
+            return 2;
+        }
+        return 0;
     }
 
     private float normalizeHeadingDelta(float deltaHeadingRad) {
@@ -1555,7 +1617,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.pdrProcessing.resetPDR();
         this.elevation = 0f;
         this.elevator = false;
-        this.particleFilterEngine = new ParticleFilterEngine();
+        this.particleFilterEngine = createParticleFilterEngine();
         this.pfInitialized = false;
         this.latestFusedPose = null;
         this.coordinateConverter = hasManualStartLocation && startLocation != null && startLocation.length >= 2
