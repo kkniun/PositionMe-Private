@@ -1,5 +1,7 @@
 package com.openpositioning.PositionMe.sensors;
 
+import androidx.annotation.Nullable;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -22,20 +24,34 @@ public class ParticleFilterEngine {
 
     private final ParticleInitializer particleInitializer;
     private final ParticleInitializer.SpawnValidator spawnValidator;
+    @Nullable
+    private final FloorTransitionGate floorTransitionGate;
     private final Random random;
     private final List<Particle> particles = new ArrayList<>();
 
     private long lastTimestampMs;
 
     public ParticleFilterEngine() {
-        this(new ParticleInitializer(), ParticleInitializer.allowAll(), new Random());
+        this(new ParticleInitializer(), ParticleInitializer.allowAll(), null, new Random());
     }
 
     public ParticleFilterEngine(
             ParticleInitializer particleInitializer,
             ParticleInitializer.SpawnValidator spawnValidator
     ) {
-        this(particleInitializer, spawnValidator, new Random());
+        this(particleInitializer, spawnValidator, null, new Random());
+    }
+
+    /**
+     * @param floorTransitionGate if non-null, floor changes are only kept when the gate allows
+     *                            (e.g. user must be in stairs/lift zone). Null disables gating.
+     */
+    public ParticleFilterEngine(
+            ParticleInitializer particleInitializer,
+            ParticleInitializer.SpawnValidator spawnValidator,
+            @Nullable FloorTransitionGate floorTransitionGate
+    ) {
+        this(particleInitializer, spawnValidator, floorTransitionGate, new Random());
     }
 
     ParticleFilterEngine(
@@ -43,10 +59,20 @@ public class ParticleFilterEngine {
             ParticleInitializer.SpawnValidator spawnValidator,
             Random random
     ) {
+        this(particleInitializer, spawnValidator, null, random);
+    }
+
+    ParticleFilterEngine(
+            ParticleInitializer particleInitializer,
+            ParticleInitializer.SpawnValidator spawnValidator,
+            @Nullable FloorTransitionGate floorTransitionGate,
+            Random random
+    ) {
         this.particleInitializer = particleInitializer;
         this.spawnValidator = spawnValidator == null
                 ? ParticleInitializer.allowAll()
                 : spawnValidator;
+        this.floorTransitionGate = floorTransitionGate;
         this.random = random;
     }
 
@@ -125,8 +151,20 @@ public class ParticleFilterEngine {
                     ? floor
                     : previousFloor;
 
-            // 这里先保留最小运动模型。
-            // 后续应在此接入墙体约束、楼梯/电梯约束和 map matching。
+            if (predictedFloor != previousFloor
+                    && floorTransitionGate != null
+                    && !floorTransitionGate.allowsFloorChange(
+                            previousX,
+                            previousY,
+                            predictedX,
+                            predictedY,
+                            previousFloor,
+                            predictedFloor
+                    )) {
+                predictedFloor = previousFloor;
+            }
+
+            // Map matching / walls: reject illegal (x,y,floor).
             if (!spawnValidator.isValid(predictedX, predictedY, predictedFloor)) {
                 predictedX = previousX;
                 predictedY = previousY;

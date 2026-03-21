@@ -23,14 +23,16 @@ public final class MapConstraintRepository {
             @Nullable String floorKey,
             int floorIndex,
             @Nullable List<LatLng> venueOutline,
-            @Nullable List<List<LatLng>> wallPolygons
+            @Nullable List<List<LatLng>> wallPolygons,
+            @Nullable List<List<LatLng>> transitionPolygons
     ) {
         snapshot = new ConstraintSnapshot(
                 venueId,
                 floorKey,
                 floorIndex,
                 copyPoints(venueOutline),
-                copyPolygons(wallPolygons)
+                copyPolygons(wallPolygons),
+                copyPolygons(transitionPolygons)
         );
     }
 
@@ -60,6 +62,25 @@ public final class MapConstraintRepository {
             return true;
         }
         return pointInPolygon(point, snapshot.venueOutline);
+    }
+
+    /**
+     * When false, floor-change gating is not applied (fail-open for barometer / PDR floor).
+     */
+    public static synchronized boolean hasTransitionConstraints() {
+        return !snapshot.transitionPolygons.isEmpty();
+    }
+
+    /**
+     * True if the point lies inside any stairs/lift/elevator polygon for the current map floor.
+     */
+    public static synchronized boolean isPointInsideTransitionZone(@NonNull LatLng point) {
+        for (List<LatLng> poly : snapshot.transitionPolygons) {
+            if (pointInPolygon(point, poly)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @NonNull
@@ -151,24 +172,33 @@ public final class MapConstraintRepository {
         final List<LatLng> venueOutline;
         @NonNull
         final List<List<LatLng>> wallPolygons;
+        @NonNull
+        final List<List<LatLng>> transitionPolygons;
 
         ConstraintSnapshot(
                 @Nullable String venueId,
                 @Nullable String floorKey,
                 int floorIndex,
                 @NonNull List<LatLng> venueOutline,
-                @NonNull List<List<LatLng>> wallPolygons
+                @NonNull List<List<LatLng>> wallPolygons,
+                @NonNull List<List<LatLng>> transitionPolygons
         ) {
             this.venueId = venueId;
             this.floorKey = floorKey;
             this.floorIndex = floorIndex;
             this.venueOutline = venueOutline;
             this.wallPolygons = wallPolygons;
+            this.transitionPolygons = transitionPolygons;
         }
 
         @NonNull
         static ConstraintSnapshot empty() {
-            return new ConstraintSnapshot(null, null, -1, Collections.emptyList(), Collections.emptyList());
+            return new ConstraintSnapshot(
+                    null, null, -1,
+                    Collections.emptyList(),
+                    Collections.emptyList(),
+                    Collections.emptyList()
+            );
         }
     }
 }

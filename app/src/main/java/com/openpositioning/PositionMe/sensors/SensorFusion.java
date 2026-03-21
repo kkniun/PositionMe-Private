@@ -1069,7 +1069,43 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     private ParticleFilterEngine createParticleFilterEngine() {
-        return new ParticleFilterEngine(new ParticleInitializer(), this::isValidParticlePrediction);
+        return new ParticleFilterEngine(
+                new ParticleInitializer(),
+                this::isValidParticlePrediction,
+                this::allowsMapBasedFloorTransition
+        );
+    }
+
+    /**
+     * When map_shapes provides stairs/lift polygons for the UI-selected floor, only allow a change
+     * in particle floor (from barometer / PdrProcessing) if the step starts or ends inside one
+     * of those zones. If no transition geometry is loaded, fail-open so height-based floor still works.
+     * WiFi/GNSS absolute fixes use {@link #handleAbsoluteFix} and are not gated here.
+     */
+    private boolean allowsMapBasedFloorTransition(
+            double previousXMeters,
+            double previousYMeters,
+            double predictedXMeters,
+            double predictedYMeters,
+            int previousFloor,
+            int newFloor
+    ) {
+        if (newFloor == previousFloor) {
+            return true;
+        }
+        if (!MapConstraintRepository.hasTransitionConstraints()) {
+            return true;
+        }
+        if (coordinateConverter == null) {
+            return true;
+        }
+        LatLng previousLatLng = coordinateConverter.toLatLng(previousXMeters, previousYMeters);
+        LatLng predictedLatLng = coordinateConverter.toLatLng(predictedXMeters, predictedYMeters);
+        if (previousLatLng == null || predictedLatLng == null) {
+            return true;
+        }
+        return MapConstraintRepository.isPointInsideTransitionZone(previousLatLng)
+                || MapConstraintRepository.isPointInsideTransitionZone(predictedLatLng);
     }
 
     private boolean isValidParticlePrediction(double x, double y, int floor) {

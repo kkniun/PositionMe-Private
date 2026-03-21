@@ -408,6 +408,7 @@ public class IndoorMapManager {
         }
         List<String> keys = getShapeFloorKeys(venue);
         if (keys.isEmpty()) {
+            MapConstraintRepository.clear();
             isIndoorMapSet = false;
             return;
         }
@@ -417,12 +418,14 @@ public class IndoorMapManager {
         String key = keys.get(currentFloor);
 
         List<List<LatLng>> wallPolygons = extractWallPolygonsForKey(payload, key);
+        List<List<LatLng>> transitionPolygons = extractTransitionPolygonsForKey(payload, key);
         MapConstraintRepository.updateCurrentFloorConstraints(
                 venue.id,
                 key,
                 currentFloor,
                 venue.outline,
-                wallPolygons
+                wallPolygons,
+                transitionPolygons
         );
 
         int[] counts = new int[]{0, 0};
@@ -499,20 +502,45 @@ public class IndoorMapManager {
         }
     }
 
+    /**
+     * Walls only: explicit tags, avoids mis-classifying stairs/lifts or arbitrary strings containing "wall".
+     */
     private boolean isWallFeature(@Nullable JSONObject properties) {
-        if (properties == null) {
+        String tag = primarySemanticTag(properties);
+        if (tag.isEmpty()) {
             return false;
+        }
+        if (isTransitionSemanticTag(tag)) {
+            return false;
+        }
+        return "wall".equals(tag) || "walls".equals(tag);
+    }
+
+    private boolean isTransitionFeature(@Nullable JSONObject properties) {
+        return isTransitionSemanticTag(primarySemanticTag(properties));
+    }
+
+    @NonNull
+    private static String primarySemanticTag(@Nullable JSONObject properties) {
+        if (properties == null) {
+            return "";
         }
         String[] candidateKeys = new String[]{
                 "indoor_type", "feature_type", "type", "class", "kind", "category", "subtype"
         };
         for (String key : candidateKeys) {
-            String value = properties.optString(key, "").toLowerCase(Locale.US);
-            if (value.contains("wall")) {
-                return true;
+            String value = properties.optString(key, "").trim().toLowerCase(Locale.US);
+            if (!TextUtils.isEmpty(value) && !"null".equals(value)) {
+                return value;
             }
         }
-        return false;
+        return "";
+    }
+
+    private static boolean isTransitionSemanticTag(@NonNull String tag) {
+        return "stairs".equals(tag) || "stair".equals(tag)
+                || "lift".equals(tag) || "elevator".equals(tag)
+                || "escalator".equals(tag);
     }
 
     private void collectWallPolygonsFromGeometry(
@@ -552,6 +580,71 @@ public class IndoorMapManager {
         List<LatLng> points = parsePointArray(ring);
         if (points.size() >= 3) {
             wallPolygons.add(points);
+        }
+    }
+
+    @NonNull
+    private List<List<LatLng>> extractTransitionPolygonsForKey(@NonNull String payload, @NonNull String floorKey) {
+        List<List<LatLng>> transitionPolygons = new ArrayList<>();
+        try {
+            JSONObject root = new JSONObject(payload.trim());
+            Object child = root.opt(floorKey);
+            if (child instanceof JSONObject) {
+                collectTransitionPolygonsFromObject((JSONObject) child, transitionPolygons);
+            } else if (child instanceof String) {
+                String raw = ((String) child).trim();
+                if (raw.startsWith("{")) {
+                    collectTransitionPolygonsFromObject(new JSONObject(raw), transitionPolygons);
+                }
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "Failed to extract transition polygons for key=" + floorKey, e);
+        }
+        return transitionPolygons;
+    }
+
+    private void collectTransitionPolygonsFromObject(
+            @NonNull JSONObject obj,
+            @NonNull List<List<LatLng>> transitionPolygons
+    ) {
+        if ("FeatureCollection".equalsIgnoreCase(obj.optString("type")) || obj.has("features")) {
+            JSONArray features = obj.optJSONArray("features");
+            if (features == null) {
+                return;
+            }
+            for (int i = 0; i < features.length(); i++) {
+                JSONObject feature = features.optJSONObject(i);
+                if (feature == null) {
+                    continue;
+                }
+                JSONObject properties = feature.optJSONObject("properties");
+                if (!isTransitionFeature(properties)) {
+                    continue;
+                }
+                JSONObject geometry = feature.optJSONObject("geometry");
+                collectWallPolygonsFromGeometry(geometry, transitionPolygons);
+            }
+            return;
+        }
+
+        JSONArray names = obj.names();
+        if (names == null) {
+            return;
+        }
+        for (int i = 0; i < names.length(); i++) {
+            String key = names.optString(i, "");
+            Object child = obj.opt(key);
+            if (child instanceof JSONObject) {
+                collectTransitionPolygonsFromObject((JSONObject) child, transitionPolygons);
+            } else if (child instanceof String) {
+                String raw = ((String) child).trim();
+                try {
+                    if (raw.startsWith("{")) {
+                        collectTransitionPolygonsFromObject(new JSONObject(raw), transitionPolygons);
+                    }
+                } catch (JSONException ignored) {
+                }
+            }
         }
     }
 
