@@ -578,14 +578,15 @@ public class SensorFusion implements SensorEventListener, Observer {
                 }
 
                 trajectory.addGnssData(gnssBuilder);
-                handleAbsoluteFix(
+                handleAbsoluteFixInternal(
                         new AbsoluteFix(
                                 System.currentTimeMillis(),
                                 latitude,
                                 longitude,
                                 accuracy
                         ),
-                        pdrProcessing.getCurrentFloor()
+                        resolveStep1InitializationFloor(null),
+                        null
                 );
             }
             gnssAltitude = location.getAltitude();
@@ -882,13 +883,14 @@ public class SensorFusion implements SensorEventListener, Observer {
                     if (wifiLocation == null) {
                         return;
                     }
-                    handleAbsoluteFix(
+                    handleAbsoluteFixInternal(
                             new AbsoluteFix(
                                     System.currentTimeMillis(),
                                     wifiLocation.latitude,
                                     wifiLocation.longitude,
                                     DEFAULT_WIFI_ACCURACY_M
                             ),
+                            resolveStep1InitializationFloor(floor),
                             floor
                     );
                 }
@@ -922,9 +924,10 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     public void handleAbsoluteFix(@NonNull AbsoluteFix absoluteFix, int floor) {
-        handleAbsoluteFix(
+        handleAbsoluteFixInternal(
                 absoluteFix.getLatitudeDeg(),
                 absoluteFix.getLongitudeDeg(),
+                floor,
                 floor,
                 absoluteFix.getTimestampMs(),
                 absoluteFix.getAccuracyMeters()
@@ -932,13 +935,38 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     public void handleAbsoluteFix(double latitudeDeg, double longitudeDeg, int floor, long timestampMs) {
-        handleAbsoluteFix(latitudeDeg, longitudeDeg, floor, timestampMs, DEFAULT_WIFI_ACCURACY_M);
+        handleAbsoluteFixInternal(
+                latitudeDeg,
+                longitudeDeg,
+                floor,
+                floor,
+                timestampMs,
+                DEFAULT_WIFI_ACCURACY_M
+        );
     }
 
     public void handleAbsoluteFix(
             double latitudeDeg,
             double longitudeDeg,
             int floor,
+            long timestampMs,
+            float accuracyMeters
+    ) {
+        handleAbsoluteFixInternal(
+                latitudeDeg,
+                longitudeDeg,
+                floor,
+                floor,
+                timestampMs,
+                accuracyMeters
+        );
+    }
+
+    private void handleAbsoluteFixInternal(
+            double latitudeDeg,
+            double longitudeDeg,
+            int initializationFloor,
+            @Nullable Integer floorPrior,
             long timestampMs,
             float accuracyMeters
     ) {
@@ -955,31 +983,34 @@ public class SensorFusion implements SensorEventListener, Observer {
             return;
         }
         maybeSetInitialPositionIfAbsent(this.trajectory, latitudeDeg, longitudeDeg);
-        double[] localFix = converter.toLocalMeters(latitudeDeg, longitudeDeg);
-
-        if (!pfInitialized) {
-            this.particleFilterEngine.initialize(
-                    localFix[0],
-                    localFix[1],
-                    floor,
-                    timestampMs,
-                    getCurrentHeadingRad(),
-                    Math.max(MIN_ABSOLUTE_FIX_START_STD_M, accuracyMeters)
-            );
-        } else {
-            this.particleFilterEngine.updateWithAbsoluteFix(
-                    localFix[0],
-                    localFix[1],
-                    floor,
-                    timestampMs,
-                    accuracyMeters
-            );
-        }
-        this.latestFusedPose = this.particleFilterEngine.estimatePose();
+        this.latestFusedPose = applyAbsoluteFixForStep1(
+                this.particleFilterEngine,
+                converter,
+                this.pfInitialized,
+                latitudeDeg,
+                longitudeDeg,
+                initializationFloor,
+                floorPrior,
+                timestampMs,
+                accuracyMeters,
+                getCurrentHeadingRad()
+        );
         this.pfInitialized = this.latestFusedPose != null;
         this.lastPredictHeadingRad = getCurrentHeadingRad();
         this.lastPredictElevation = this.elevation;
         recordLatestFusedPoseIfNeeded();
+    }
+
+    private void handleAbsoluteFixInternal(@NonNull AbsoluteFix absoluteFix, int initializationFloor,
+                                           @Nullable Integer floorPrior) {
+        handleAbsoluteFixInternal(
+                absoluteFix.getLatitudeDeg(),
+                absoluteFix.getLongitudeDeg(),
+                initializationFloor,
+                floorPrior,
+                absoluteFix.getTimestampMs(),
+                absoluteFix.getAccuracyMeters()
+        );
     }
 
     public void handlePdrPredict(@Nullable PdrDelta pdrDelta, int floor, long timestampMs) {
@@ -993,8 +1024,13 @@ public class SensorFusion implements SensorEventListener, Observer {
             return;
         }
 
-        this.particleFilterEngine.predict(pdrDelta, floor, timestampMs);
-        this.latestFusedPose = this.particleFilterEngine.estimatePose();
+        this.latestFusedPose = applyPdrPredictionForStep1(
+                this.particleFilterEngine,
+                this.pfInitialized,
+                pdrDelta,
+                floor,
+                timestampMs
+        );
         recordLatestFusedPoseIfNeeded();
     }
 
@@ -1059,6 +1095,65 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.startLocation = new float[]{(float) latitudeDeg, (float) longitudeDeg};
         this.hasManualStartLocation = manualOrigin;
         this.coordinateConverter = new CoordinateConverter(latitudeDeg, longitudeDeg);
+    }
+
+    private int resolveStep1InitializationFloor(@Nullable Integer preferredFloor) {
+        if (preferredFloor != null) {
+            return preferredFloor;
+        }
+        if (latestFusedPose != null) {
+            return latestFusedPose.getFloor();
+        }
+        return getCurrentFloor();
+    }
+
+    static FusedPose applyAbsoluteFixForStep1(
+            @NonNull ParticleFilterEngine particleFilterEngine,
+            @NonNull CoordinateConverter coordinateConverter,
+            boolean pfInitialized,
+            double latitudeDeg,
+            double longitudeDeg,
+            int initializationFloor,
+            @Nullable Integer floorPrior,
+            long timestampMs,
+            float accuracyMeters,
+            float headingRad
+    ) {
+        double[] localFix = coordinateConverter.toLocalMeters(latitudeDeg, longitudeDeg);
+        if (!pfInitialized) {
+            particleFilterEngine.initialize(
+                    localFix[0],
+                    localFix[1],
+                    initializationFloor,
+                    timestampMs,
+                    headingRad,
+                    Math.max(MIN_ABSOLUTE_FIX_START_STD_M, accuracyMeters)
+            );
+        } else {
+            particleFilterEngine.updateWithAbsoluteFix(
+                    localFix[0],
+                    localFix[1],
+                    floorPrior,
+                    timestampMs,
+                    accuracyMeters
+            );
+        }
+        return particleFilterEngine.estimatePose();
+    }
+
+    @Nullable
+    static FusedPose applyPdrPredictionForStep1(
+            @NonNull ParticleFilterEngine particleFilterEngine,
+            boolean pfInitialized,
+            @Nullable PdrDelta pdrDelta,
+            int floor,
+            long timestampMs
+    ) {
+        if (!pfInitialized || pdrDelta == null) {
+            return particleFilterEngine.estimatePose();
+        }
+        particleFilterEngine.predict(pdrDelta, floor, timestampMs);
+        return particleFilterEngine.estimatePose();
     }
 
     private float getCurrentHeadingRad() {

@@ -65,9 +65,12 @@ public class TrajectoryMapFragment extends Fragment {
     private LatLng currentLocation;
     private Marker orientationMarker;
     private Marker gnssMarker;
+    private Marker wifiMarker;
     private Polyline polyline;
     private Polyline gnssPolyline;
+    private Polyline wifiPolyline;
     private LatLng lastGnssLocation;
+    private LatLng lastWifiLocation;
     private LatLng pendingCameraPosition;
     private boolean hasPendingCameraMove;
     private boolean isRed = true;
@@ -245,6 +248,9 @@ public class TrajectoryMapFragment extends Fragment {
 
         polyline = map.addPolyline(new PolylineOptions().color(Color.RED).width(5f).add());
         gnssPolyline = map.addPolyline(new PolylineOptions().color(Color.BLUE).width(5f).add());
+        wifiPolyline = map.addPolyline(
+                new PolylineOptions().color(Color.rgb(255, 165, 0)).width(4f).add()
+        );
         updateVenueLabel();
     }
 
@@ -384,12 +390,45 @@ public class TrajectoryMapFragment extends Fragment {
         lastGnssLocation = gnssLocation;
     }
 
+    public void updateWifiFix(@NonNull LatLng wifiLocation, int floor) {
+        if (gMap == null) {
+            return;
+        }
+
+        if (wifiMarker == null) {
+            wifiMarker = gMap.addMarker(new MarkerOptions()
+                    .position(wifiLocation)
+                    .title("WiFi Position")
+                    .snippet("Floor " + floor)
+                    .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE)));
+            lastWifiLocation = wifiLocation;
+            return;
+        }
+
+        wifiMarker.setPosition(wifiLocation);
+        wifiMarker.setSnippet("Floor " + floor);
+        if (lastWifiLocation != null && !lastWifiLocation.equals(wifiLocation) && wifiPolyline != null) {
+            List<LatLng> points = new ArrayList<>(wifiPolyline.getPoints());
+            points.add(wifiLocation);
+            wifiPolyline.setPoints(points);
+        }
+        lastWifiLocation = wifiLocation;
+    }
+
     public void clearGNSS() {
         if (gnssMarker != null) {
             gnssMarker.remove();
             gnssMarker = null;
         }
         lastGnssLocation = null;
+    }
+
+    public void clearWifiFix() {
+        if (wifiMarker != null) {
+            wifiMarker.remove();
+            wifiMarker = null;
+        }
+        lastWifiLocation = null;
     }
 
     public boolean isGnssEnabled() {
@@ -412,16 +451,24 @@ public class TrajectoryMapFragment extends Fragment {
             gnssPolyline.remove();
             gnssPolyline = null;
         }
+        if (wifiPolyline != null) {
+            wifiPolyline.remove();
+            wifiPolyline = null;
+        }
         if (orientationMarker != null) {
             orientationMarker.remove();
             orientationMarker = null;
         }
         clearGNSS();
+        clearWifiFix();
         currentLocation = null;
 
         if (gMap != null) {
             polyline = gMap.addPolyline(new PolylineOptions().color(Color.RED).width(5f).add());
             gnssPolyline = gMap.addPolyline(new PolylineOptions().color(Color.BLUE).width(5f).add());
+            wifiPolyline = gMap.addPolyline(
+                    new PolylineOptions().color(Color.rgb(255, 165, 0)).width(4f).add()
+            );
         }
     }
 

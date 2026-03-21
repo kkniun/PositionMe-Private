@@ -380,6 +380,15 @@ public class RecordingFragment extends Fragment {
             }
         }
 
+        if (trajectoryMapFragment != null) {
+            LatLng wifiLocation = sensorFusion.getLatLngWifiPositioning();
+            if (wifiLocation != null) {
+                trajectoryMapFragment.updateWifiFix(wifiLocation, sensorFusion.getWifiFloor());
+            } else {
+                trajectoryMapFragment.clearWifiFix();
+            }
+        }
+
         // Update previous
         previousLocalX = fusedPose.getX();
         previousLocalY = fusedPose.getY();

@@ -158,14 +158,32 @@ public class PdrProcessing {
         return new PdrDelta(computedStepLength, deltaHeadingRad, heightDeltaMeters);
     }
 
+    /**
+     * Projects a step into the local coursework frame used across the app.
+     *
+     * <p>The heading follows the Android azimuth convention consumed by {@link SensorFusion}:
+     * {@code 0} radians points north and positive rotation turns east. The returned vector is
+     * {@code [eastMeters, northMeters]}.</p>
+     *
+     * @param stepLengthMeters step length in meters
+     * @param headingRad heading in radians
+     * @return local step vector as {@code [eastMeters, northMeters]}
+     */
+    public static double[] projectStepToLocalFrame(double stepLengthMeters, double headingRad) {
+        return new double[]{
+                stepLengthMeters * Math.sin(headingRad),
+                stepLengthMeters * Math.cos(headingRad)
+        };
+    }
+
     public float[] applyStepDelta(PdrDelta delta, float headingRad) {
         if (delta == null || delta.getStepLengthMeters() <= 0f) {
             return new float[]{this.positionX, this.positionY};
         }
 
-        float adaptedHeading = (float) (Math.PI / 2 - headingRad);
-        float x = (float) (delta.getStepLengthMeters() * Math.cos(adaptedHeading));
-        float y = (float) (delta.getStepLengthMeters() * Math.sin(adaptedHeading));
+        double[] localStep = projectStepToLocalFrame(delta.getStepLengthMeters(), headingRad);
+        float x = (float) localStep[0];
+        float y = (float) localStep[1];
 
         this.positionX += x;
         this.positionY += y;

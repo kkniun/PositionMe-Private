@@ -11,12 +11,18 @@ import com.google.android.gms.maps.model.LatLng;
 import com.openpositioning.PositionMe.presentation.fragment.RecordingFragment;
 
 /**
- * Class containing utility functions which can used by other classes.
+ * Utility functions shared across the app.
+ *
+ * <p>The coordinate helpers use a small-area WGS84 approximation:
+ * one degree of latitude is treated as a constant metric distance and
+ * longitude is scaled by cos(latitude). This is appropriate for the
+ * short indoor/outdoor distances handled by the coursework.</p>
+ *
  * @see RecordingFragment Currently used by RecordingFragment
  */
 public class UtilFunctions {
-    // Constant 1degree of latitiude/longitude (in m)
-    private static final int  DEGREE_IN_M=111111;
+    private static final double METERS_PER_DEGREE_LAT = 111_111.0;
+
     /**
      * Simple function to calculate the angle between two close points
      * @param pointA Starting point
@@ -30,50 +36,78 @@ public class UtilFunctions {
     }
 
     /**
-     * Calculate new coordinates based on net distance moved in PDR
-     * (as per WGS84 datum)
-     * @param initialLocation Current Location of user
-     * @param pdrMoved Amount of movement along X and Y
-     * @return new Coordinates based on the movement
+     * Calculates a new WGS84 position from local east/north movement in meters.
+     *
+     * @param initialLocation current WGS84 location
+     * @param pdrMoved movement in the local frame, where x is east and y is north
+     * @return updated WGS84 location
      */
-    public static LatLng calculateNewPos(LatLng initialLocation,float[] pdrMoved){
-        // Changes Euclidean movement into maps latitude and longitude as per WGS84 datum
-        double newLatitude=initialLocation.latitude+(pdrMoved[1]/(DEGREE_IN_M));
-        double newLongitude = initialLocation.longitude + (
-                pdrMoved[0] / (DEGREE_IN_M * Math.cos(Math.toRadians(initialLocation.latitude)))
-        );
+    public static LatLng calculateNewPos(LatLng initialLocation, float[] pdrMoved) {
+        double newLatitude = initialLocation.latitude + metersToDegreesLat(pdrMoved[1]);
+        double newLongitude = initialLocation.longitude
+                + metersToDegreesLng(pdrMoved[0], initialLocation.latitude);
         return new LatLng(newLatitude, newLongitude);
-    }
-    /**
-     * Converts a degree value of Latitude into meters
-     * (as per WGS84 datum)
-     * @param degreeVal Value in degrees to convert to meters
-     * @return double corresponding to the value in meters.
-     */
-    public static double degreesToMetersLat(double degreeVal) {
-        return degreeVal*DEGREE_IN_M;
-    }
-    /**
-     * Converts a degree value of Longitude into meters
-     * (as per WGS84 datum)
-     * @param degreeVal Value in degrees to convert to meters
-     * @param latitude the latitude of the current position
-     * @return double corresponding to the value in meters.
-     */
-    public static double degreesToMetersLng(double degreeVal, double latitude) {
-        return degreeVal*DEGREE_IN_M/Math.cos(Math.toRadians(latitude));
     }
 
     /**
-     * Calculates the distance between two LatLng points A and B (in meters)
-     * (Note: approximation: for short distances)
+     * Converts a latitude delta in degrees into northing in meters.
+     *
+     * @param degreeVal latitude delta in degrees
+     * @return northing in meters
+     */
+    public static double degreesToMetersLat(double degreeVal) {
+        return degreeVal * METERS_PER_DEGREE_LAT;
+    }
+
+    /**
+     * Converts a longitude delta in degrees into easting in meters.
+     *
+     * <p>Longitude degrees shrink with latitude, so the metric scale must be
+     * multiplied by cos(latitude).</p>
+     *
+     * @param degreeVal longitude delta in degrees
+     * @param latitude reference latitude in degrees
+     * @return easting in meters
+     */
+    public static double degreesToMetersLng(double degreeVal, double latitude) {
+        return degreeVal * metersPerDegreeLongitude(latitude);
+    }
+
+    /**
+     * Converts northing in meters into a latitude delta in degrees.
+     *
+     * @param meters northing in meters
+     * @return latitude delta in degrees
+     */
+    public static double metersToDegreesLat(double meters) {
+        return meters / METERS_PER_DEGREE_LAT;
+    }
+
+    /**
+     * Converts easting in meters into a longitude delta in degrees.
+     *
+     * @param meters easting in meters
+     * @param latitude reference latitude in degrees
+     * @return longitude delta in degrees
+     */
+    public static double metersToDegreesLng(double meters, double latitude) {
+        return meters / metersPerDegreeLongitude(latitude);
+    }
+
+    /**
+     * Calculates the approximate distance between two nearby WGS84 points.
+     *
+     * <p>This uses the same small-area approximation as the local coordinate pipeline.</p>
+     *
      * @param pointA initial point
      * @param pointB final point
-     * @return the distance between the two points
+     * @return distance between the two points in meters
      */
-    public static double distanceBetweenPoints(LatLng pointA, LatLng pointB){
-        return  Math.sqrt(Math.pow(degreesToMetersLat(pointA.latitude-pointB.latitude),2) +
-                Math.pow(degreesToMetersLng(pointA.longitude-pointB.longitude,pointA.latitude),2));
+    public static double distanceBetweenPoints(LatLng pointA, LatLng pointB) {
+        double referenceLatitude = (pointA.latitude + pointB.latitude) * 0.5;
+        double northMeters = degreesToMetersLat(pointA.latitude - pointB.latitude);
+        double eastMeters = degreesToMetersLng(pointA.longitude - pointB.longitude, referenceLatitude);
+        return Math.sqrt(Math.pow(northMeters, 2) + Math.pow(eastMeters, 2));
     }
 
     /**
@@ -93,6 +127,10 @@ public class UtilFunctions {
         vectorDrawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
         vectorDrawable.draw(canvas);
         return bitmap;
+    }
+
+    private static double metersPerDegreeLongitude(double latitudeDeg) {
+        return METERS_PER_DEGREE_LAT * Math.cos(Math.toRadians(latitudeDeg));
     }
 
 }
