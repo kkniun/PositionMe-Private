@@ -157,6 +157,7 @@
     <string name="venue_selected_format">Venue: %1$s (floor %2$d/%3$d)</string>
     <string name="floor_status">Floor: 0</string>
     <string name="floor_status_value">Floor: %1$d</string>
+    <string name="floor_status_label_value">Floor: %1$s</string>
     <string name="floor_status_unknown">Floor: --</string>
     <string name="floor_status_relative_value">Floor: relative %1$d</string>
     <string name="system_status_default">Status: Waiting for first absolute fix</string>

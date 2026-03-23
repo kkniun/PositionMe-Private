@@ -10,6 +10,7 @@ import android.app.ActivityManager;
 import android.content.Intent;
 import android.location.Location;
 import android.location.LocationListener;
+import android.location.LocationManager;
 import android.os.Build;
 import android.os.PowerManager;
 import android.os.SystemClock;
@@ -100,7 +101,10 @@ public class SensorFusion implements SensorEventListener, Observer {
     // String for creating WiFi fingerprint JSO N object
     private static final String WIFI_FINGERPRINT= "wf";
     private static final String DEFAULT_COLLECTION_VENUE = "traj";
-    private static final float DEFAULT_WIFI_ACCURACY_M = 8.0f;
+    private static final float DEFAULT_WIFI_ACCURACY_M = 5.0f;
+    private static final float GNSS_GPS_ACCURACY_WEIGHT_FACTOR = 0.65f;
+    private static final float GNSS_NETWORK_ACCURACY_PENALTY_FACTOR = 1.35f;
+    private static final float MIN_GNSS_EFFECTIVE_ACCURACY_M = 1.5f;
     private static final double MIN_ABSOLUTE_FIX_START_STD_M = 1.0;
     //endregion
 
@@ -406,6 +410,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                 angularVelocity[0] = sensorEvent.values[0];
                 angularVelocity[1] = sensorEvent.values[1];
                 angularVelocity[2] = sensorEvent.values[2];
+                break;
 
             case Sensor.TYPE_LINEAR_ACCELERATION:
                 filteredAcc[0] = sensorEvent.values[0];
@@ -459,11 +464,10 @@ public class SensorFusion implements SensorEventListener, Observer {
                 SensorManager.getRotationMatrixFromVector(rotationVectorDCM, this.rotation);
                 SensorManager.getOrientation(rotationVectorDCM, this.orientation);
 
-                Log.d("HeadingDbg", "onSensorChanged azimuth(rad)=" + orientation[0]);
-
                 if (DEBUG_HEADING) {
                     long now = SystemClock.elapsedRealtime();
                     if (now - headingDbgRotvecLastLogMs >= 1000) {
+                        Log.d("HeadingDbg", "onSensorChanged azimuth(rad)=" + orientation[0]);
                         Log.d("HeadingDbg", "rotvec azimuth(rad)=" + orientation[0]);
                         headingDbgRotvecLastLogMs = now;
                     }
@@ -500,13 +504,20 @@ public class SensorFusion implements SensorEventListener, Observer {
                             deltaHeadingRad,
                             heightDeltaMeters
                     );
+                    float[] previousPdr = this.pdrProcessing.getPDRMovement();
                     float[] newCords = this.pdrProcessing.applyStepDelta(pdrDelta, currentHeadingRad);
+                    int currentPdrFloor = this.pdrProcessing.getCurrentFloor();
+                    if (!isValidParticlePrediction(newCords[0], newCords[1], currentPdrFloor)) {
+                        // Keep raw PDR inside map constraints too (same wall/outline rules as PF particles).
+                        this.pdrProcessing.setPdrPosition(previousPdr[0], previousPdr[1]);
+                        newCords = previousPdr;
+                    }
 
                     // Clear the accelMagnitude after using it
                     this.accelMagnitude.clear();
                     handlePdrPredict(
                             pdrDelta,
-                            this.pdrProcessing.getCurrentFloor(),
+                            currentPdrFloor,
                             currentTime
                     );
                     this.lastPredictHeadingRad = currentHeadingRad;
@@ -558,6 +569,15 @@ public class SensorFusion implements SensorEventListener, Observer {
             float accuracy = (float) location.getAccuracy();
             float speed = (float) location.getSpeed();
             String provider = location.getProvider();
+            float weightedAccuracy = accuracy;
+            if (LocationManager.GPS_PROVIDER.equals(provider)) {
+                weightedAccuracy = Math.max(
+                        MIN_GNSS_EFFECTIVE_ACCURACY_M,
+                        accuracy * GNSS_GPS_ACCURACY_WEIGHT_FACTOR
+                );
+            } else if (LocationManager.NETWORK_PROVIDER.equals(provider)) {
+                weightedAccuracy = accuracy * GNSS_NETWORK_ACCURACY_PENALTY_FACTOR;
+            }
             if(saveRecording) {
                 long relativeTimestamp = System.currentTimeMillis() - absoluteStartTime;
                 Traj.GNSSPosition.Builder position = Traj.GNSSPosition.newBuilder()
@@ -583,7 +603,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                                 System.currentTimeMillis(),
                                 latitude,
                                 longitude,
-                                accuracy
+                                weightedAccuracy
                         ),
                         resolveStep1InitializationFloor(null),
                         null
@@ -1589,6 +1609,26 @@ public class SensorFusion implements SensorEventListener, Observer {
         return this.pdrProcessing == null ? 0 : this.pdrProcessing.getCurrentFloor();
     }
 
+    public void setPdrFloorHeightMeters(float floorHeightMeters) {
+        if (this.pdrProcessing == null) {
+            return;
+        }
+        this.pdrProcessing.setFloorHeight(floorHeightMeters);
+    }
+
+    public boolean recalibrateBarometerFloorAnchor(int anchorFloor) {
+        if (this.pdrProcessing == null || this.pressure <= 0f) {
+            return false;
+        }
+        float absoluteElevationMeters = SensorManager.getAltitude(
+                SensorManager.PRESSURE_STANDARD_ATMOSPHERE,
+                pressure
+        );
+        this.pdrProcessing.recalibrateFloorAnchor(absoluteElevationMeters, anchorFloor);
+        this.elevation = this.pdrProcessing.getCurrentElevation();
+        return true;
+    }
+
     /**
      * Get an estimate by the PDR class whether it estimates the user is currently taking an elevator.
      *
@@ -1637,7 +1677,8 @@ public class SensorFusion implements SensorEventListener, Observer {
         proximitySensor.sensorManager.registerListener(this, proximitySensor.sensor, (int) 1e6);
         magnetometerSensor.sensorManager.registerListener(this, magnetometerSensor.sensor, 10000, (int) maxReportLatencyNs);
         stepDetectionSensor.sensorManager.registerListener(this, stepDetectionSensor.sensor, SensorManager.SENSOR_DELAY_NORMAL);
-        rotationSensor.sensorManager.registerListener(this, rotationSensor.sensor, (int) 1e6);
+        // Heading drives both PDR propagation and map arrow; keep rotation-vector updates responsive.
+        rotationSensor.sensorManager.registerListener(this, rotationSensor.sensor, 10000, (int) maxReportLatencyNs);
         wifiProcessor.startListening();
         gnssProcessor.startLocationUpdates();
         bleProcessor.startListening();

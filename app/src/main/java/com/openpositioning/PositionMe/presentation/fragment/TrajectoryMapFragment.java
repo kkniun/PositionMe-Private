@@ -48,6 +48,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
+import com.openpositioning.PositionMe.sensors.FusedPose;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.utils.BuildingPolygon;
 import com.openpositioning.PositionMe.utils.IndoorMapManager;
@@ -69,6 +70,9 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double TRAJECTORY_DUPLICATE_SUPPRESS_THRESHOLD_M = 0.15;
     private static final double RAW_POINT_DUPLICATE_THRESHOLD_M = 0.25;
     private static final double DISPLAY_SMOOTHING_ALPHA = 0.35;
+    private static final double HEADING_MOVEMENT_MIN_DISTANCE_M = 0.8;
+    private static final float HEADING_SENSOR_SMOOTH_ALPHA = 0.15f;
+    private static final float HEADING_COURSE_BLEND_ALPHA = 0.35f;
     private static final float DISABLED_ACTION_ALPHA = 0.4f;
     private static final float ENABLED_ACTION_ALPHA = 1f;
     private static final float DEFAULT_WAITING_CAMERA_ZOOM = 17.2f;
@@ -104,6 +108,8 @@ public class TrajectoryMapFragment extends Fragment {
     private LatLng lastGnssObservation;
     private LatLng lastWifiObservation;
     private LatLng lastPdrObservation;
+    private LatLng lastHeadingLocation;
+    private float filteredHeadingDeg = Float.NaN;
     private long lastFusedTrajectoryUpdateTimestampMs = -1L;
 
     private BitmapDescriptor fusedMarkerIcon;
@@ -248,13 +254,11 @@ public class TrajectoryMapFragment extends Fragment {
             if (!isChecked || indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
                 return;
             }
-            float floorHeight = indoorMapManager.getFloorHeight();
-            if (floorHeight <= 0f) {
-                return;
+            float venueFloorHeight = indoorMapManager.getFloorHeight();
+            if (venueFloorHeight > 0f) {
+                sensorFusion.setPdrFloorHeightMeters(venueFloorHeight);
             }
-            int estimatedFloor = (int) (sensorFusion.getElevation() / floorHeight);
-            indoorMapManager.setCurrentFloor(estimatedFloor, true);
-            updateVenueLabel();
+            // Floor switch is handled by RecordingFragment with 2s stability debounce.
         });
 
         floorUpButton.setOnClickListener(v -> {
@@ -355,7 +359,8 @@ public class TrajectoryMapFragment extends Fragment {
         LatLng displayedLocation = resolveDisplayLocation(newLocation);
         currentLocation = displayedLocation;
 
-        updateFusedMarker(displayedLocation, orientation);
+        float resolvedHeadingDeg = resolveDisplayHeading(displayedLocation, orientation);
+        updateFusedMarker(displayedLocation, resolvedHeadingDeg);
         maybeAppendFusedTrajectory(newLocation, timestampMs);
 
         if (!hasAutoCenteredOnFirstFix) {
@@ -443,12 +448,36 @@ public class TrajectoryMapFragment extends Fragment {
                 && !TextUtils.isEmpty(indoorMapManager.getSelectedVenueName());
     }
 
+    public float getVenueFloorHeightMeters() {
+        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
+            return 0f;
+        }
+        return indoorMapManager.getFloorHeight();
+    }
+
+    @Nullable
+    public String getCurrentDisplayedFloorLabel() {
+        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
+            return null;
+        }
+        return indoorMapManager.getCurrentFloorLabel();
+    }
+
     public void syncDisplayedFloor(int floor) {
         if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
             return;
         }
-        indoorMapManager.setCurrentFloor(floor, true);
+        // RecordingFragment already applies debounce; avoid a second debounce layer here.
+        indoorMapManager.setCurrentFloorFromSemanticLevel(floor, false);
         updateVenueLabel();
+    }
+
+    @Nullable
+    public String getFloorDisplayLabelFor(int floorIndex) {
+        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
+            return null;
+        }
+        return indoorMapManager.getFloorLabelForIndex(floorIndex);
     }
 
     public void setInitialCameraPosition(@NonNull LatLng startLocation) {
@@ -472,6 +501,8 @@ public class TrajectoryMapFragment extends Fragment {
         currentLocation = null;
         currentRawLocation = null;
         smoothedFusedLocation = null;
+        lastHeadingLocation = null;
+        filteredHeadingDeg = Float.NaN;
         hasAutoCenteredOnFirstFix = false;
 
         clearGNSS();
@@ -550,6 +581,61 @@ public class TrajectoryMapFragment extends Fragment {
             fusedMarker.setRotation(orientation);
             fusedMarker.setVisible(isFusedOn);
         }
+    }
+
+    private float resolveDisplayHeading(@NonNull LatLng current, float sensorHeadingDeg) {
+        float normalizedSensorDeg = normalizeDegrees(sensorHeadingDeg);
+        if (Float.isNaN(filteredHeadingDeg)) {
+            filteredHeadingDeg = normalizedSensorDeg;
+            lastHeadingLocation = current;
+            return filteredHeadingDeg;
+        }
+
+        // Smooth raw sensor heading first to reduce jitter.
+        filteredHeadingDeg = blendDegrees(filteredHeadingDeg, normalizedSensorDeg, HEADING_SENSOR_SMOOTH_ALPHA);
+
+        if (lastHeadingLocation != null) {
+            double movementMeters = UtilFunctions.distanceBetweenPoints(lastHeadingLocation, current);
+            if (movementMeters >= HEADING_MOVEMENT_MIN_DISTANCE_M) {
+                float courseHeadingDeg = bearingDegrees(lastHeadingLocation, current);
+                // When moving, blend in course heading so arrow follows actual travel direction.
+                filteredHeadingDeg = blendDegrees(filteredHeadingDeg, courseHeadingDeg, HEADING_COURSE_BLEND_ALPHA);
+                lastHeadingLocation = current;
+            }
+        } else {
+            lastHeadingLocation = current;
+        }
+        return normalizeDegrees(filteredHeadingDeg);
+    }
+
+    private float bearingDegrees(@NonNull LatLng from, @NonNull LatLng to) {
+        double fromLat = Math.toRadians(from.latitude);
+        double toLat = Math.toRadians(to.latitude);
+        double deltaLon = Math.toRadians(to.longitude - from.longitude);
+        double y = Math.sin(deltaLon) * Math.cos(toLat);
+        double x = Math.cos(fromLat) * Math.sin(toLat)
+                - Math.sin(fromLat) * Math.cos(toLat) * Math.cos(deltaLon);
+        return normalizeDegrees((float) Math.toDegrees(Math.atan2(y, x)));
+    }
+
+    private float blendDegrees(float baseDeg, float targetDeg, float alpha) {
+        float delta = shortestSignedDeltaDeg(baseDeg, targetDeg);
+        return normalizeDegrees(baseDeg + alpha * delta);
+    }
+
+    private float shortestSignedDeltaDeg(float fromDeg, float toDeg) {
+        float delta = normalizeDegrees(toDeg) - normalizeDegrees(fromDeg);
+        if (delta > 180f) delta -= 360f;
+        if (delta < -180f) delta += 360f;
+        return delta;
+    }
+
+    private float normalizeDegrees(float deg) {
+        float normalized = deg % 360f;
+        if (normalized < 0f) {
+            normalized += 360f;
+        }
+        return normalized;
     }
 
     private void maybeAppendFusedTrajectory(@NonNull LatLng rawLocation, long timestampMs) {

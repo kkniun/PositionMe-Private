@@ -45,7 +45,7 @@ import java.util.TimerTask;
 public class WifiDataProcessor implements Observable {
 
     //Time over which a new scan will be initiated
-    private static final long SCAN_INTERVAL_MS = 5000;
+    private static final long SCAN_INTERVAL_MS = 2000;
     private static final long TOAST_DEBOUNCE_MS = 8000;
     private static final String WIFI_CHECK_TAG = "WifiCheck";
     private static boolean sThrottleSettingWarned = false;

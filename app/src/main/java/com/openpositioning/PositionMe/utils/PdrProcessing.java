@@ -59,7 +59,7 @@ public class PdrProcessing {
     private float startElevation;
     private int setupIndex = 0;
     private float elevation;
-    private int floorHeight;
+    private float floorHeight;
     private int currentFloor;
 
     // Buffer of most recent elevations calculated
@@ -191,6 +191,14 @@ public class PdrProcessing {
     }
 
     /**
+     * Force-set current PDR local position in meters.
+     */
+    public void setPdrPosition(float xMeters, float yMeters) {
+        this.positionX = xMeters;
+        this.positionY = yMeters;
+    }
+
+    /**
      * Calculates the relative elevation compared to the start position.
      * The start elevation is the median of the first three seconds of data to give the sensor time
      * to settle. The sea level is irrelevant as only values relative to the initial position are
@@ -309,6 +317,37 @@ public class PdrProcessing {
      */
     public int getCurrentFloor() {
         return this.currentFloor;
+    }
+
+    /**
+     * Override floor height at runtime (for example from venue metadata).
+     */
+    public void setFloorHeight(float floorHeightMeters) {
+        if (Float.isNaN(floorHeightMeters) || Float.isInfinite(floorHeightMeters) || floorHeightMeters <= 0f) {
+            return;
+        }
+        this.floorHeight = floorHeightMeters;
+    }
+
+    /**
+     * Re-anchor barometric floor estimation to a known floor label.
+     * This is useful when entering a building on a non-zero floor (e.g. G/2/LG).
+     */
+    public void recalibrateFloorAnchor(float absoluteElevationMeters, int anchorFloor) {
+        if (Float.isNaN(absoluteElevationMeters) || Float.isInfinite(absoluteElevationMeters) || floorHeight <= 0f) {
+            return;
+        }
+        this.startElevation = absoluteElevationMeters - (anchorFloor * floorHeight);
+        this.currentFloor = anchorFloor;
+        this.elevation = absoluteElevationMeters - this.startElevation;
+        this.setupIndex = 3; // mark baseline as initialized
+        this.startElevationBuffer = new Float[]{startElevation, startElevation, startElevation};
+
+        int capacity = elevationList != null ? elevationList.getCapacity() : elevationSeconds;
+        this.elevationList = new CircularFloatBuffer(capacity);
+        for (int i = 0; i < capacity; i++) {
+            this.elevationList.putNewest(absoluteElevationMeters);
+        }
     }
 
     /**

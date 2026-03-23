@@ -67,7 +67,6 @@ import java.util.Locale;
  */
 
 public class RecordingFragment extends Fragment {
-
     // UI elements
     private MaterialButton completeButton, cancelButton, addMarkerButton;
     private ImageView recIcon;
@@ -100,6 +99,9 @@ public class RecordingFragment extends Fragment {
     private Handler refreshDataHandler;
     private CountDownTimer autoStop;
     private long headingDbgUiLastLogMs = 0;
+    private static final long AUTO_FLOOR_STABLE_MS = 1200L;
+    private Integer pendingAutoFloorSemantic = null;
+    private long pendingAutoFloorSinceMs = 0L;
 
     // Distance tracking
     private float distance = 0f;
@@ -373,7 +375,7 @@ public class RecordingFragment extends Fragment {
 
         LatLng newLocation = sensorFusion.getLatLngForFusedPose(fusedPose);
         if (newLocation != null) {
-            double orientationDeg = Math.toDegrees(sensorFusion.passOrientation());
+            double orientationDeg = normalizeHeadingDeg(Math.toDegrees(sensorFusion.passOrientation()));
             if (SensorFusion.DEBUG_HEADING) {
                 long now = SystemClock.elapsedRealtime();
                 if (now - headingDbgUiLastLogMs >= 1000) {
@@ -388,10 +390,10 @@ public class RecordingFragment extends Fragment {
                         (float) orientationDeg,
                         fusedPose.getTimestampMs()
                 );
-                if (trajectoryMapFragment.isAutoFloorEnabled()) {
-                    trajectoryMapFragment.syncDisplayedFloor(fusedPose.getFloor());
-                }
             }
+        }
+        if (trajectoryMapFragment != null && trajectoryMapFragment.isAutoFloorEnabled()) {
+            maybeSyncDisplayedFloorFromWifi();
         }
 
         LatLng gnssLocation = sensorFusion.getCurrentGnssLatLng();
@@ -450,7 +452,63 @@ public class RecordingFragment extends Fragment {
         if (trajectoryMapFragment != null && !trajectoryMapFragment.isMappedVenueActive()) {
             return getString(R.string.floor_status_relative_value, floor);
         }
+        if (trajectoryMapFragment != null) {
+            String displayedLabel = trajectoryMapFragment.getCurrentDisplayedFloorLabel();
+            if (displayedLabel != null && !displayedLabel.isEmpty()) {
+                return getString(R.string.floor_status_label_value, displayedLabel);
+            }
+            String floorLabel = trajectoryMapFragment.getFloorDisplayLabelFor(floor);
+            if (floorLabel != null && !floorLabel.isEmpty()) {
+                return getString(R.string.floor_status_label_value, floorLabel);
+            }
+        }
         return getString(R.string.floor_status_value, floor);
+    }
+
+    /**
+     * Auto-floor strategy (WiFi-first only):
+     * - Only WiFi floor is allowed to drive map floor switching.
+     * - Fused/barometric floors are intentionally ignored here.
+     */
+    private void maybeSyncDisplayedFloorFromWifi() {
+        if (trajectoryMapFragment == null || !trajectoryMapFragment.isMappedVenueActive()) {
+            return;
+        }
+        if (sensorFusion.getLatLngWifiPositioning() == null) {
+            // Keep current displayed floor while WiFi floor is temporarily unavailable.
+            pendingAutoFloorSemantic = null;
+            return;
+        }
+        int candidateFloor = sensorFusion.getWifiFloor();
+        String currentLabel = trajectoryMapFragment.getCurrentDisplayedFloorLabel();
+        String candidateLabel = trajectoryMapFragment.getFloorDisplayLabelFor(candidateFloor);
+        if (candidateLabel == null || candidateLabel.isEmpty()) {
+            pendingAutoFloorSemantic = null;
+            return;
+        }
+        if (candidateLabel.equals(currentLabel)) {
+            pendingAutoFloorSemantic = null;
+            return;
+        }
+
+        long now = SystemClock.elapsedRealtime();
+        if (pendingAutoFloorSemantic == null || pendingAutoFloorSemantic != candidateFloor) {
+            pendingAutoFloorSemantic = candidateFloor;
+            pendingAutoFloorSinceMs = now;
+            return;
+        }
+        if (now - pendingAutoFloorSinceMs >= AUTO_FLOOR_STABLE_MS) {
+            trajectoryMapFragment.syncDisplayedFloor(candidateFloor);
+            pendingAutoFloorSemantic = null;
+        }
+    }
+
+    private float normalizeHeadingDeg(double headingDeg) {
+        double normalized = headingDeg % 360.0;
+        if (normalized < 0.0) {
+            normalized += 360.0;
+        }
+        return (float) normalized;
     }
 
     private String resolveElevatorStatusText() {

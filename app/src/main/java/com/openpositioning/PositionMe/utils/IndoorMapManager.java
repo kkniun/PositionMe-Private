@@ -34,11 +34,14 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -62,6 +65,8 @@ public class IndoorMapManager {
     private static final float REQUEST_DISTANCE_M = 8f;
     private static final float DEFAULT_FLOOR_HEIGHT_M = 3.6f;
     private static final int LOG_PREVIEW_LIMIT = 220;
+    private static final int AUTO_FLOOR_CONFIRMATION_COUNT = 4;
+    private static final long AUTO_FLOOR_MIN_SWITCH_INTERVAL_MS = 5000L;
 
     private static final int VENUE_STROKE = Color.argb(220, 0, 190, 255);
     private static final int VENUE_FILL = Color.argb(45, 0, 190, 255);
@@ -70,6 +75,8 @@ public class IndoorMapManager {
     private static final int FLOOR_SHAPE_STROKE = Color.argb(220, 255, 255, 255);
     private static final int FLOOR_SHAPE_FILL = Color.argb(40, 255, 255, 255);
     private static final float FLOOR_SHAPE_STROKE_WIDTH = 3f;
+    private static final Pattern BASEMENT_FLOOR_PATTERN = Pattern.compile("^B(\\d+)$");
+    private static final Pattern LEVEL_FLOOR_PATTERN = Pattern.compile("^[LF](\\d+)$");
 
     private final GoogleMap gMap;
     private final OkHttpClient httpClient;
@@ -92,6 +99,9 @@ public class IndoorMapManager {
     private String selectedVenueId;
     private boolean autoSelectFirstVenue;
     private VenueSelectionListener venueSelectionListener;
+    private int pendingAutoFloorIndex = -1;
+    private int pendingAutoFloorCount = 0;
+    private long lastAutoFloorSwitchMs = 0L;
 
     public interface VenueSelectionListener {
         void onVenueSelected(@Nullable String venueId, @Nullable String venueName);
@@ -209,7 +219,8 @@ public class IndoorMapManager {
             Log.d(TAG, "FLOOR_UI: venue selected id=" + venue.id);
         }
         floorHeight = venue.floorHeight;
-        currentFloor = Math.min(currentFloor, Math.max(venue.floors.size() - 1, 0));
+        int maxFloorIndex = resolveMaxFloorIndexForVenue(venue);
+        currentFloor = Math.max(0, Math.min(currentFloor, maxFloorIndex));
         loadFloorplanForVenue(venue);
         updatePolygonStyle();
 
@@ -217,6 +228,14 @@ public class IndoorMapManager {
             venueSelectionListener.onVenueSelected(venue.id, venue.name);
         }
         return true;
+    }
+
+    private int resolveMaxFloorIndexForVenue(@NonNull VenueModel venue) {
+        if (!venue.floors.isEmpty()) {
+            return Math.max(venue.floors.size() - 1, 0);
+        }
+        List<String> keys = getShapeFloorKeys(venue);
+        return Math.max(keys.size() - 1, 0);
     }
 
     public boolean getIsIndoorMapSet() {
@@ -238,6 +257,35 @@ public class IndoorMapManager {
 
     public int getCurrentFloor() {
         return currentFloor;
+    }
+
+    @Nullable
+    public String getCurrentFloorLabel() {
+        return getFloorLabelForIndex(currentFloor);
+    }
+
+    @Nullable
+    public String getFloorLabelForIndex(int floorIndex) {
+        VenueModel selected = getSelectedVenue();
+        if (selected == null) {
+            return null;
+        }
+
+        if (selected.floors.isEmpty()) {
+            List<String> keys = getShapeFloorKeys(selected);
+            if (keys.isEmpty()) {
+                return null;
+            }
+            int bounded = Math.max(0, Math.min(floorIndex, keys.size() - 1));
+            return keys.get(bounded);
+        }
+
+        int bounded = Math.max(0, Math.min(floorIndex, selected.floors.size() - 1));
+        FloorModel floorModel = selected.floors.get(bounded);
+        if (!TextUtils.isEmpty(floorModel.floorName)) {
+            return floorModel.floorName;
+        }
+        return String.valueOf(floorModel.floorIndex);
     }
 
     @Nullable
@@ -268,10 +316,19 @@ public class IndoorMapManager {
 
             if (bounded == currentFloor && isIndoorMapSet) {
                 Log.d(TAG, "NOOP map_shapes: same floor");
+                if (autoFloor) {
+                    pendingAutoFloorIndex = -1;
+                    pendingAutoFloorCount = 0;
+                }
                 return;
             }
 
             currentFloor = bounded;
+            if (autoFloor) {
+                lastAutoFloorSwitchMs = System.currentTimeMillis();
+                pendingAutoFloorIndex = -1;
+                pendingAutoFloorCount = 0;
+            }
 
             // 关键：触发重新绘制当前 floorKey 的 shapes（不要 renderCurrentFloor）
             loadFloorplanForVenue(selected);
@@ -290,11 +347,98 @@ public class IndoorMapManager {
 
         if (bounded == currentFloor && isIndoorMapSet) {
             Log.d(TAG, "NOOP: bounded == currentFloor and map set, return");
+            if (autoFloor) {
+                pendingAutoFloorIndex = -1;
+                pendingAutoFloorCount = 0;
+            }
             return;
         }
 
         currentFloor = bounded;
-        renderCurrentFloor();
+        if (autoFloor) {
+            lastAutoFloorSwitchMs = System.currentTimeMillis();
+            pendingAutoFloorIndex = -1;
+            pendingAutoFloorCount = 0;
+        }
+        loadFloorplanForVenue(selected);
+    }
+
+    /**
+     * Set displayed floor from a semantic floor value (for example -1/0/1/2), not from list index.
+     * This avoids mismatches where a semantic floor is accidentally interpreted as map key position.
+     */
+    public void setCurrentFloorFromSemanticLevel(int semanticFloor, boolean autoFloor) {
+        VenueModel selected = getSelectedVenue();
+        if (selected == null) {
+            return;
+        }
+        int targetIndex;
+        if (selected.floors.isEmpty()) {
+            targetIndex = resolveMapShapeIndexForSemanticLevel(selected, semanticFloor);
+        } else {
+            int bestIndex = 0;
+            int bestDistance = Integer.MAX_VALUE;
+            for (int i = 0; i < selected.floors.size(); i++) {
+                int distance = Math.abs(selected.floors.get(i).floorIndex - semanticFloor);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = i;
+                }
+            }
+            targetIndex = bestIndex;
+        }
+
+        if (!autoFloor) {
+            pendingAutoFloorIndex = -1;
+            pendingAutoFloorCount = 0;
+            setCurrentFloor(targetIndex, false);
+            return;
+        }
+        if (targetIndex == currentFloor) {
+            pendingAutoFloorIndex = -1;
+            pendingAutoFloorCount = 0;
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastAutoFloorSwitchMs < AUTO_FLOOR_MIN_SWITCH_INTERVAL_MS) {
+            return;
+        }
+        if (pendingAutoFloorIndex != targetIndex) {
+            pendingAutoFloorIndex = targetIndex;
+            pendingAutoFloorCount = 1;
+            return;
+        }
+        pendingAutoFloorCount++;
+        if (pendingAutoFloorCount < AUTO_FLOOR_CONFIRMATION_COUNT) {
+            return;
+        }
+        setCurrentFloor(targetIndex, true);
+    }
+
+    private int resolveMapShapeIndexForSemanticLevel(@NonNull VenueModel selected, int semanticFloor) {
+        List<String> keys = getShapeFloorKeys(selected);
+        if (keys.isEmpty()) {
+            return 0;
+        }
+
+        int bestIndex = currentFloor;
+        double bestDistance = Double.POSITIVE_INFINITY;
+        for (int i = 0; i < keys.size(); i++) {
+            Double rank = parseFloorLabelRank(keys.get(i));
+            if (rank == null) {
+                continue;
+            }
+            double distance = Math.abs(rank - semanticFloor);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = i;
+            }
+        }
+        if (bestDistance < Double.POSITIVE_INFINITY) {
+            return Math.max(0, Math.min(bestIndex, keys.size() - 1));
+        }
+        // No parseable keys: preserve prior behavior as best effort.
+        return Math.max(0, Math.min(semanticFloor, keys.size() - 1));
     }
 
 
@@ -391,8 +535,8 @@ public class IndoorMapManager {
     private void loadFloorplanForVenue(@NonNull VenueModel venue) {
         clearFloorShapeOverlays();
         if (!venue.floors.isEmpty()) {
-            MapConstraintRepository.clear();
             renderCurrentFloor();
+            updateMapConstraintsForCurrentFloor(venue);
             return;
         }
         removeGroundOverlay();
@@ -438,6 +582,37 @@ public class IndoorMapManager {
                     + " drawnPolylines=" + counts[0] + " drawnPolygons=" + counts[1]);
         }
 
+    }
+
+    private void updateMapConstraintsForCurrentFloor(@NonNull VenueModel venue) {
+        if (TextUtils.isEmpty(venue.mapShapesPayload)) {
+            MapConstraintRepository.clear();
+            return;
+        }
+        List<String> keys = getShapeFloorKeys(venue);
+        if (keys.isEmpty()) {
+            MapConstraintRepository.clear();
+            return;
+        }
+
+        int shapeFloorIndex = Math.max(0, Math.min(currentFloor, keys.size() - 1));
+        if (!venue.floors.isEmpty() && currentFloor >= 0 && currentFloor < venue.floors.size()) {
+            int semanticFloor = venue.floors.get(currentFloor).floorIndex;
+            shapeFloorIndex = resolveMapShapeIndexForSemanticLevel(venue, semanticFloor);
+        }
+        shapeFloorIndex = Math.max(0, Math.min(shapeFloorIndex, keys.size() - 1));
+        String key = keys.get(shapeFloorIndex);
+
+        List<List<LatLng>> wallPolygons = extractWallPolygonsForKey(venue.mapShapesPayload, key);
+        List<List<LatLng>> transitionPolygons = extractTransitionPolygonsForKey(venue.mapShapesPayload, key);
+        MapConstraintRepository.updateCurrentFloorConstraints(
+                venue.id,
+                key,
+                shapeFloorIndex,
+                venue.outline,
+                wallPolygons,
+                transitionPolygons
+        );
     }
 
     @NonNull
@@ -679,11 +854,72 @@ public class IndoorMapManager {
             }
         } catch (JSONException ignored) {}
 
-        // 可选：排序，让 UI 顺序稳定（B1,G,1,2... 你也可以自定义排序规则）
-        Collections.sort(keys);
+        // Stable floor order: basement -> lobby/ground -> upper floors.
+        Collections.sort(keys, new Comparator<String>() {
+            @Override
+            public int compare(String a, String b) {
+                Double rankA = parseFloorLabelRank(a);
+                Double rankB = parseFloorLabelRank(b);
+                if (rankA != null && rankB != null) {
+                    int rankCmp = Double.compare(rankA, rankB);
+                    if (rankCmp != 0) return rankCmp;
+                } else if (rankA != null) {
+                    return -1;
+                } else if (rankB != null) {
+                    return 1;
+                }
+                return a.compareToIgnoreCase(b);
+            }
+        });
 
         shapeFloorKeysCache.put(venue.id, keys);
         return keys;
+    }
+
+    @Nullable
+    private Double parseFloorLabelRank(@Nullable String label) {
+        if (TextUtils.isEmpty(label)) {
+            return null;
+        }
+        String normalized = label.trim().toUpperCase(Locale.US).replace(" ", "");
+        if (TextUtils.isEmpty(normalized)) {
+            return null;
+        }
+        // Numeric floors: "2", "-1"
+        if (normalized.matches("[-+]?\\d+")) {
+            try {
+                return Double.parseDouble(normalized);
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        // Ground floor aliases.
+        if ("G".equals(normalized) || "GF".equals(normalized) || "GROUND".equals(normalized)) {
+            return 0.0;
+        }
+        // Lower ground: commonly between B1 and G.
+        if ("LG".equals(normalized) || "LOWERGROUND".equals(normalized)) {
+            return -0.5;
+        }
+        // Basement floors: B1, B2...
+        Matcher basementMatcher = BASEMENT_FLOOR_PATTERN.matcher(normalized);
+        if (basementMatcher.matches()) {
+            try {
+                return -Double.parseDouble(basementMatcher.group(1));
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        // Level-style floors: L1/L2 or F1/F2.
+        Matcher levelMatcher = LEVEL_FLOOR_PATTERN.matcher(normalized);
+        if (levelMatcher.matches()) {
+            try {
+                return Double.parseDouble(levelMatcher.group(1));
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        return null;
     }
 
     private void drawMapShapesForKey(@NonNull String payload, @NonNull String floorKey, @NonNull int[] counts) {

@@ -45,33 +45,44 @@
                 <!-- Distance Traveled -->
                 <TextView
                     android:id="@+id/currentDistanceTraveled"
-                    android:layout_width="wrap_content"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:ellipsize="end"
+                    android:singleLine="true"
                     android:text="@string/meter"
-                    android:textAppearance="@style/TextAppearance.Material3.BodyLarge"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
                     android:textColor="@color/md_theme_secondary"
                     android:textStyle="bold" />
 
                 <!-- Elevation -->
                 <TextView
                     android:id="@+id/currentElevation"
-                    android:layout_width="wrap_content"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
+                    android:layout_weight="1"
                     android:layout_marginStart="16dp"
                     android:layout_marginEnd="16dp"
+                    android:ellipsize="end"
+                    android:gravity="center_horizontal"
+                    android:singleLine="true"
                     android:text="@string/elevation"
-                    android:textAppearance="@style/TextAppearance.Material3.BodyLarge"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
                     android:textColor="@color/md_theme_secondary"
                     android:textStyle="bold" />
 
                 <!-- GNSS Error -->
                 <TextView
                     android:id="@+id/gnssError"
-                    android:layout_width="wrap_content"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
+                    android:layout_weight="1"
                     android:layout_marginStart="16dp"
+                    android:ellipsize="end"
+                    android:gravity="end"
+                    android:singleLine="true"
                     android:text="@string/gnss_error"
-                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="@color/md_theme_error" />
             </LinearLayout>
 
@@ -86,8 +97,10 @@
                     android:id="@+id/currentFloorStatus"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
+                    android:ellipsize="end"
+                    android:singleLine="true"
                     android:text="@string/floor_status_unknown"
-                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="@color/md_theme_secondary"
                     android:textStyle="bold" />
 
@@ -96,8 +109,10 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="16dp"
+                    android:ellipsize="end"
+                    android:singleLine="true"
                     android:text="@string/elevator_status_unknown"
-                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="@color/md_theme_secondary"
                     android:textStyle="bold" />
             </LinearLayout>
@@ -114,8 +129,10 @@
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
+                    android:ellipsize="end"
+                    android:singleLine="true"
                     android:text="@string/system_status_default"
-                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="@color/md_theme_secondary"
                     android:textStyle="bold" />
 
@@ -124,8 +141,10 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="16dp"
+                    android:ellipsize="end"
+                    android:singleLine="true"
                     android:text="@string/last_update_default"
-                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="@color/md_theme_secondary" />
             </LinearLayout>
 
