@@ -37,8 +37,11 @@ import com.openpositioning.PositionMe.sensors.SensorTypes;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
 import com.google.android.gms.maps.model.LatLng;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Fragment responsible for managing the recording process of trajectory data.
@@ -69,7 +72,7 @@ public class RecordingFragment extends Fragment {
     private MaterialButton completeButton, cancelButton, addMarkerButton;
     private ImageView recIcon;
     private ProgressBar timeRemaining;
-    private TextView elevation, distanceTravelled, gnssError, floorStatus, elevatorStatus;
+    private TextView elevation, distanceTravelled, gnssError, floorStatus, elevatorStatus, systemStatus, lastUpdateTime, trackingContextHint;
 
     // Marker data  elements
     private final List<MarkerPoint> markerPoints = new ArrayList<>();
@@ -102,6 +105,7 @@ public class RecordingFragment extends Fragment {
     private float distance = 0f;
     private double previousLocalX = 0.0;
     private double previousLocalY = 0.0;
+    private final SimpleDateFormat updateTimeFormat = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
 
     // References to the child map fragment
     private TrajectoryMapFragment trajectoryMapFragment;
@@ -166,6 +170,9 @@ public class RecordingFragment extends Fragment {
         gnssError = view.findViewById(R.id.gnssError);
         floorStatus = view.findViewById(R.id.currentFloorStatus);
         elevatorStatus = view.findViewById(R.id.elevatorStatus);
+        systemStatus = view.findViewById(R.id.systemStatus);
+        lastUpdateTime = view.findViewById(R.id.lastUpdateTime);
+        trackingContextHint = view.findViewById(R.id.trackingContextHint);
 
         // Marker button and data
         markerPoints.clear();
@@ -193,9 +200,13 @@ public class RecordingFragment extends Fragment {
         // Hide or initialize default values
         gnssError.setVisibility(View.GONE);
         elevation.setText(getString(R.string.elevation, "0"));
-        distanceTravelled.setText(getString(R.string.meter, "0"));
-        floorStatus.setText(getString(R.string.floor_status_value, 0));
-        elevatorStatus.setText(getString(R.string.elevator_status_value, getString(R.string.elevator_inactive)));
+        distanceTravelled.setText(getString(R.string.travelled_distance_value, "0"));
+        distanceTravelled.setVisibility(View.GONE);
+        floorStatus.setText(getString(R.string.floor_status_unknown));
+        elevatorStatus.setText(getString(R.string.elevator_status_unknown));
+        systemStatus.setText(getString(R.string.system_status_default));
+        lastUpdateTime.setText(getString(R.string.last_update_default));
+        trackingContextHint.setVisibility(View.GONE);
 
         // Buttons
         completeButton.setOnClickListener(v -> {
@@ -316,6 +327,17 @@ public class RecordingFragment extends Fragment {
     private void updateUIandPosition() {
         FusedPose fusedPose = sensorFusion.getLatestFusedPose();
         if (fusedPose == null) {
+            floorStatus.setText(getString(R.string.floor_status_unknown));
+            elevatorStatus.setText(getString(R.string.elevator_status_unknown));
+            systemStatus.setText(getString(
+                    R.string.system_status_value,
+                    getString(sensorFusion.isWaitingForAbsoluteFix()
+                            ? R.string.system_status_waiting_fix
+                            : R.string.system_status_no_pose)
+            ));
+            lastUpdateTime.setText(getString(R.string.last_update_value, getString(R.string.last_update_unknown)));
+            trackingContextHint.setVisibility(View.GONE);
+            distanceTravelled.setVisibility(View.GONE);
             if (sensorFusion.isWaitingForAbsoluteFix()) {
                 gnssError.setVisibility(View.VISIBLE);
                 gnssError.setText(getString(R.string.waiting_for_absolute_fix));
@@ -331,16 +353,23 @@ public class RecordingFragment extends Fragment {
                 Math.pow(fusedPose.getX() - previousLocalX, 2)
                         + Math.pow(fusedPose.getY() - previousLocalY, 2)
         );
-        distanceTravelled.setText(getString(R.string.meter, String.format("%.2f", distance)));
+        distanceTravelled.setText(getString(R.string.travelled_distance_value, String.format("%.2f", distance)));
+        distanceTravelled.setVisibility(shouldShowTrackedPath() ? View.VISIBLE : View.GONE);
 
         // Elevation
         float elevationVal = sensorFusion.getElevation();
         elevation.setText(getString(R.string.elevation, String.format("%.1f", elevationVal)));
-        floorStatus.setText(getString(R.string.floor_status_value, fusedPose.getFloor()));
-        elevatorStatus.setText(getString(
-                R.string.elevator_status_value,
-                getString(sensorFusion.getElevator() ? R.string.elevator_active : R.string.elevator_inactive)
+        floorStatus.setText(resolveFloorStatusText(fusedPose.getFloor()));
+        elevatorStatus.setText(resolveElevatorStatusText());
+        systemStatus.setText(getString(
+                R.string.system_status_value,
+                resolveSystemStatusLabel()
         ));
+        lastUpdateTime.setText(getString(
+                R.string.last_update_value,
+                updateTimeFormat.format(new Date(fusedPose.getTimestampMs()))
+        ));
+        updateTrackingContextHint();
 
         LatLng newLocation = sensorFusion.getLatLngForFusedPose(fusedPose);
         if (newLocation != null) {
@@ -354,44 +383,98 @@ public class RecordingFragment extends Fragment {
             }
 
             if (trajectoryMapFragment != null) {
-                trajectoryMapFragment.updateUserLocation(newLocation, (float) orientationDeg);
+                trajectoryMapFragment.updateUserLocation(
+                        newLocation,
+                        (float) orientationDeg,
+                        fusedPose.getTimestampMs()
+                );
                 if (trajectoryMapFragment.isAutoFloorEnabled()) {
                     trajectoryMapFragment.syncDisplayedFloor(fusedPose.getFloor());
                 }
             }
         }
 
-        // GNSS logic if you want to show GNSS error, etc.
-        float[] gnss = sensorFusion.getSensorValueMap().get(SensorTypes.GNSSLATLONG);
-        if (gnss != null && trajectoryMapFragment != null) {
-            // If user toggles showing GNSS in the map, call e.g.
-            if (trajectoryMapFragment.isGnssEnabled()) {
-                LatLng gnssLocation = new LatLng(gnss[0], gnss[1]);
-                LatLng currentLoc = trajectoryMapFragment.getCurrentLocation();
-                if (currentLoc != null) {
-                    double errorDist = UtilFunctions.distanceBetweenPoints(currentLoc, gnssLocation);
-                    gnssError.setVisibility(View.VISIBLE);
-                    gnssError.setText(String.format(getString(R.string.gnss_error) + "%.2fm", errorDist));
-                }
-                trajectoryMapFragment.updateGNSS(gnssLocation);
-            } else {
-                gnssError.setVisibility(View.GONE);
-                trajectoryMapFragment.clearGNSS();
+        LatLng gnssLocation = sensorFusion.getCurrentGnssLatLng();
+        if (gnssLocation != null) {
+            if (newLocation != null) {
+                double errorDist = UtilFunctions.distanceBetweenPoints(newLocation, gnssLocation);
+                gnssError.setVisibility(View.VISIBLE);
+                gnssError.setText(String.format(Locale.getDefault(), "%s %.2fm",
+                        getString(R.string.gnss_error), errorDist));
             }
+            if (trajectoryMapFragment != null) {
+                trajectoryMapFragment.updateGNSS(gnssLocation);
+            }
+        } else {
+            gnssError.setVisibility(View.GONE);
         }
 
         if (trajectoryMapFragment != null) {
             LatLng wifiLocation = sensorFusion.getLatLngWifiPositioning();
             if (wifiLocation != null) {
                 trajectoryMapFragment.updateWifiFix(wifiLocation, sensorFusion.getWifiFloor());
-            } else {
-                trajectoryMapFragment.clearWifiFix();
+            }
+
+            float[] pdrLocalPosition = sensorFusion.getSensorValueMap().get(SensorTypes.PDR);
+            LatLng pdrLocation = sensorFusion.getLatLngForLocalPosition(pdrLocalPosition);
+            if (pdrLocation != null) {
+                trajectoryMapFragment.updatePdrObservation(pdrLocation);
             }
         }
 
         // Update previous
         previousLocalX = fusedPose.getX();
         previousLocalY = fusedPose.getY();
+    }
+
+    private String resolveSystemStatusLabel() {
+        boolean hasGnss = sensorFusion.getCurrentGnssLatLng() != null;
+        boolean hasWifi = sensorFusion.getLatLngWifiPositioning() != null;
+        if (hasGnss && hasWifi) {
+            return getString(R.string.system_status_tracking_gnss_wifi);
+        }
+        if (hasGnss) {
+            return getString(R.string.system_status_tracking_gnss);
+        }
+        if (hasWifi) {
+            return getString(R.string.system_status_tracking_wifi);
+        }
+        return getString(R.string.system_status_tracking_pdr);
+    }
+
+    private boolean shouldShowTrackedPath() {
+        return trajectoryMapFragment != null && trajectoryMapFragment.isMappedVenueActive();
+    }
+
+    private String resolveFloorStatusText(int floor) {
+        if (trajectoryMapFragment != null && !trajectoryMapFragment.isMappedVenueActive()) {
+            return getString(R.string.floor_status_relative_value, floor);
+        }
+        return getString(R.string.floor_status_value, floor);
+    }
+
+    private String resolveElevatorStatusText() {
+        if (trajectoryMapFragment != null && !trajectoryMapFragment.isMappedVenueActive()) {
+            return getString(R.string.elevator_status_unknown);
+        }
+        return getString(
+                R.string.elevator_status_value,
+                getString(sensorFusion.getElevator() ? R.string.elevator_active : R.string.elevator_inactive)
+        );
+    }
+
+    private void updateTrackingContextHint() {
+        if (trackingContextHint == null) {
+            return;
+        }
+        boolean hasAbsoluteTracking = sensorFusion.getCurrentGnssLatLng() != null
+                || sensorFusion.getLatLngWifiPositioning() != null;
+        boolean outsideMappedVenue = trajectoryMapFragment != null && !trajectoryMapFragment.isMappedVenueActive();
+        boolean showHint = hasAbsoluteTracking && outsideMappedVenue;
+        trackingContextHint.setVisibility(showHint ? View.VISIBLE : View.GONE);
+        if (showHint) {
+            trackingContextHint.setText(getString(R.string.tracking_context_fallback));
+        }
     }
 
     /**

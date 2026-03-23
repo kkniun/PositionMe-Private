@@ -5,95 +5,199 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <!-- The actual map container -->
     <androidx.fragment.app.FragmentContainerView
         android:id="@+id/trajectoryMap"
         android:name="com.google.android.gms.maps.SupportMapFragment"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- Overlaid controls (extra compact, UI-only changes) -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/mapEmptyStateCard"
+        android:layout_width="240dp"
+        android:layout_height="wrap_content"
+        android:layout_margin="16dp"
+        android:visibility="gone"
+        app:cardBackgroundColor="#E6FFFFFF"
+        app:cardElevation="4dp"
+        app:layout_anchor="@id/trajectoryMap"
+        app:layout_anchorGravity="center"
+        app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.SmallComponent">
+
+        <TextView
+            android:id="@+id/mapEmptyStateText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:padding="16dp"
+            android:text="@string/map_waiting_state"
+            android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+            android:textColor="@color/md_theme_onSurface" />
+    </com.google.android.material.card.MaterialCardView>
+
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/mapControlsCard"
-        android:layout_width="150dp"
+        android:layout_width="184dp"
         android:layout_height="wrap_content"
-        android:layout_margin="4dp"
-        android:padding="4dp"
-        app:cardBackgroundColor="#CCFFFFFF"
-        app:cardElevation="2dp"
-        app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.SmallComponent"
+        android:layout_margin="8dp"
+        app:cardBackgroundColor="#E6FFFFFF"
+        app:cardElevation="4dp"
         app:layout_anchor="@id/trajectoryMap"
-        app:layout_anchorGravity="top|start">
+        app:layout_anchorGravity="top|start"
+        app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.SmallComponent">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:padding="2dp"
-            android:gravity="start">
+            android:padding="8dp">
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/fusedSwitch"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:minHeight="0dp"
+                android:text="@string/layer_fused"
+                android:textSize="12sp" />
 
             <com.google.android.material.switchmaterial.SwitchMaterial
                 android:id="@+id/gnssSwitch"
                 android:layout_width="match_parent"
-                android:layout_height="32dp"
-                android:padding="0dp"
+                android:layout_height="wrap_content"
+                android:checked="true"
                 android:minHeight="0dp"
-                android:text="@string/gnssSwitch"
-                android:textSize="10sp"
-                android:layout_marginBottom="2dp" />
+                android:text="@string/layer_gnss"
+                android:textSize="12sp" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/wifiSwitch"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:minHeight="0dp"
+                android:text="@string/layer_wifi"
+                android:textSize="12sp" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/pdrSwitch"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:minHeight="0dp"
+                android:text="@string/layer_pdr"
+                android:textSize="12sp" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/displaySmoothingSwitch"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:minHeight="0dp"
+                android:text="@string/display_smoothing"
+                android:textSize="12sp" />
 
             <com.google.android.material.switchmaterial.SwitchMaterial
                 android:id="@+id/autoFloor"
                 android:layout_width="match_parent"
-                android:layout_height="32dp"
-                android:padding="0dp"
+                android:layout_height="wrap_content"
                 android:minHeight="0dp"
                 android:text="@string/auto_floor"
-                android:textSize="10sp"
-                android:layout_marginBottom="4dp" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/lineColorButton"
-                style="@style/Widget.Material3.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="30dp"
-                android:text="@string/color"
-                android:textSize="10sp"
-                android:textAllCaps="false"
-                android:insetTop="0dp"
-                android:insetBottom="0dp"
-                android:minHeight="0dp"
-                android:padding="0dp"
-                android:layout_marginBottom="4dp" />
+                android:textSize="12sp" />
 
             <Spinner
                 android:id="@+id/mapSwitchSpinner"
                 android:layout_width="match_parent"
-                android:layout_height="32dp"
-                android:spinnerMode="dropdown"
+                android:layout_height="36dp"
+                android:layout_marginTop="6dp"
                 android:background="@android:color/white"
                 android:dropDownVerticalOffset="2dp"
-                android:elevation="1dp" />
+                android:elevation="1dp"
+                android:spinnerMode="dropdown" />
 
             <TextView
                 android:id="@+id/selectedVenueText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:text="@string/venue_not_selected"
-                android:textColor="@color/md_theme_onSurface"
-                android:autoSizeTextType="uniform"
-                android:autoSizeMinTextSize="8sp"
-                android:autoSizeMaxTextSize="10sp"
+                android:layout_marginTop="8dp"
+                android:autoSizeMaxTextSize="11sp"
+                android:autoSizeMinTextSize="9sp"
                 android:autoSizeStepGranularity="1sp"
+                android:autoSizeTextType="uniform"
+                android:ellipsize="end"
                 android:maxLines="2"
-                android:ellipsize="end" />
-
-
+                android:text="@string/venue_not_selected"
+                android:textColor="@color/md_theme_onSurface" />
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 
-    <!-- Floating action buttons for floor control -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/mapLegendCard"
+        android:layout_width="190dp"
+        android:layout_height="wrap_content"
+        android:layout_margin="8dp"
+        app:cardBackgroundColor="#E6FFFFFF"
+        app:cardElevation="4dp"
+        app:layout_anchor="@id/trajectoryMap"
+        app:layout_anchorGravity="bottom|start"
+        app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.SmallComponent">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="10dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/legend_title"
+                android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                android:textColor="@color/md_theme_onSurface"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/legend_fused"
+                android:textColor="#D32F2F"
+                android:textSize="12sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/legend_gnss"
+                android:textColor="#1976D2"
+                android:textSize="12sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/legend_wifi"
+                android:textColor="#F57C00"
+                android:textSize="12sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/legend_pdr"
+                android:textColor="#00897B"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:id="@+id/recenterButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_margin="16dp"
+        android:contentDescription="@string/recenter_map"
+        android:src="@drawable/ic_baseline_navigation_24"
+        app:backgroundTint="@color/md_theme_secondary"
+        app:layout_anchor="@id/trajectoryMap"
+        app:layout_anchorGravity="top|end"
+        app:tint="@color/md_theme_onSecondary" />
+
     <androidx.constraintlayout.widget.ConstraintLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent">
@@ -103,24 +207,24 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_margin="16dp"
+            android:contentDescription="@string/floor_down"
             android:src="@android:drawable/arrow_down_float"
             app:backgroundTint="@color/md_theme_primary"
-            app:tint="@color/md_theme_onPrimary"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
-            android:contentDescription="@string/floor_down" />
+            app:tint="@color/md_theme_onPrimary" />
 
         <com.google.android.material.floatingactionbutton.FloatingActionButton
             android:id="@+id/floorUpButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_margin="16dp"
+            android:contentDescription="@string/floor_up"
             android:src="@android:drawable/arrow_up_float"
             app:backgroundTint="@color/md_theme_primary"
-            app:tint="@color/md_theme_onPrimary"
             app:layout_constraintBottom_toTopOf="@id/floorDownButton"
             app:layout_constraintEnd_toEndOf="parent"
-            android:contentDescription="@string/floor_up" />
+            app:tint="@color/md_theme_onPrimary" />
     </androidx.constraintlayout.widget.ConstraintLayout>
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>

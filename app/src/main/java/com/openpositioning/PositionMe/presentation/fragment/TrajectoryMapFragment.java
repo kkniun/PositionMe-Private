@@ -6,7 +6,6 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
-import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.TypedValue;
@@ -15,7 +14,6 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
-import android.widget.Button;
 import android.widget.Spinner;
 import android.widget.TextView;
 
@@ -43,63 +41,95 @@ import com.google.android.gms.maps.model.Polygon;
 import com.google.android.gms.maps.model.PolygonOptions;
 import com.google.android.gms.maps.model.Polyline;
 import com.google.android.gms.maps.model.PolylineOptions;
+import com.google.android.material.floatingactionbutton.FloatingActionButton;
+import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.android.material.floatingactionbutton.FloatingActionButton;
-import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
+import com.openpositioning.PositionMe.utils.BuildingPolygon;
 import com.openpositioning.PositionMe.utils.IndoorMapManager;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
 import com.openpositioning.PositionMe.viewmodels.MapViewModel;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 public class TrajectoryMapFragment extends Fragment {
+
+    private static final int MAX_RAW_OBSERVATIONS = 12;
+    private static final long FUSED_PATH_UPDATE_INTERVAL_MS = 1000L;
+    private static final double FUSED_PATH_MOVEMENT_THRESHOLD_M = 0.75;
+    // Suppress visually duplicate trajectory vertices when the displayed position is effectively stationary.
+    private static final double TRAJECTORY_DUPLICATE_SUPPRESS_THRESHOLD_M = 0.15;
+    private static final double RAW_POINT_DUPLICATE_THRESHOLD_M = 0.25;
+    private static final double DISPLAY_SMOOTHING_ALPHA = 0.35;
+    private static final float DISABLED_ACTION_ALPHA = 0.4f;
+    private static final float ENABLED_ACTION_ALPHA = 1f;
+    private static final float DEFAULT_WAITING_CAMERA_ZOOM = 17.2f;
+    private static final int FUSED_COLOR = Color.parseColor("#D32F2F");
+    private static final int GNSS_COLOR = Color.parseColor("#1976D2");
+    private static final int WIFI_COLOR = Color.parseColor("#F57C00");
+    private static final int PDR_COLOR = Color.parseColor("#00897B");
+
     private GoogleMap gMap;
     private LatLng currentLocation;
-    private Marker orientationMarker;
-    private Marker gnssMarker;
-    private Marker wifiMarker;
-    private Polyline polyline;
-    private Polyline gnssPolyline;
-    private Polyline wifiPolyline;
-    private LatLng lastGnssLocation;
-    private LatLng lastWifiLocation;
+    private LatLng currentRawLocation;
+    private LatLng smoothedFusedLocation;
+    private Marker fusedMarker;
+    private Polyline fusedTrajectoryPolyline;
     private LatLng pendingCameraPosition;
     private boolean hasPendingCameraMove;
-    private boolean isRed = true;
-    private boolean isGnssOn;
+    private boolean hasAutoCenteredOnFirstFix;
+    private boolean isFusedOn = true;
+    private boolean isGnssOn = true;
+    private boolean isWifiOn = true;
+    private boolean isPdrOn = true;
+    private boolean displaySmoothingEnabled = true;
     private boolean venueSelectionEnabled;
 
-    private SensorFusion sensorFusion;
-    private long headingDbgMapLastLogMs = 0;
-    private IndoorMapManager indoorMapManager;
-
-    private Spinner switchMapSpinner;
-    private SwitchMaterial gnssSwitch;
-    private SwitchMaterial autoFloorSwitch;
-    private FloatingActionButton floorUpButton;
-    private FloatingActionButton floorDownButton;
-    private Button switchColorButton;
-    private TextView selectedVenueText;
-    private Polygon buildingPolygon;
-
-    private MapViewModel mapViewModel;
-    private List<Polygon> venuePolygons = new ArrayList<>();
-    private GroundOverlay floorplanOverlay;
-    private OnMapReadyCallback mapReadyCallback;
-
-    // Marker
+    private final List<LatLng> fusedTrajectoryRawPoints = new ArrayList<>();
+    private final ArrayDeque<Marker> gnssObservationMarkers = new ArrayDeque<>();
+    private final ArrayDeque<Marker> wifiObservationMarkers = new ArrayDeque<>();
+    private final ArrayDeque<Marker> pdrObservationMarkers = new ArrayDeque<>();
     private final List<Marker> testPointMarkers = new ArrayList<>();
     private final Map<Integer, BitmapDescriptor> testPointIconCache = new HashMap<>();
 
+    private LatLng lastFusedTrajectoryRawLocation;
+    private LatLng lastGnssObservation;
+    private LatLng lastWifiObservation;
+    private LatLng lastPdrObservation;
+    private long lastFusedTrajectoryUpdateTimestampMs = -1L;
 
+    private BitmapDescriptor fusedMarkerIcon;
+    private BitmapDescriptor gnssObservationIcon;
+    private BitmapDescriptor wifiObservationIcon;
+    private BitmapDescriptor pdrObservationIcon;
+
+    private SensorFusion sensorFusion;
+    private IndoorMapManager indoorMapManager;
+    private Spinner switchMapSpinner;
+    private SwitchMaterial fusedSwitch;
+    private SwitchMaterial gnssSwitch;
+    private SwitchMaterial wifiSwitch;
+    private SwitchMaterial pdrSwitch;
+    private SwitchMaterial displaySmoothingSwitch;
+    private SwitchMaterial autoFloorSwitch;
+    private FloatingActionButton floorUpButton;
+    private FloatingActionButton floorDownButton;
+    private FloatingActionButton recenterButton;
+    private View mapEmptyStateCard;
+    private TextView selectedVenueText;
+    private TextView mapEmptyStateText;
+    private MapViewModel mapViewModel;
+    private final List<Polygon> venuePolygons = new ArrayList<>();
+    private GroundOverlay floorplanOverlay;
+    private OnMapReadyCallback mapReadyCallback;
 
     public TrajectoryMapFragment() {
     }
@@ -119,7 +149,6 @@ public class TrajectoryMapFragment extends Fragment {
         venueSelectionEnabled = requireActivity() instanceof RecordingActivity;
 
         mapViewModel = new ViewModelProvider(requireParentFragment()).get(MapViewModel.class);
-
         mapViewModel.getFloorplanResponse().observe(getViewLifecycleOwner(), response -> {
             if (response != null && gMap != null) {
                 drawVenueOutlines(response);
@@ -129,12 +158,24 @@ public class TrajectoryMapFragment extends Fragment {
         });
 
         switchMapSpinner = view.findViewById(R.id.mapSwitchSpinner);
+        fusedSwitch = view.findViewById(R.id.fusedSwitch);
         gnssSwitch = view.findViewById(R.id.gnssSwitch);
+        wifiSwitch = view.findViewById(R.id.wifiSwitch);
+        pdrSwitch = view.findViewById(R.id.pdrSwitch);
+        displaySmoothingSwitch = view.findViewById(R.id.displaySmoothingSwitch);
         autoFloorSwitch = view.findViewById(R.id.autoFloor);
         floorUpButton = view.findViewById(R.id.floorUpButton);
         floorDownButton = view.findViewById(R.id.floorDownButton);
-        switchColorButton = view.findViewById(R.id.lineColorButton);
+        recenterButton = view.findViewById(R.id.recenterButton);
+        mapEmptyStateCard = view.findViewById(R.id.mapEmptyStateCard);
         selectedVenueText = view.findViewById(R.id.selectedVenueText);
+        mapEmptyStateText = view.findViewById(R.id.mapEmptyStateText);
+
+        isFusedOn = fusedSwitch.isChecked();
+        isGnssOn = gnssSwitch.isChecked();
+        isWifiOn = wifiSwitch.isChecked();
+        isPdrOn = pdrSwitch.isChecked();
+        displaySmoothingEnabled = displaySmoothingSwitch.isChecked();
 
         setFloorControlsVisibility(View.GONE);
         if (!venueSelectionEnabled && selectedVenueText != null) {
@@ -144,55 +185,63 @@ public class TrajectoryMapFragment extends Fragment {
         SupportMapFragment mapFragment =
                 (SupportMapFragment) getChildFragmentManager().findFragmentById(R.id.trajectoryMap);
         if (mapFragment != null) {
-            mapFragment.getMapAsync(new OnMapReadyCallback() {
-                @Override
-                public void onMapReady(@NonNull GoogleMap googleMap) {
-                    gMap = googleMap;
-                    initMapSettings(gMap);
-                    if (hasPendingCameraMove && pendingCameraPosition != null) {
-                        gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(pendingCameraPosition, 19f));
-                        hasPendingCameraMove = false;
-                        pendingCameraPosition = null;
-                    }
-                    if (venueSelectionEnabled) {
-                        gMap.setOnPolygonClickListener(polygon -> {
-                            if (indoorMapManager != null && indoorMapManager.onVenuePolygonClicked(polygon)) {
-                                updateVenueLabel();
-                                setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
-                            }
-                        });
-                    }
-
-                    Log.d("TrajectoryMapFragment", "onMapReady: Map is ready!");
-
-                    if (mapReadyCallback != null) {
-                        mapReadyCallback.onMapReady(gMap);
-                    }
+            mapFragment.getMapAsync(googleMap -> {
+                gMap = googleMap;
+                initMapSettings(gMap);
+                if (hasPendingCameraMove && pendingCameraPosition != null) {
+                    gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(pendingCameraPosition, 19f));
+                    hasPendingCameraMove = false;
+                    pendingCameraPosition = null;
+                } else {
+                    moveCameraToDefaultWaitingAreaIfNeeded();
                 }
+                if (venueSelectionEnabled) {
+                    gMap.setOnPolygonClickListener(polygon -> {
+                        if (indoorMapManager != null && indoorMapManager.onVenuePolygonClicked(polygon)) {
+                            updateVenueLabel();
+                            setFloorControlsVisibility(
+                                    indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE
+                            );
+                        }
+                    });
+                }
+                if (mapReadyCallback != null) {
+                    mapReadyCallback.onMapReady(gMap);
+                }
+                updateWaitingStateUi();
             });
         }
 
         initMapTypeSpinner();
 
+        fusedSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            isFusedOn = isChecked;
+            updateLayerVisibility();
+        });
         gnssSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
             isGnssOn = isChecked;
-            if (!isChecked) {
-                clearGNSS();
-            }
+            updateLayerVisibility();
         });
-
-        switchColorButton.setOnClickListener(v -> {
-            if (polyline == null) {
-                return;
+        wifiSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            isWifiOn = isChecked;
+            updateLayerVisibility();
+        });
+        pdrSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            isPdrOn = isChecked;
+            updateLayerVisibility();
+        });
+        displaySmoothingSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            displaySmoothingEnabled = isChecked;
+            smoothedFusedLocation = currentRawLocation;
+            refreshFusedTrajectoryPolyline();
+            if (currentRawLocation != null) {
+                LatLng displayedLocation = resolveDisplayLocation(currentRawLocation);
+                currentLocation = displayedLocation;
+                updateFusedMarker(
+                        displayedLocation,
+                        fusedMarker != null ? fusedMarker.getRotation() : 0f
+                );
             }
-            if (isRed) {
-                switchColorButton.setBackgroundColor(Color.BLACK);
-                polyline.setColor(Color.BLACK);
-            } else {
-                switchColorButton.setBackgroundColor(Color.RED);
-                polyline.setColor(Color.RED);
-            }
-            isRed = !isRed;
         });
 
         autoFloorSwitch.setOnCheckedChangeListener((compoundButton, isChecked) -> {
@@ -223,6 +272,9 @@ public class TrajectoryMapFragment extends Fragment {
                 updateVenueLabel();
             }
         });
+
+        recenterButton.setOnClickListener(v -> recenterOnCurrentLocation());
+        updateWaitingStateUi();
     }
 
     private void initMapSettings(@NonNull GoogleMap map) {
@@ -246,12 +298,12 @@ public class TrajectoryMapFragment extends Fragment {
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
         });
 
-        polyline = map.addPolyline(new PolylineOptions().color(Color.RED).width(5f).add());
-        gnssPolyline = map.addPolyline(new PolylineOptions().color(Color.BLUE).width(5f).add());
-        wifiPolyline = map.addPolyline(
-                new PolylineOptions().color(Color.rgb(255, 165, 0)).width(4f).add()
-        );
+        fusedTrajectoryPolyline = map.addPolyline(new PolylineOptions()
+                .color(FUSED_COLOR)
+                .width(7f)
+                .zIndex(2f));
         updateVenueLabel();
+        updateLayerVisibility();
     }
 
     private void initMapTypeSpinner() {
@@ -291,48 +343,402 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     public void updateUserLocation(@NonNull LatLng newLocation, float orientation) {
+        updateUserLocation(newLocation, orientation, System.currentTimeMillis());
+    }
+
+    public void updateUserLocation(@NonNull LatLng newLocation, float orientation, long timestampMs) {
         if (gMap == null) {
             return;
         }
 
-        LatLng oldLocation = currentLocation;
-        currentLocation = newLocation;
+        currentRawLocation = newLocation;
+        LatLng displayedLocation = resolveDisplayLocation(newLocation);
+        currentLocation = displayedLocation;
 
-        if (orientationMarker == null) {
-            orientationMarker = gMap.addMarker(new MarkerOptions()
-                    .position(newLocation)
-                    .flat(true)
-                    .title("Current Position")
-                    .icon(BitmapDescriptorFactory.fromBitmap(
-                            UtilFunctions.getBitmapFromVector(requireContext(), R.drawable.ic_baseline_navigation_24)))
-            );
-            Log.d("HeadingDbg", "marker created hash=" + orientationMarker.hashCode());
-            gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(newLocation, 19f));
-        } else {
-            orientationMarker.setPosition(newLocation);
-            if (SensorFusion.DEBUG_HEADING) {
-                long now = SystemClock.elapsedRealtime();
-                if (now - headingDbgMapLastLogMs >= 1000) {
-                    Log.d("HeadingDbg", "map rotate=" + orientation);
-                    headingDbgMapLastLogMs = now;
-                }
-            }
-            Log.d("HeadingDbg", "will setRotation=" + orientation + " markerNull?" + (orientationMarker==null));
-            orientationMarker.setRotation(orientation);
-            gMap.moveCamera(CameraUpdateFactory.newLatLng(newLocation));
-        }
+        updateFusedMarker(displayedLocation, orientation);
+        maybeAppendFusedTrajectory(newLocation, timestampMs);
 
-        if (oldLocation != null && !oldLocation.equals(newLocation) && polyline != null) {
-            List<LatLng> points = new ArrayList<>(polyline.getPoints());
-            points.add(newLocation);
-            polyline.setPoints(points);
+        if (!hasAutoCenteredOnFirstFix) {
+            gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(displayedLocation, 19f));
+            hasAutoCenteredOnFirstFix = true;
         }
+        updateWaitingStateUi();
 
         if (indoorMapManager != null) {
-            indoorMapManager.setCurrentLocation(newLocation);
-            indoorMapManager.refreshNearbyVenues(newLocation, sensorFusion.getWifiList());
+            indoorMapManager.setCurrentLocation(displayedLocation);
+            indoorMapManager.refreshNearbyVenues(displayedLocation, sensorFusion.getWifiList());
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
             updateVenueLabel();
+        }
+    }
+
+    public void updateGNSS(@NonNull LatLng gnssLocation) {
+        addObservationMarker(
+                gnssObservationMarkers,
+                lastGnssObservation,
+                gnssLocation,
+                "GNSS Position",
+                null,
+                getGnssObservationIcon(),
+                isGnssOn,
+                1f
+        );
+        lastGnssObservation = gnssLocation;
+    }
+
+    public void updateWifiFix(@NonNull LatLng wifiLocation, int floor) {
+        addObservationMarker(
+                wifiObservationMarkers,
+                lastWifiObservation,
+                wifiLocation,
+                "WiFi Position",
+                "Floor " + floor,
+                getWifiObservationIcon(),
+                isWifiOn,
+                1.2f
+        );
+        lastWifiObservation = wifiLocation;
+    }
+
+    public void updatePdrObservation(@NonNull LatLng pdrLocation) {
+        addObservationMarker(
+                pdrObservationMarkers,
+                lastPdrObservation,
+                pdrLocation,
+                "PDR Position",
+                null,
+                getPdrObservationIcon(),
+                isPdrOn,
+                1.15f
+        );
+        lastPdrObservation = pdrLocation;
+    }
+
+    public void clearGNSS() {
+        clearObservationMarkers(gnssObservationMarkers);
+        lastGnssObservation = null;
+    }
+
+    public void clearWifiFix() {
+        clearObservationMarkers(wifiObservationMarkers);
+        lastWifiObservation = null;
+    }
+
+    public void clearPdrObservations() {
+        clearObservationMarkers(pdrObservationMarkers);
+        lastPdrObservation = null;
+    }
+
+    public boolean isGnssEnabled() {
+        return isGnssOn;
+    }
+
+    public boolean isAutoFloorEnabled() {
+        return autoFloorSwitch != null && autoFloorSwitch.isChecked();
+    }
+
+    public boolean isMappedVenueActive() {
+        return indoorMapManager != null
+                && indoorMapManager.getIsIndoorMapSet()
+                && !TextUtils.isEmpty(indoorMapManager.getSelectedVenueName());
+    }
+
+    public void syncDisplayedFloor(int floor) {
+        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
+            return;
+        }
+        indoorMapManager.setCurrentFloor(floor, true);
+        updateVenueLabel();
+    }
+
+    public void setInitialCameraPosition(@NonNull LatLng startLocation) {
+        if (gMap != null) {
+            gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(startLocation, 19f));
+            hasAutoCenteredOnFirstFix = true;
+        } else {
+            pendingCameraPosition = startLocation;
+            hasPendingCameraMove = true;
+        }
+    }
+
+    public LatLng getCurrentLocation() {
+        return currentLocation;
+    }
+
+    public void clearMapAndReset() {
+        fusedTrajectoryRawPoints.clear();
+        lastFusedTrajectoryRawLocation = null;
+        lastFusedTrajectoryUpdateTimestampMs = -1L;
+        currentLocation = null;
+        currentRawLocation = null;
+        smoothedFusedLocation = null;
+        hasAutoCenteredOnFirstFix = false;
+
+        clearGNSS();
+        clearWifiFix();
+        clearPdrObservations();
+
+        if (fusedMarker != null) {
+            fusedMarker.remove();
+            fusedMarker = null;
+        }
+        if (fusedTrajectoryPolyline != null) {
+            fusedTrajectoryPolyline.remove();
+            fusedTrajectoryPolyline = null;
+        }
+        if (gMap != null) {
+            fusedTrajectoryPolyline = gMap.addPolyline(new PolylineOptions()
+                    .color(FUSED_COLOR)
+                    .width(7f)
+                    .zIndex(2f));
+        }
+        updateLayerVisibility();
+        updateWaitingStateUi();
+    }
+
+    public void getMapAsync(OnMapReadyCallback callback) {
+        if (gMap != null) {
+            callback.onMapReady(gMap);
+        } else {
+            this.mapReadyCallback = callback;
+        }
+    }
+
+    public GoogleMap getMap() {
+        return gMap;
+    }
+
+    public void addTestPointMarker(@NonNull LatLng pos, int idx) {
+        if (gMap == null) {
+            return;
+        }
+        Marker marker = gMap.addMarker(new MarkerOptions()
+                .position(pos)
+                .title("TP " + idx)
+                .anchor(0.5f, 0.5f)
+                .icon(getNumberedTestPointIcon(idx)));
+        if (marker != null) {
+            testPointMarkers.add(marker);
+        }
+    }
+
+    public void clearTestPointMarkers() {
+        for (Marker marker : testPointMarkers) {
+            if (marker != null) {
+                marker.remove();
+            }
+        }
+        testPointMarkers.clear();
+    }
+
+    private void updateFusedMarker(@NonNull LatLng displayedLocation, float orientation) {
+        if (gMap == null) {
+            return;
+        }
+        if (fusedMarker == null) {
+            fusedMarker = gMap.addMarker(new MarkerOptions()
+                    .position(displayedLocation)
+                    .anchor(0.5f, 0.5f)
+                    .flat(true)
+                    .title("Fused Position")
+                    .zIndex(4f)
+                    .icon(getFusedMarkerIcon()));
+        } else {
+            fusedMarker.setPosition(displayedLocation);
+        }
+        if (fusedMarker != null) {
+            fusedMarker.setRotation(orientation);
+            fusedMarker.setVisible(isFusedOn);
+        }
+    }
+
+    private void maybeAppendFusedTrajectory(@NonNull LatLng rawLocation, long timestampMs) {
+        if (fusedTrajectoryRawPoints.isEmpty()) {
+            fusedTrajectoryRawPoints.add(rawLocation);
+            lastFusedTrajectoryRawLocation = rawLocation;
+            lastFusedTrajectoryUpdateTimestampMs = timestampMs;
+            refreshFusedTrajectoryPolyline();
+            return;
+        }
+
+        double distanceMeters = lastFusedTrajectoryRawLocation == null
+                ? 0.0
+                : UtilFunctions.distanceBetweenPoints(lastFusedTrajectoryRawLocation, rawLocation);
+        long elapsedMs = lastFusedTrajectoryUpdateTimestampMs <= 0L
+                ? Long.MAX_VALUE
+                : Math.max(0L, timestampMs - lastFusedTrajectoryUpdateTimestampMs);
+
+        if (distanceMeters < FUSED_PATH_MOVEMENT_THRESHOLD_M
+                && elapsedMs < FUSED_PATH_UPDATE_INTERVAL_MS) {
+            return;
+        }
+        if (distanceMeters < TRAJECTORY_DUPLICATE_SUPPRESS_THRESHOLD_M) {
+            return;
+        }
+
+        fusedTrajectoryRawPoints.add(rawLocation);
+        lastFusedTrajectoryRawLocation = rawLocation;
+        lastFusedTrajectoryUpdateTimestampMs = timestampMs;
+        refreshFusedTrajectoryPolyline();
+    }
+
+    private void refreshFusedTrajectoryPolyline() {
+        if (fusedTrajectoryPolyline == null) {
+            return;
+        }
+        List<LatLng> displayedPoints = new ArrayList<>(fusedTrajectoryRawPoints.size());
+        if (displaySmoothingEnabled) {
+            LatLng smoothedPoint = null;
+            for (LatLng rawPoint : fusedTrajectoryRawPoints) {
+                smoothedPoint = smoothedPoint == null
+                        ? rawPoint
+                        : interpolate(smoothedPoint, rawPoint, DISPLAY_SMOOTHING_ALPHA);
+                displayedPoints.add(smoothedPoint);
+            }
+        } else {
+            displayedPoints.addAll(fusedTrajectoryRawPoints);
+        }
+        fusedTrajectoryPolyline.setPoints(displayedPoints);
+        fusedTrajectoryPolyline.setVisible(isFusedOn);
+    }
+
+    @NonNull
+    private LatLng resolveDisplayLocation(@NonNull LatLng rawLocation) {
+        if (!displaySmoothingEnabled) {
+            smoothedFusedLocation = rawLocation;
+            return rawLocation;
+        }
+        if (smoothedFusedLocation == null) {
+            smoothedFusedLocation = rawLocation;
+            return rawLocation;
+        }
+        smoothedFusedLocation = interpolate(smoothedFusedLocation, rawLocation, DISPLAY_SMOOTHING_ALPHA);
+        return smoothedFusedLocation;
+    }
+
+    @NonNull
+    private LatLng interpolate(@NonNull LatLng from, @NonNull LatLng to, double alpha) {
+        double clampedAlpha = Math.max(0.0, Math.min(1.0, alpha));
+        return new LatLng(
+                from.latitude + ((to.latitude - from.latitude) * clampedAlpha),
+                from.longitude + ((to.longitude - from.longitude) * clampedAlpha)
+        );
+    }
+
+    private void addObservationMarker(
+            @NonNull ArrayDeque<Marker> markers,
+            @Nullable LatLng previousLocation,
+            @NonNull LatLng newLocation,
+            @NonNull String title,
+            @Nullable String snippet,
+            @NonNull BitmapDescriptor icon,
+            boolean visible,
+            float zIndex
+    ) {
+        if (gMap == null) {
+            return;
+        }
+        if (previousLocation != null
+                && UtilFunctions.distanceBetweenPoints(previousLocation, newLocation) < RAW_POINT_DUPLICATE_THRESHOLD_M) {
+            return;
+        }
+        Marker marker = gMap.addMarker(new MarkerOptions()
+                .position(newLocation)
+                .title(title)
+                .snippet(snippet)
+                .anchor(0.5f, 0.5f)
+                .zIndex(zIndex)
+                .icon(icon)
+                .visible(visible));
+        if (marker == null) {
+            return;
+        }
+        markers.addLast(marker);
+        while (markers.size() > MAX_RAW_OBSERVATIONS) {
+            Marker oldest = markers.removeFirst();
+            oldest.remove();
+        }
+    }
+
+    private void clearObservationMarkers(@NonNull ArrayDeque<Marker> markers) {
+        while (!markers.isEmpty()) {
+            Marker marker = markers.removeFirst();
+            marker.remove();
+        }
+    }
+
+    private void recenterOnCurrentLocation() {
+        if (gMap == null || currentLocation == null) {
+            return;
+        }
+        gMap.animateCamera(CameraUpdateFactory.newLatLngZoom(currentLocation, 19f));
+    }
+
+    private void updateWaitingStateUi() {
+        boolean hasDisplayPose = currentLocation != null;
+        if (mapEmptyStateCard != null) {
+            boolean showEmptyState = venueSelectionEnabled && !hasDisplayPose;
+            mapEmptyStateCard.setVisibility(showEmptyState ? View.VISIBLE : View.GONE);
+        }
+        if (mapEmptyStateText != null) {
+            mapEmptyStateText.setText(getString(R.string.map_waiting_state));
+        }
+        updateRecenterState(hasDisplayPose);
+    }
+
+    private void updateRecenterState(boolean enabled) {
+        if (recenterButton == null) {
+            return;
+        }
+        recenterButton.setEnabled(enabled);
+        recenterButton.setClickable(enabled);
+        recenterButton.setAlpha(enabled ? ENABLED_ACTION_ALPHA : DISABLED_ACTION_ALPHA);
+    }
+
+    private void moveCameraToDefaultWaitingAreaIfNeeded() {
+        if (gMap == null || !venueSelectionEnabled || currentLocation != null || hasAutoCenteredOnFirstFix) {
+            return;
+        }
+
+        LatLng anchor = sensorFusion.getCurrentGnssLatLng();
+        if (anchor == null) {
+            float[] startLocation = sensorFusion.getGNSSLatitude(true);
+            if (startLocation != null
+                    && startLocation.length >= 2
+                    && !(startLocation[0] == 0f && startLocation[1] == 0f)) {
+                anchor = new LatLng(startLocation[0], startLocation[1]);
+            }
+        }
+        if (anchor == null) {
+            anchor = getDefaultWaitingCameraCenter();
+        }
+        gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(anchor, DEFAULT_WAITING_CAMERA_ZOOM));
+    }
+
+    @NonNull
+    private LatLng getDefaultWaitingCameraCenter() {
+        double north = Math.max(BuildingPolygon.NUCLEUS_NE.latitude, BuildingPolygon.LIBRARY_NE.latitude);
+        double south = Math.min(BuildingPolygon.NUCLEUS_SW.latitude, BuildingPolygon.LIBRARY_SW.latitude);
+        double east = Math.max(BuildingPolygon.NUCLEUS_NE.longitude, BuildingPolygon.LIBRARY_NE.longitude);
+        double west = Math.min(BuildingPolygon.NUCLEUS_SW.longitude, BuildingPolygon.LIBRARY_SW.longitude);
+        return new LatLng((north + south) * 0.5, (east + west) * 0.5);
+    }
+
+    private void updateLayerVisibility() {
+        if (fusedMarker != null) {
+            fusedMarker.setVisible(isFusedOn);
+        }
+        if (fusedTrajectoryPolyline != null) {
+            fusedTrajectoryPolyline.setVisible(isFusedOn);
+        }
+        setObservationVisibility(gnssObservationMarkers, isGnssOn);
+        setObservationVisibility(wifiObservationMarkers, isWifiOn);
+        setObservationVisibility(pdrObservationMarkers, isPdrOn);
+    }
+
+    private void setObservationVisibility(@NonNull ArrayDeque<Marker> markers, boolean visible) {
+        for (Marker marker : markers) {
+            marker.setVisible(visible);
         }
     }
 
@@ -354,87 +760,6 @@ public class TrajectoryMapFragment extends Fragment {
         selectedVenueText.setText(getString(R.string.venue_selected_format, venueName, floorNumber, floorCount));
     }
 
-    public void setInitialCameraPosition(@NonNull LatLng startLocation) {
-        if (gMap != null) {
-            gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(startLocation, 19f));
-        } else {
-            pendingCameraPosition = startLocation;
-            hasPendingCameraMove = true;
-        }
-    }
-
-    public LatLng getCurrentLocation() {
-        return currentLocation;
-    }
-
-    public void updateGNSS(@NonNull LatLng gnssLocation) {
-        if (gMap == null || !isGnssOn) {
-            return;
-        }
-
-        if (gnssMarker == null) {
-            gnssMarker = gMap.addMarker(new MarkerOptions()
-                    .position(gnssLocation)
-                    .title("GNSS Position")
-                    .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE)));
-            lastGnssLocation = gnssLocation;
-            return;
-        }
-
-        gnssMarker.setPosition(gnssLocation);
-        if (lastGnssLocation != null && !lastGnssLocation.equals(gnssLocation) && gnssPolyline != null) {
-            List<LatLng> points = new ArrayList<>(gnssPolyline.getPoints());
-            points.add(gnssLocation);
-            gnssPolyline.setPoints(points);
-        }
-        lastGnssLocation = gnssLocation;
-    }
-
-    public void updateWifiFix(@NonNull LatLng wifiLocation, int floor) {
-        if (gMap == null) {
-            return;
-        }
-
-        if (wifiMarker == null) {
-            wifiMarker = gMap.addMarker(new MarkerOptions()
-                    .position(wifiLocation)
-                    .title("WiFi Position")
-                    .snippet("Floor " + floor)
-                    .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE)));
-            lastWifiLocation = wifiLocation;
-            return;
-        }
-
-        wifiMarker.setPosition(wifiLocation);
-        wifiMarker.setSnippet("Floor " + floor);
-        if (lastWifiLocation != null && !lastWifiLocation.equals(wifiLocation) && wifiPolyline != null) {
-            List<LatLng> points = new ArrayList<>(wifiPolyline.getPoints());
-            points.add(wifiLocation);
-            wifiPolyline.setPoints(points);
-        }
-        lastWifiLocation = wifiLocation;
-    }
-
-    public void clearGNSS() {
-        if (gnssMarker != null) {
-            gnssMarker.remove();
-            gnssMarker = null;
-        }
-        lastGnssLocation = null;
-    }
-
-    public void clearWifiFix() {
-        if (wifiMarker != null) {
-            wifiMarker.remove();
-            wifiMarker = null;
-        }
-        lastWifiLocation = null;
-    }
-
-    public boolean isGnssEnabled() {
-        return isGnssOn;
-    }
-
     private void setFloorControlsVisibility(int visibility) {
         int finalVisibility = venueSelectionEnabled ? visibility : View.GONE;
         floorUpButton.setVisibility(finalVisibility);
@@ -442,87 +767,80 @@ public class TrajectoryMapFragment extends Fragment {
         autoFloorSwitch.setVisibility(finalVisibility);
     }
 
-    public void clearMapAndReset() {
-        if (polyline != null) {
-            polyline.remove();
-            polyline = null;
+    private BitmapDescriptor getFusedMarkerIcon() {
+        if (fusedMarkerIcon != null) {
+            return fusedMarkerIcon;
         }
-        if (gnssPolyline != null) {
-            gnssPolyline.remove();
-            gnssPolyline = null;
-        }
-        if (wifiPolyline != null) {
-            wifiPolyline.remove();
-            wifiPolyline = null;
-        }
-        if (orientationMarker != null) {
-            orientationMarker.remove();
-            orientationMarker = null;
-        }
-        clearGNSS();
-        clearWifiFix();
-        currentLocation = null;
+        int sizePx = dpToPx(54);
+        int arrowSizePx = dpToPx(24);
+        Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
 
-        if (gMap != null) {
-            polyline = gMap.addPolyline(new PolylineOptions().color(Color.RED).width(5f).add());
-            gnssPolyline = gMap.addPolyline(new PolylineOptions().color(Color.BLUE).width(5f).add());
-            wifiPolyline = gMap.addPolyline(
-                    new PolylineOptions().color(Color.rgb(255, 165, 0)).width(4f).add()
-            );
-        }
+        Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        fillPaint.setColor(Color.WHITE);
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - dpToPx(2), fillPaint);
+
+        Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        strokePaint.setColor(FUSED_COLOR);
+        strokePaint.setStyle(Paint.Style.STROKE);
+        strokePaint.setStrokeWidth(dpToPx(3));
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - dpToPx(2), strokePaint);
+
+        Bitmap arrowBitmap = UtilFunctions.getBitmapFromVector(requireContext(), R.drawable.ic_baseline_navigation_24);
+        Bitmap scaledArrowBitmap = Bitmap.createScaledBitmap(arrowBitmap, arrowSizePx, arrowSizePx, true);
+        float left = (sizePx - arrowSizePx) / 2f;
+        float top = (sizePx - arrowSizePx) / 2f;
+        canvas.drawBitmap(scaledArrowBitmap, left, top, null);
+
+        fusedMarkerIcon = BitmapDescriptorFactory.fromBitmap(bitmap);
+        return fusedMarkerIcon;
     }
 
-    /**
-     * Registers a callback that is invoked when the map instance is available.
-     *
-     * @param callback The callback to be invoked when the map is ready.
-     */
-    public void getMapAsync(OnMapReadyCallback callback) {
-        if (gMap != null) {
-            callback.onMapReady(gMap);
-        } else {
-            this.mapReadyCallback = callback;
+    private BitmapDescriptor getGnssObservationIcon() {
+        if (gnssObservationIcon == null) {
+            gnssObservationIcon = createObservationIcon(GNSS_COLOR, 12, 1);
         }
+        return gnssObservationIcon;
     }
 
-    /**
-     * Returns the current map instance.
-     *
-     * @return The GoogleMap object, or null if it's not ready.
-     */
-    public GoogleMap getMap() {
-        return gMap;
-    }
-
-    public void addTestPointMarker(@NonNull LatLng pos, int idx) {
-        if (gMap == null) return;
-
-        Marker m = gMap.addMarker(new MarkerOptions()
-                .position(pos)
-                .title("TP " + idx)
-                .anchor(0.5f, 0.5f)
-                .icon(getNumberedTestPointIcon(idx)));
-
-        if (m != null) testPointMarkers.add(m);
-    }
-
-    public void clearTestPointMarkers() {
-        for (Marker m : testPointMarkers) {
-            if (m != null) m.remove();
+    private BitmapDescriptor getWifiObservationIcon() {
+        if (wifiObservationIcon == null) {
+            wifiObservationIcon = createObservationIcon(WIFI_COLOR, 15, 2);
         }
-        testPointMarkers.clear();
+        return wifiObservationIcon;
     }
 
-    public void syncDisplayedFloor(int floor) {
-        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
-            return;
+    private BitmapDescriptor getPdrObservationIcon() {
+        if (pdrObservationIcon == null) {
+            pdrObservationIcon = createObservationIcon(PDR_COLOR, 15, 2);
         }
-        indoorMapManager.setCurrentFloor(floor, true);
-        updateVenueLabel();
+        return pdrObservationIcon;
     }
 
-    public boolean isAutoFloorEnabled() {
-        return autoFloorSwitch != null && autoFloorSwitch.isChecked();
+    private BitmapDescriptor createObservationIcon(int color, int sizeDp, int strokeWidthDp) {
+        int sizePx = dpToPx(sizeDp);
+        Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+
+        Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        fillPaint.setColor(color);
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 1f, fillPaint);
+
+        Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        strokePaint.setColor(Color.WHITE);
+        strokePaint.setStyle(Paint.Style.STROKE);
+        strokePaint.setStrokeWidth(dpToPx(strokeWidthDp));
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 1f, strokePaint);
+
+        return BitmapDescriptorFactory.fromBitmap(bitmap);
+    }
+
+    private int dpToPx(int dp) {
+        return (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP,
+                dp,
+                getResources().getDisplayMetrics()
+        );
     }
 
     private BitmapDescriptor getNumberedTestPointIcon(int idx) {
@@ -531,12 +849,7 @@ public class TrajectoryMapFragment extends Fragment {
             return cached;
         }
 
-        int sizePx = (int) TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP,
-                36,
-                getResources().getDisplayMetrics()
-        );
-
+        int sizePx = dpToPx(36);
         Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
 
@@ -564,24 +877,23 @@ public class TrajectoryMapFragment extends Fragment {
         return icon;
     }
 
-
-    /**
-     * Draws venue outlines from the floorplan API response.
-     *
-     * @param apiResponse The JSON object received from the floorplan API.
-     */
     private void drawVenueOutlines(JsonObject apiResponse) {
-        for (Polygon p : venuePolygons) {
-            p.remove();
+        for (Polygon polygon : venuePolygons) {
+            polygon.remove();
         }
         venuePolygons.clear();
 
         JsonArray venues = apiResponse.getAsJsonArray("venues");
-        if (venues == null || gMap == null) return;
+        if (venues == null || gMap == null) {
+            return;
+        }
 
         for (JsonElement venueElement : venues) {
             JsonObject venue = venueElement.getAsJsonObject();
-            JsonArray outlineCoords = venue.getAsJsonObject("outline").getAsJsonArray("coordinates").get(0).getAsJsonArray();
+            JsonArray outlineCoords = venue.getAsJsonObject("outline")
+                    .getAsJsonArray("coordinates")
+                    .get(0)
+                    .getAsJsonArray();
 
             PolygonOptions polygonOptions = new PolygonOptions()
                     .strokeColor(Color.BLUE)
@@ -600,15 +912,9 @@ public class TrajectoryMapFragment extends Fragment {
         }
     }
 
-    /**
-     * Updates the selected venue and displays the first available floorplan.
-     *
-     * @param venueData The JSON data attached to the selected polygon.
-     */
     private void selectVenue(JsonObject venueData) {
         String venueId = venueData.get("id").getAsString();
         Log.d("TrajectoryMapFragment", "Venue selected: " + venueId);
-
         mapViewModel.setSelectedVenueId(venueId);
 
         JsonArray floorplans = venueData.getAsJsonArray("floorplans");
@@ -618,11 +924,6 @@ public class TrajectoryMapFragment extends Fragment {
         }
     }
 
-    /**
-     * Displays a floorplan image as a ground overlay.
-     *
-     * @param floorplan The floor definition containing the image URL and bounding box.
-     */
     private void displayFloorplan(JsonObject floorplan) {
         if (floorplanOverlay != null) {
             floorplanOverlay.remove();
@@ -642,10 +943,9 @@ public class TrajectoryMapFragment extends Fragment {
                     @Override
                     public void onResourceReady(@NonNull Bitmap resource, @Nullable Transition<? super Bitmap> transition) {
                         if (gMap != null) {
-                            GroundOverlayOptions options = new GroundOverlayOptions()
+                            floorplanOverlay = gMap.addGroundOverlay(new GroundOverlayOptions()
                                     .image(BitmapDescriptorFactory.fromBitmap(resource))
-                                    .positionFromBounds(bounds);
-                            floorplanOverlay = gMap.addGroundOverlay(options);
+                                    .positionFromBounds(bounds));
                         }
                     }
 
@@ -653,15 +953,8 @@ public class TrajectoryMapFragment extends Fragment {
                     public void onLoadCleared(@Nullable Drawable placeholder) {
                     }
                 });
-
-
     }
 
-    /**
-     * Dispatches polygon click events to the venue selection handler.
-     *
-     * @param polygon The polygon that was clicked.
-     */
     public void handlePolygonClick(Polygon polygon) {
         JsonObject venueData = (JsonObject) polygon.getTag();
         if (venueData != null) {

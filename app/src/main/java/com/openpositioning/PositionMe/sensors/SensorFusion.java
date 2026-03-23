@@ -1054,6 +1054,18 @@ public class SensorFusion implements SensorEventListener, Observer {
         return converter.toLatLng(fusedPose.getX(), fusedPose.getY());
     }
 
+    @Nullable
+    public LatLng getLatLngForLocalPosition(@Nullable float[] localPosition) {
+        if (localPosition == null || localPosition.length < 2) {
+            return null;
+        }
+        CoordinateConverter converter = getOrCreateCoordinateConverter(latitude, longitude);
+        if (converter == null) {
+            return null;
+        }
+        return converter.toLatLng(localPosition[0], localPosition[1]);
+    }
+
     public void recordLatestFusedPoseIfNeeded() {
         if (!saveRecording || trajectory == null || latestFusedPose == null) {
             return;

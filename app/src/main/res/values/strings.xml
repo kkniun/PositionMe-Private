@@ -79,6 +79,7 @@
 
     <!-- Units only -->
     <string name="meter">%1$s m</string>
+    <string name="travelled_distance_value">Tracked path: %1$s m</string>
     <string name="db">%1$s dB</string>
     <string name="ble_devices_count">Devices: %1$d</string>
     <string name="ble_strongest_rssi">Strongest: %1$d dBm</string>
@@ -129,7 +130,7 @@
     <string name="floor_up_button">Floor Up button</string>
     <string name="choose_map">Choose Map</string>
     <string name="auto_floor">❇️ Auto Floor </string>
-    <string name="gnss_error">GNSS error:</string>
+    <string name="gnss_error">GNSS/fused offset:</string>
     <string name="waiting_for_absolute_fix">Waiting for first absolute fix...</string>
     <string name="satellite">Satellite</string>
     <string name="normal">Normal</string>
@@ -151,14 +152,42 @@
     <string name="replay_frag_play">Play</string>
     <string name="replay_frag_end">End</string>
     <string name="replay_frag_exit">Exit</string>
-    <string name="venue_not_selected">Venue: not selected</string>
+    <string name="venue_not_selected">Venue: no mapped venue nearby</string>
     <string name="venue_selected_no_floor">Venue: %1$s</string>
     <string name="venue_selected_format">Venue: %1$s (floor %2$d/%3$d)</string>
     <string name="floor_status">Floor: 0</string>
     <string name="floor_status_value">Floor: %1$d</string>
+    <string name="floor_status_unknown">Floor: --</string>
+    <string name="floor_status_relative_value">Floor: relative %1$d</string>
+    <string name="system_status_default">Status: Waiting for first absolute fix</string>
+    <string name="system_status_value">Status: %1$s</string>
+    <string name="system_status_waiting_fix">Waiting for first absolute fix</string>
+    <string name="system_status_no_pose">No fused pose yet</string>
+    <string name="system_status_tracking_gnss_wifi">Tracking (GNSS + WiFi)</string>
+    <string name="system_status_tracking_gnss">Tracking (GNSS)</string>
+    <string name="system_status_tracking_wifi">Tracking (WiFi)</string>
+    <string name="system_status_tracking_pdr">Tracking (PDR propagation)</string>
+    <string name="tracking_context_fallback">Fallback tracking active outside mapped venue</string>
+    <string name="last_update_value">Last update: %1$s</string>
+    <string name="last_update_unknown">--</string>
+    <string name="last_update_default">Last update: --</string>
     <string name="elevator_status">Elevator: Off</string>
     <string name="elevator_status_value">Elevator: %1$s</string>
+    <string name="elevator_status_unknown">Elevator: --</string>
     <string name="elevator_active">On</string>
     <string name="elevator_inactive">Off</string>
+    <string name="map_waiting_state">Waiting for first absolute fix\nMove to a mapped venue to start indoor tracking</string>
+    <string name="layer_fused">Fused</string>
+    <string name="layer_gnss">GNSS</string>
+    <string name="layer_wifi">WiFi</string>
+    <string name="layer_pdr">PDR</string>
+    <string name="display_smoothing">Smooth display</string>
+    <string name="legend_title">Legend</string>
+    <string name="legend_fused">● Fused best position</string>
+    <string name="legend_gnss">● GNSS recent points</string>
+    <string name="legend_wifi">● WiFi recent points</string>
+    <string name="legend_pdr">● PDR recent points</string>
+    <string name="recenter">Recenter</string>
+    <string name="recenter_map">Recenter map on current fused position</string>
 
 </resources>
