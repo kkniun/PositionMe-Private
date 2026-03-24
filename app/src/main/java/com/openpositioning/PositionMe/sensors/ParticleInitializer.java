@@ -17,6 +17,17 @@ public class ParticleInitializer {
 
     public interface SpawnValidator {
         boolean isValid(double x, double y, int floor);
+
+        default boolean isValidMotion(
+                double previousX,
+                double previousY,
+                double predictedX,
+                double predictedY,
+                int previousFloor,
+                int predictedFloor
+        ) {
+            return isValid(predictedX, predictedY, predictedFloor);
+        }
     }
 
     public ParticleInitializer() {

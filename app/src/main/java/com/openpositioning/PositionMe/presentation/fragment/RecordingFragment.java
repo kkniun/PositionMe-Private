@@ -29,6 +29,7 @@ import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
 import androidx.preference.PreferenceManager;
 
+import com.openpositioning.PositionMe.BuildConfig;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
 import com.openpositioning.PositionMe.sensors.FusedPose;
@@ -67,6 +68,8 @@ import java.util.Locale;
  */
 
 public class RecordingFragment extends Fragment {
+    private static final String ARROW_DBG_TAG = "ARROW_DBG";
+    private static final long ARROW_DBG_INTERVAL_MS = 500L;
 
     // UI elements
     private MaterialButton completeButton, cancelButton, addMarkerButton;
@@ -100,6 +103,8 @@ public class RecordingFragment extends Fragment {
     private Handler refreshDataHandler;
     private CountDownTimer autoStop;
     private long headingDbgUiLastLogMs = 0;
+    // 地图箭头链路最小日志节流。
+    private long arrowDbgUiLastLogMs = 0;
 
     // Distance tracking
     private float distance = 0f;
@@ -373,7 +378,9 @@ public class RecordingFragment extends Fragment {
 
         LatLng newLocation = sensorFusion.getLatLngForFusedPose(fusedPose);
         if (newLocation != null) {
-            double orientationDeg = Math.toDegrees(sensorFusion.passOrientation());
+            float orientationDeg = (float) Math.toDegrees(sensorFusion.passDisplayOrientation());
+            orientationDeg = (orientationDeg % 360f + 360f) % 360f;
+            logArrowUiTrace(orientationDeg, !sensorFusion.isWaitingForAbsoluteFix());
             if (SensorFusion.DEBUG_HEADING) {
                 long now = SystemClock.elapsedRealtime();
                 if (now - headingDbgUiLastLogMs >= 1000) {
@@ -385,7 +392,7 @@ public class RecordingFragment extends Fragment {
             if (trajectoryMapFragment != null) {
                 trajectoryMapFragment.updateUserLocation(
                         newLocation,
-                        (float) orientationDeg,
+                        orientationDeg,
                         fusedPose.getTimestampMs()
                 );
                 if (trajectoryMapFragment.isAutoFloorEnabled()) {
@@ -425,6 +432,31 @@ public class RecordingFragment extends Fragment {
         // Update previous
         previousLocalX = fusedPose.getX();
         previousLocalY = fusedPose.getY();
+    }
+
+    // 记录传给地图前的最终角度，以及当前是否已经拿到 first absolute fix。
+    private void logArrowUiTrace(float orientationDeg, boolean hasFirstAbsoluteFix) {
+        if (!BuildConfig.DEBUG) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now - arrowDbgUiLastLogMs < ARROW_DBG_INTERVAL_MS) {
+            return;
+        }
+        Log.d(
+                ARROW_DBG_TAG,
+                "stage=RecordingFragment.beforeMap"
+                        + " orientationRad=" + String.format(Locale.US, "%.3f", Math.toRadians(orientationDeg))
+                        + " orientationDeg=" + String.format(Locale.US, "%.3f", orientationDeg)
+                        + " orientationDeg360=" + String.format(Locale.US, "%.3f", normalizeDegrees(orientationDeg))
+                        + " hasFirstAbsoluteFix=" + hasFirstAbsoluteFix
+        );
+        arrowDbgUiLastLogMs = now;
+    }
+
+    private double normalizeDegrees(double degrees) {
+        double normalized = degrees % 360.0;
+        return normalized < 0.0 ? normalized + 360.0 : normalized;
     }
 
     private String resolveSystemStatusLabel() {

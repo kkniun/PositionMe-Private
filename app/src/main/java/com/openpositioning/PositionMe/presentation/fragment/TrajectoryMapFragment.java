@@ -16,12 +16,14 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
 import androidx.lifecycle.ViewModelProvider;
 
+import com.openpositioning.PositionMe.BuildConfig;
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.request.target.CustomTarget;
 import com.bumptech.glide.request.transition.Transition;
@@ -29,6 +31,7 @@ import com.google.android.gms.maps.CameraUpdateFactory;
 import com.google.android.gms.maps.GoogleMap;
 import com.google.android.gms.maps.OnMapReadyCallback;
 import com.google.android.gms.maps.SupportMapFragment;
+import com.google.android.gms.maps.model.CameraPosition;
 import com.google.android.gms.maps.model.BitmapDescriptor;
 import com.google.android.gms.maps.model.BitmapDescriptorFactory;
 import com.google.android.gms.maps.model.GroundOverlay;
@@ -48,6 +51,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
+import com.openpositioning.PositionMe.sensors.FusedPose;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.utils.BuildingPolygon;
 import com.openpositioning.PositionMe.utils.IndoorMapManager;
@@ -58,9 +62,12 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 public class TrajectoryMapFragment extends Fragment {
+    private static final String ARROW_DBG_TAG = "ARROW_DBG";
+    private static final long ARROW_DBG_INTERVAL_MS = 500L;
 
     private static final int MAX_RAW_OBSERVATIONS = 12;
     private static final long FUSED_PATH_UPDATE_INTERVAL_MS = 1000L;
@@ -68,6 +75,9 @@ public class TrajectoryMapFragment extends Fragment {
     // Suppress visually duplicate trajectory vertices when the displayed position is effectively stationary.
     private static final double TRAJECTORY_DUPLICATE_SUPPRESS_THRESHOLD_M = 0.15;
     private static final double RAW_POINT_DUPLICATE_THRESHOLD_M = 0.25;
+    private static final float HEADING_SMOOTHING_FACTOR = 0.15f;
+    // 地图 marker 的视觉基准当前比期望“尖头朝上”右偏约 90 度，只在显示层做常量修正。
+    private static final float FUSED_MARKER_VISUAL_OFFSET_DEG = 0f;
     private static final double DISPLAY_SMOOTHING_ALPHA = 0.35;
     private static final float DISABLED_ACTION_ALPHA = 0.4f;
     private static final float ENABLED_ACTION_ALPHA = 1f;
@@ -81,6 +91,7 @@ public class TrajectoryMapFragment extends Fragment {
     private LatLng currentLocation;
     private LatLng currentRawLocation;
     private LatLng smoothedFusedLocation;
+    private float smoothedFusedMarkerRotationDeg = Float.NaN;
     private Marker fusedMarker;
     private Polyline fusedTrajectoryPolyline;
     private LatLng pendingCameraPosition;
@@ -105,6 +116,8 @@ public class TrajectoryMapFragment extends Fragment {
     private LatLng lastWifiObservation;
     private LatLng lastPdrObservation;
     private long lastFusedTrajectoryUpdateTimestampMs = -1L;
+    // 地图箭头显示日志节流。
+    private long arrowDbgMarkerLastLogMs = 0L;
 
     private BitmapDescriptor fusedMarkerIcon;
     private BitmapDescriptor gnssObservationIcon;
@@ -233,13 +246,20 @@ public class TrajectoryMapFragment extends Fragment {
         displaySmoothingSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
             displaySmoothingEnabled = isChecked;
             smoothedFusedLocation = currentRawLocation;
+            smoothedFusedMarkerRotationDeg = fusedMarker != null
+                    ? fusedMarker.getRotation()
+                    : Float.NaN;
             refreshFusedTrajectoryPolyline();
             if (currentRawLocation != null) {
                 LatLng displayedLocation = resolveDisplayLocation(currentRawLocation);
                 currentLocation = displayedLocation;
                 updateFusedMarker(
                         displayedLocation,
-                        fusedMarker != null ? fusedMarker.getRotation() : 0f
+                        fusedMarker != null
+                                ? (float) normalizeDegrees(
+                                        fusedMarker.getRotation() - FUSED_MARKER_VISUAL_OFFSET_DEG
+                                )
+                                : 0f
                 );
             }
         });
@@ -285,7 +305,7 @@ public class TrajectoryMapFragment extends Fragment {
         map.setMapType(GoogleMap.MAP_TYPE_HYBRID);
 
         indoorMapManager = new IndoorMapManager(requireContext(), map);
-        indoorMapManager.setAutoSelectFirstVenue(!venueSelectionEnabled);
+        indoorMapManager.setAutoSelectFirstVenue(true);
         indoorMapManager.setVenueSelectionListener((venueId, venueName) -> {
             if (venueSelectionEnabled) {
                 sensorFusion.setCollectionVenue(venueId);
@@ -294,8 +314,20 @@ public class TrajectoryMapFragment extends Fragment {
                     mapViewModel.setSelectedVenueId(venueId);
                 }
             }
+            if (venueId != null) {
+                sensorFusion.setVenueFloorHeightMeters(indoorMapManager.getFloorHeight());
+            } else {
+                sensorFusion.clearVenueFloorHeightOverride();
+            }
             updateVenueLabel();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
+            if (venueId != null && !indoorMapManager.hasVectorMapShapes()) {
+                Toast.makeText(
+                        requireContext(),
+                        "Warning: Map Physics Disabled (Image-Only Venue)",
+                        Toast.LENGTH_LONG
+                ).show();
+            }
         });
 
         fusedTrajectoryPolyline = map.addPolyline(new PolylineOptions()
@@ -354,6 +386,8 @@ public class TrajectoryMapFragment extends Fragment {
         currentRawLocation = newLocation;
         LatLng displayedLocation = resolveDisplayLocation(newLocation);
         currentLocation = displayedLocation;
+        sensorFusion.noteDisplayedFusedMarker(newLocation, displayedLocation, timestampMs);
+        logUiFusedTrace(newLocation, displayedLocation, timestampMs);
 
         updateFusedMarker(displayedLocation, orientation);
         maybeAppendFusedTrajectory(newLocation, timestampMs);
@@ -383,6 +417,7 @@ public class TrajectoryMapFragment extends Fragment {
                 isGnssOn,
                 1f
         );
+        logUiObservationTrace("GNSS", gnssLocation, null);
         lastGnssObservation = gnssLocation;
     }
 
@@ -397,6 +432,7 @@ public class TrajectoryMapFragment extends Fragment {
                 isWifiOn,
                 1.2f
         );
+        logUiObservationTrace("WIFI", wifiLocation, floor);
         lastWifiObservation = wifiLocation;
     }
 
@@ -411,6 +447,7 @@ public class TrajectoryMapFragment extends Fragment {
                 isPdrOn,
                 1.15f
         );
+        logUiObservationTrace("PDR", pdrLocation, null);
         lastPdrObservation = pdrLocation;
     }
 
@@ -439,8 +476,7 @@ public class TrajectoryMapFragment extends Fragment {
 
     public boolean isMappedVenueActive() {
         return indoorMapManager != null
-                && indoorMapManager.getIsIndoorMapSet()
-                && !TextUtils.isEmpty(indoorMapManager.getSelectedVenueName());
+                && indoorMapManager.hasActiveMapMatchingConstraints();
     }
 
     public void syncDisplayedFloor(int floor) {
@@ -472,6 +508,7 @@ public class TrajectoryMapFragment extends Fragment {
         currentLocation = null;
         currentRawLocation = null;
         smoothedFusedLocation = null;
+        smoothedFusedMarkerRotationDeg = Float.NaN;
         hasAutoCenteredOnFirstFix = false;
 
         clearGNSS();
@@ -535,6 +572,7 @@ public class TrajectoryMapFragment extends Fragment {
         if (gMap == null) {
             return;
         }
+        boolean markerCreated = false;
         if (fusedMarker == null) {
             fusedMarker = gMap.addMarker(new MarkerOptions()
                     .position(displayedLocation)
@@ -543,13 +581,84 @@ public class TrajectoryMapFragment extends Fragment {
                     .title("Fused Position")
                     .zIndex(4f)
                     .icon(getFusedMarkerIcon()));
+            markerCreated = true;
         } else {
             fusedMarker.setPosition(displayedLocation);
         }
         if (fusedMarker != null) {
-            fusedMarker.setRotation(orientation);
+            float targetRotation = (float) normalizeDegrees(orientation + FUSED_MARKER_VISUAL_OFFSET_DEG);
+            float markerRotation = resolveDisplayedMarkerRotation(targetRotation, markerCreated);
+            fusedMarker.setRotation(markerRotation);
             fusedMarker.setVisible(isFusedOn);
+            logArrowMarkerTrace(markerRotation, markerCreated);
+
+            float trueHeading = (float) normalizeDegrees(
+                    markerRotation - FUSED_MARKER_VISUAL_OFFSET_DEG
+            );
+            if (gMap != null) {
+                CameraPosition currentCameraPosition = gMap.getCameraPosition();
+                CameraPosition newCameraPosition = new CameraPosition.Builder(currentCameraPosition)
+                        .bearing(trueHeading)
+                        .build();
+                gMap.animateCamera(
+                        CameraUpdateFactory.newCameraPosition(newCameraPosition),
+                        200,
+                        null
+                );
+            }
         }
+    }
+
+    private float resolveDisplayedMarkerRotation(float targetRotation, boolean markerCreated) {
+        if (!displaySmoothingEnabled) {
+            smoothedFusedMarkerRotationDeg = targetRotation;
+            return targetRotation;
+        }
+        if (markerCreated || !Float.isFinite(smoothedFusedMarkerRotationDeg)) {
+            smoothedFusedMarkerRotationDeg = targetRotation;
+            return targetRotation;
+        }
+
+        float currentRotation = smoothedFusedMarkerRotationDeg;
+        float diff = (targetRotation - currentRotation + 180f + 360f) % 360f - 180f;
+        float smoothedRotation = currentRotation + diff * HEADING_SMOOTHING_FACTOR;
+        smoothedFusedMarkerRotationDeg = (float) normalizeDegrees(smoothedRotation);
+        return smoothedFusedMarkerRotationDeg;
+    }
+
+    // 记录最终 setRotation 的角度，以及地图当前 camera bearing。
+    private void logArrowMarkerTrace(float angleDeg, boolean markerCreated) {
+        if (!BuildConfig.DEBUG) {
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - arrowDbgMarkerLastLogMs < ARROW_DBG_INTERVAL_MS) {
+            return;
+        }
+        float cameraBearing = gMap == null || gMap.getCameraPosition() == null
+                ? Float.NaN
+                : gMap.getCameraPosition().bearing;
+        Log.d(
+                ARROW_DBG_TAG,
+                "stage=TrajectoryMapFragment.setRotation"
+                        + " setRotationRad=" + formatDebugDouble(Math.toRadians(angleDeg))
+                        + " setRotationDeg=" + formatDebugDouble(angleDeg)
+                        + " setRotationDeg360=" + formatDebugDouble(normalizeDegrees(angleDeg))
+                        + " markerCreated=" + markerCreated
+                        + " markerExists=" + (fusedMarker != null)
+                        + " cameraBearingRad=" + formatDebugDouble(Math.toRadians(cameraBearing))
+                        + " cameraBearingDeg=" + formatDebugDouble(cameraBearing)
+                        + " cameraBearingDeg360=" + formatDebugDouble(normalizeDegrees(cameraBearing))
+        );
+        arrowDbgMarkerLastLogMs = now;
+    }
+
+    private double normalizeDegrees(double degrees) {
+        if (!Double.isFinite(degrees)) {
+            return Double.NaN;
+        }
+        double normalized = degrees % 360.0;
+        return normalized < 0.0 ? normalized + 360.0 : normalized;
     }
 
     private void maybeAppendFusedTrajectory(@NonNull LatLng rawLocation, long timestampMs) {
@@ -756,7 +865,7 @@ public class TrajectoryMapFragment extends Fragment {
             selectedVenueText.setText(getString(R.string.venue_selected_no_floor, venueName));
             return;
         }
-        int floorNumber = indoorMapManager.getCurrentFloor() + 1;
+        int floorNumber = indoorMapManager.getCurrentFloor();
         selectedVenueText.setText(getString(R.string.venue_selected_format, venueName, floorNumber, floorCount));
     }
 
@@ -765,6 +874,99 @@ public class TrajectoryMapFragment extends Fragment {
         floorUpButton.setVisibility(finalVisibility);
         floorDownButton.setVisibility(finalVisibility);
         autoFloorSwitch.setVisibility(finalVisibility);
+    }
+
+    private void logUiFusedTrace(
+            @NonNull LatLng rawLocation,
+            @NonNull LatLng displayedLocation,
+            long timestampMs
+    ) {
+        if (!SensorFusion.DEBUG_FUSION_TRACE) {
+            return;
+        }
+        double[] rawLocal = sensorFusion.getLocalMetersForLatLng(rawLocation);
+        double[] displayedLocal = sensorFusion.getLocalMetersForLatLng(displayedLocation);
+        FusedPose fusedPose = sensorFusion.getLatestFusedPose();
+        Log.d(
+                "TrajectoryMapFragment",
+                "UI_DBG ts=" + timestampMs
+                        + " source=FUSED"
+                        + " rawLatLon=" + formatLatLng(rawLocation)
+                        + " rawEN=" + formatLocal(rawLocal)
+                        + " displayedLatLon=" + formatLatLng(displayedLocation)
+                        + " displayedEN=" + formatLocal(displayedLocal)
+                        + " fused=" + formatFusedPose(fusedPose)
+                        + " displayedFloor=" + getDisplayedFloorForDebug()
+                        + " smoothing=" + displaySmoothingEnabled
+                        + " displayAgeMs=" + Math.max(0L, System.currentTimeMillis() - timestampMs)
+        );
+    }
+
+    private void logUiObservationTrace(
+            @NonNull String source,
+            @NonNull LatLng location,
+            @Nullable Integer observationFloor
+    ) {
+        if (!SensorFusion.DEBUG_FUSION_TRACE) {
+            return;
+        }
+        double[] local = sensorFusion.getLocalMetersForLatLng(location);
+        FusedPose fusedPose = sensorFusion.getLatestFusedPose();
+        Log.d(
+                "TrajectoryMapFragment",
+                "UI_DBG ts=" + System.currentTimeMillis()
+                        + " source=" + source
+                        + " markerLatLon=" + formatLatLng(location)
+                        + " markerEN=" + formatLocal(local)
+                        + " markerFloor=" + (observationFloor == null ? "n/a" : observationFloor)
+                        + " displayedFloor=" + getDisplayedFloorForDebug()
+                        + " fused=" + formatFusedPose(fusedPose)
+                        + " smoothing=" + displaySmoothingEnabled
+        );
+    }
+
+    private int getDisplayedFloorForDebug() {
+        return indoorMapManager == null ? -1 : indoorMapManager.getCurrentFloor();
+    }
+
+    @NonNull
+    private String formatFusedPose(@Nullable FusedPose fusedPose) {
+        if (fusedPose == null) {
+            return "n/a";
+        }
+        return "{e=" + formatDebugDouble(fusedPose.getX())
+                + ",n=" + formatDebugDouble(fusedPose.getY())
+                + ",floor=" + fusedPose.getFloor()
+                + ",conf=" + formatDebugDouble(fusedPose.getConfidence())
+                + "}";
+    }
+
+    @NonNull
+    private String formatLatLng(@Nullable LatLng latLng) {
+        if (latLng == null) {
+            return "n/a";
+        }
+        return "{lat=" + formatDebugDouble(latLng.latitude)
+                + ",lon=" + formatDebugDouble(latLng.longitude)
+                + "}";
+    }
+
+    @NonNull
+    private String formatLocal(@Nullable double[] localMeters) {
+        if (localMeters == null || localMeters.length < 2) {
+            return "n/a";
+        }
+        return "{e=" + formatDebugDouble(localMeters[0])
+                + ",n=" + formatDebugDouble(localMeters[1])
+                + "}";
+    }
+
+    @NonNull
+    private String formatDebugDouble(double value) {
+        if (!Double.isFinite(value)) {
+            return "n/a";
+        }
+        return String.format(Locale.US, "%.3f", value);
     }
 
     private BitmapDescriptor getFusedMarkerIcon() {

@@ -59,7 +59,7 @@ public class PdrProcessing {
     private float startElevation;
     private int setupIndex = 0;
     private float elevation;
-    private int floorHeight;
+    private float floorHeight;
     private int currentFloor;
 
     // Buffer of most recent elevations calculated
@@ -230,6 +230,16 @@ public class PdrProcessing {
         }
         // Keep elevation at zero if there is no calculated value
         return 0;
+    }
+
+    public void setFloorHeightMeters(float floorHeightMeters) {
+        if (floorHeightMeters > 0f) {
+            this.floorHeight = floorHeightMeters;
+        }
+    }
+
+    public void clearFloorHeightOverride() {
+        this.floorHeight = settings.getInt("floor_height", 4);
     }
 
     /**

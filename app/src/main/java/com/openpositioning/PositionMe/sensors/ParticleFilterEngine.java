@@ -37,6 +37,10 @@ public class ParticleFilterEngine {
     private final List<Particle> particles = new ArrayList<>();
 
     private long lastTimestampMs;
+    // 临时调试状态：用于判断 PF 是否被楼层/墙体约束卡住，定位完成后可删除。
+    private int lastPredictWallRejectCount;
+    private int lastPredictFloorConstraintRejectCount;
+    private boolean lastAbsoluteFixReanchored;
 
     public ParticleFilterEngine() {
         this(new ParticleInitializer(), ParticleInitializer.allowAll(), null, new Random());
@@ -134,6 +138,8 @@ public class ParticleFilterEngine {
             return;
         }
 
+        lastPredictWallRejectCount = 0;
+        lastPredictFloorConstraintRejectCount = 0;
         double stepLengthMeters = delta.getStepLengthMeters();
         double deltaHeadingRad = delta.getDeltaHeadingRad();
         double heightDeltaMeters = delta.getHeightDeltaMeters();
@@ -167,11 +173,20 @@ public class ParticleFilterEngine {
                             previousFloor,
                             predictedFloor
                     )) {
+                lastPredictFloorConstraintRejectCount++;
                 predictedFloor = previousFloor;
             }
 
-            // Map matching / walls: reject illegal (x,y,floor).
-            if (!spawnValidator.isValid(predictedX, predictedY, predictedFloor)) {
+            // Map matching / walls: reject illegal segments, not only illegal endpoints.
+            if (!spawnValidator.isValidMotion(
+                    previousX,
+                    previousY,
+                    predictedX,
+                    predictedY,
+                    previousFloor,
+                    predictedFloor
+            )) {
+                lastPredictWallRejectCount++;
                 predictedX = previousX;
                 predictedY = previousY;
                 predictedFloor = previousFloor;
@@ -208,6 +223,7 @@ public class ParticleFilterEngine {
             long timestampMs,
             double accuracyMeters
     ) {
+        lastAbsoluteFixReanchored = false;
         if (particles.isEmpty()) {
             initialize(
                     fixX,
@@ -223,6 +239,7 @@ public class ParticleFilterEngine {
 
         double measurementStdMeters = sanitizeAccuracyMeters(accuracyMeters);
         if (shouldReanchorToAbsoluteFix(fixX, fixY, measurementStdMeters)) {
+            lastAbsoluteFixReanchored = true;
             reanchorToAbsoluteFix(fixX, fixY, floorPrior, timestampMs, measurementStdMeters);
             return;
         }
@@ -537,5 +554,17 @@ public class ParticleFilterEngine {
             snapshot.add(new Particle(particle));
         }
         return snapshot;
+    }
+
+    int getLastPredictWallRejectCount() {
+        return lastPredictWallRejectCount;
+    }
+
+    int getLastPredictFloorConstraintRejectCount() {
+        return lastPredictFloorConstraintRejectCount;
+    }
+
+    boolean wasLastAbsoluteFixReanchored() {
+        return lastAbsoluteFixReanchored;
     }
 }

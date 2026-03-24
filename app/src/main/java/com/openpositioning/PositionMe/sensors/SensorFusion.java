@@ -2,12 +2,13 @@ package com.openpositioning.PositionMe.sensors;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.app.ActivityManager;
+import android.content.Intent;
+import android.hardware.GeomagneticField;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
-import android.app.ActivityManager;
-import android.content.Intent;
 import android.location.Location;
 import android.location.LocationListener;
 import android.os.Build;
@@ -15,6 +16,8 @@ import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.Surface;
+import android.view.WindowManager;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
@@ -22,6 +25,7 @@ import androidx.annotation.Nullable;
 import androidx.preference.PreferenceManager;
 
 import com.google.android.gms.maps.model.LatLng;
+import com.openpositioning.PositionMe.BuildConfig;
 import com.openpositioning.PositionMe.presentation.activity.MainActivity;
 import com.openpositioning.PositionMe.utils.BuildingPolygon;
 import com.openpositioning.PositionMe.utils.CoordinateConverter;
@@ -73,6 +77,9 @@ import java.util.stream.Stream;
  * @author Virginia Cangelosi
  */
 public class SensorFusion implements SensorEventListener, Observer {
+    private static final String ARROW_DBG_TAG = "ARROW_DBG";
+    private static final long ARROW_DBG_INTERVAL_MS = 500L;
+    private static final long DECLINATION_REFRESH_INTERVAL_MS = 10 * 60 * 1000L;
     private static final String VENUE_KEY_NUCLEUS = "nucleus";
     private static final String VENUE_KEY_LIBRARY = "library";
     private static final String VENUE_KEY_MURCHISON = "murchison";
@@ -102,6 +109,8 @@ public class SensorFusion implements SensorEventListener, Observer {
     private static final String DEFAULT_COLLECTION_VENUE = "traj";
     private static final float DEFAULT_WIFI_ACCURACY_M = 8.0f;
     private static final double MIN_ABSOLUTE_FIX_START_STD_M = 1.0;
+    // 临时联调开关：定位 fused 内部状态与 UI 显示偏差后可删除。
+    public static final boolean DEBUG_FUSION_TRACE = BuildConfig.DEBUG;
     //endregion
 
     //region Instance variables
@@ -164,6 +173,8 @@ public class SensorFusion implements SensorEventListener, Observer {
     private float[] magneticField;
     private float[] angularVelocity;
     private float[] orientation;
+    // 仅用于地图箭头显示，避免影响 PDR/PF 仍在使用的原始 device azimuth。
+    private float[] displayOrientation;
     private float[] rotation;
     private float pressure;
     private float light;
@@ -171,6 +182,15 @@ public class SensorFusion implements SensorEventListener, Observer {
     private float[] R;
     // Throttling timestamp for heading debug logs (rotation vector)
     private long headingDbgRotvecLastLogMs = 0;
+    private boolean hasGeomagneticDeclination = false;
+    private float geomagneticDeclinationDeg = 0f;
+    private long geomagneticDeclinationTimestampMs = 0L;
+    private double geomagneticDeclinationLatitudeDeg = Double.NaN;
+    private double geomagneticDeclinationLongitudeDeg = Double.NaN;
+    private float geomagneticDeclinationAltitudeMeters = 0f;
+    // 地图箭头链路最小日志节流，避免 logcat 刷屏。
+    private long arrowDbgRawLastLogMs = 0;
+    private long arrowDbgDisplayLastLogMs = 0;
     private int stepCounter ;
     // Derived values
     private float elevation;
@@ -208,7 +228,17 @@ public class SensorFusion implements SensorEventListener, Observer {
     private boolean hasManualStartLocation;
     private float lastPredictHeadingRad;
     private float lastPredictElevation;
+    private long lastWaitingForAbsoluteFixLogMs;
     private long lastRecordedFusedPoseTimestampMs;
+    // Converts barometer/PDR relative floors into absolute map floor indices.
+    private int pdrFloorOffset = 0;
+    private boolean isFloorOffsetInitialized = false;
+    private long lastWifiScanWallClockMs = -1L;
+    @Nullable
+    private LatLng lastDisplayedFusedMarkerLatLng;
+    @Nullable
+    private LatLng lastDisplayedFusedMarkerRawLatLng;
+    private long lastDisplayedFusedMarkerTimestampMs = -1L;
 
     // Trajectory displaying class
     private PathView pathView;
@@ -262,6 +292,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.magneticField = new float[3];
         this.angularVelocity = new float[3];
         this.orientation = new float[3];
+        this.displayOrientation = new float[3];
         this.rotation = new float[4];
         this.rotation[3] = 1.0f;
         this.R = new float[9];
@@ -456,8 +487,19 @@ public class SensorFusion implements SensorEventListener, Observer {
             case Sensor.TYPE_ROTATION_VECTOR:
                 this.rotation = sensorEvent.values.clone();
                 float[] rotationVectorDCM = new float[9];
+                float[] horizontalWorldDCM = new float[9];
                 SensorManager.getRotationMatrixFromVector(rotationVectorDCM, this.rotation);
-                SensorManager.getOrientation(rotationVectorDCM, this.orientation);
+                if (!SensorManager.remapCoordinateSystem(
+                        rotationVectorDCM,
+                        SensorManager.AXIS_X,
+                        SensorManager.AXIS_Z,
+                        horizontalWorldDCM
+                )) {
+                    System.arraycopy(rotationVectorDCM, 0, horizontalWorldDCM, 0, rotationVectorDCM.length);
+                }
+                updateTrueNorthOrientation(horizontalWorldDCM);
+                updateDisplayOrientation(horizontalWorldDCM);
+                logArrowRawOrientationTrace();
 
                 Log.d("HeadingDbg", "onSensorChanged azimuth(rad)=" + orientation[0]);
 
@@ -501,13 +543,18 @@ public class SensorFusion implements SensorEventListener, Observer {
                             heightDeltaMeters
                     );
                     float[] newCords = this.pdrProcessing.applyStepDelta(pdrDelta, currentHeadingRad);
+                    long stepEventAgeMs = Math.max(
+                            0L,
+                            (SystemClock.elapsedRealtimeNanos() - sensorEvent.timestamp) / 1_000_000L
+                    );
 
                     // Clear the accelMagnitude after using it
                     this.accelMagnitude.clear();
                     handlePdrPredict(
                             pdrDelta,
-                            this.pdrProcessing.getCurrentFloor(),
-                            currentTime
+                            getAbsoluteCurrentFloor(),
+                            currentTime,
+                            stepEventAgeMs
                     );
                     this.lastPredictHeadingRad = currentHeadingRad;
                     this.lastPredictElevation = this.elevation;
@@ -520,7 +567,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                                 .setRelativeTimestamp(SystemClock.uptimeMillis() - bootTime)
                                 .setX(newCords[0])
                                 .setY(newCords[1])
-                                .setFloor(this.pdrProcessing.getCurrentFloor())
+                                .setFloor(getAbsoluteCurrentFloor())
                                 .setElevator(this.elevator)
                                 .setElevation(this.elevation));
                     }
@@ -555,6 +602,7 @@ public class SensorFusion implements SensorEventListener, Observer {
             latitude = (float) location.getLatitude();
             longitude = (float) location.getLongitude();
             float altitude = (float) location.getAltitude();
+            updateGeomagneticDeclination(latitude, longitude, altitude, location.getTime());
             float accuracy = (float) location.getAccuracy();
             float speed = (float) location.getSpeed();
             String provider = location.getProvider();
@@ -578,15 +626,19 @@ public class SensorFusion implements SensorEventListener, Observer {
                 }
 
                 trajectory.addGnssData(gnssBuilder);
+                long fixTimestampMs = System.currentTimeMillis();
+                long observationAgeMs = resolveGnssObservationAgeMs(location, fixTimestampMs);
                 handleAbsoluteFixInternal(
                         new AbsoluteFix(
-                                System.currentTimeMillis(),
+                                fixTimestampMs,
                                 latitude,
                                 longitude,
                                 accuracy
                         ),
                         resolveStep1InitializationFloor(null),
-                        null
+                        null,
+                        "GNSS",
+                        observationAgeMs
                 );
             }
             gnssAltitude = location.getAltitude();
@@ -685,6 +737,7 @@ public class SensorFusion implements SensorEventListener, Observer {
             this.wifiList = Stream.of(wifiArr)
                     .map(o -> (Wifi) o)
                     .collect(Collectors.toList());
+            lastWifiScanWallClockMs = System.currentTimeMillis();
 
             // === keep ALL your existing WiFi fingerprint code here ===
             // (the whole "if(saveRecording) { ... trajectory.addWifiFingerprints ... }"
@@ -861,6 +914,9 @@ public class SensorFusion implements SensorEventListener, Observer {
     private void createWifiPositioningRequest(){
         // Try catch block to catch any errors and prevent app crashing
         try {
+            final long wifiObservationTimestampMs = lastWifiScanWallClockMs > 0L
+                    ? lastWifiScanWallClockMs
+                    : System.currentTimeMillis();
             // Creating a JSON object to store the WiFi access points
             JSONObject wifiAccessPoints=new JSONObject();
             for (Wifi data : this.wifiList){
@@ -883,15 +939,19 @@ public class SensorFusion implements SensorEventListener, Observer {
                     if (wifiLocation == null) {
                         return;
                     }
+                    long fixTimestampMs = System.currentTimeMillis();
+                    long observationAgeMs = Math.max(0L, fixTimestampMs - wifiObservationTimestampMs);
                     handleAbsoluteFixInternal(
                             new AbsoluteFix(
-                                    System.currentTimeMillis(),
+                                    fixTimestampMs,
                                     wifiLocation.latitude,
                                     wifiLocation.longitude,
                                     DEFAULT_WIFI_ACCURACY_M
                             ),
                             resolveStep1InitializationFloor(floor),
-                            floor
+                            floor,
+                            "WIFI",
+                            observationAgeMs
                     );
                 }
 
@@ -930,7 +990,9 @@ public class SensorFusion implements SensorEventListener, Observer {
                 floor,
                 floor,
                 absoluteFix.getTimestampMs(),
-                absoluteFix.getAccuracyMeters()
+                absoluteFix.getAccuracyMeters(),
+                "ABS",
+                -1L
         );
     }
 
@@ -941,7 +1003,9 @@ public class SensorFusion implements SensorEventListener, Observer {
                 floor,
                 floor,
                 timestampMs,
-                DEFAULT_WIFI_ACCURACY_M
+                DEFAULT_WIFI_ACCURACY_M,
+                "ABS",
+                -1L
         );
     }
 
@@ -958,7 +1022,9 @@ public class SensorFusion implements SensorEventListener, Observer {
                 floor,
                 floor,
                 timestampMs,
-                accuracyMeters
+                accuracyMeters,
+                "ABS",
+                -1L
         );
     }
 
@@ -968,7 +1034,9 @@ public class SensorFusion implements SensorEventListener, Observer {
             int initializationFloor,
             @Nullable Integer floorPrior,
             long timestampMs,
-            float accuracyMeters
+            float accuracyMeters,
+            @NonNull String debugSource,
+            long observationAgeMs
     ) {
         if (!saveRecording) {
             return;
@@ -978,10 +1046,13 @@ public class SensorFusion implements SensorEventListener, Observer {
             this.particleFilterEngine = createParticleFilterEngine();
         }
 
+        updateGeomagneticDeclination(latitudeDeg, longitudeDeg, 0f, timestampMs);
         CoordinateConverter converter = getOrCreateCoordinateConverter(latitudeDeg, longitudeDeg);
         if (converter == null) {
             return;
         }
+        maybeCalibrateFloorOffset(floorPrior);
+        double[] localFix = converter.toLocalMeters(latitudeDeg, longitudeDeg);
         maybeSetInitialPositionIfAbsent(this.trajectory, latitudeDeg, longitudeDeg);
         this.latestFusedPose = applyAbsoluteFixForStep1(
                 this.particleFilterEngine,
@@ -999,21 +1070,44 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.lastPredictHeadingRad = getCurrentHeadingRad();
         this.lastPredictElevation = this.elevation;
         recordLatestFusedPoseIfNeeded();
+        logAbsoluteFusionTrace(
+                debugSource,
+                timestampMs,
+                observationAgeMs,
+                latitudeDeg,
+                longitudeDeg,
+                localFix,
+                floorPrior,
+                accuracyMeters
+        );
     }
 
     private void handleAbsoluteFixInternal(@NonNull AbsoluteFix absoluteFix, int initializationFloor,
-                                           @Nullable Integer floorPrior) {
+                                           @Nullable Integer floorPrior,
+                                           @NonNull String debugSource,
+                                           long observationAgeMs) {
         handleAbsoluteFixInternal(
                 absoluteFix.getLatitudeDeg(),
                 absoluteFix.getLongitudeDeg(),
                 initializationFloor,
                 floorPrior,
                 absoluteFix.getTimestampMs(),
-                absoluteFix.getAccuracyMeters()
+                absoluteFix.getAccuracyMeters(),
+                debugSource,
+                observationAgeMs
         );
     }
 
     public void handlePdrPredict(@Nullable PdrDelta pdrDelta, int floor, long timestampMs) {
+        handlePdrPredict(pdrDelta, floor, timestampMs, 0L);
+    }
+
+    public void handlePdrPredict(
+            @Nullable PdrDelta pdrDelta,
+            int floor,
+            long timestampMs,
+            long observationAgeMs
+    ) {
         if (!saveRecording) {
             return;
         }
@@ -1021,17 +1115,31 @@ public class SensorFusion implements SensorEventListener, Observer {
         // Formal fusion flow must wait for the first real absolute fix.
         // PDR-only prediction is ignored until GNSS/WiFi/other absolute positioning arrives.
         if (!pfInitialized || this.particleFilterEngine == null || pdrDelta == null) {
+            if (saveRecording && pdrDelta != null && !pfInitialized) {
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastWaitingForAbsoluteFixLogMs >= 3_000L) {
+                    Log.i(
+                            "SensorFusion",
+                            "Waiting for first absolute fix; holding PDR prediction until GNSS/WiFi anchor arrives."
+                    );
+                    lastWaitingForAbsoluteFixLogMs = now;
+                }
+            }
             return;
         }
 
+        PdrDelta constrainedDelta = getElevator()
+                ? new PdrDelta(0f, pdrDelta.getDeltaHeadingRad(), pdrDelta.getHeightDeltaMeters())
+                : pdrDelta;
         this.latestFusedPose = applyPdrPredictionForStep1(
                 this.particleFilterEngine,
                 this.pfInitialized,
-                pdrDelta,
+                constrainedDelta,
                 floor,
                 timestampMs
         );
         recordLatestFusedPoseIfNeeded();
+        logPdrFusionTrace(constrainedDelta, floor, timestampMs, observationAgeMs);
     }
 
     public FusedPose getLatestFusedPose() {
@@ -1064,6 +1172,25 @@ public class SensorFusion implements SensorEventListener, Observer {
             return null;
         }
         return converter.toLatLng(localPosition[0], localPosition[1]);
+    }
+
+    @Nullable
+    public double[] getLocalMetersForLatLng(@Nullable LatLng latLng) {
+        if (latLng == null || coordinateConverter == null) {
+            return null;
+        }
+        return coordinateConverter.toLocalMeters(latLng.latitude, latLng.longitude);
+    }
+
+    // UI 侧回写当前实际显示的 fused marker，便于区分“内部 fused 错了”还是“UI 画错了”。
+    public void noteDisplayedFusedMarker(
+            @Nullable LatLng rawLocation,
+            @Nullable LatLng displayedLocation,
+            long timestampMs
+    ) {
+        lastDisplayedFusedMarkerRawLatLng = rawLocation;
+        lastDisplayedFusedMarkerLatLng = displayedLocation;
+        lastDisplayedFusedMarkerTimestampMs = timestampMs;
     }
 
     public void recordLatestFusedPoseIfNeeded() {
@@ -1107,6 +1234,29 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.startLocation = new float[]{(float) latitudeDeg, (float) longitudeDeg};
         this.hasManualStartLocation = manualOrigin;
         this.coordinateConverter = new CoordinateConverter(latitudeDeg, longitudeDeg);
+        updateGeomagneticDeclination(latitudeDeg, longitudeDeg, 0f, System.currentTimeMillis());
+    }
+
+    private int getRelativeCurrentFloor() {
+        return this.pdrProcessing == null ? 0 : this.pdrProcessing.getCurrentFloor();
+    }
+
+    /**
+     * Get the current absolute floor aligned to the map floor index space.
+     */
+    private int getAbsoluteCurrentFloor() {
+        return getRelativeCurrentFloor() + pdrFloorOffset;
+    }
+
+    private void maybeCalibrateFloorOffset(@Nullable Integer absoluteFloor) {
+        if (absoluteFloor == null || this.pdrProcessing == null) {
+            return;
+        }
+        int desiredOffset = absoluteFloor - getRelativeCurrentFloor();
+        if (!isFloorOffsetInitialized || getAbsoluteCurrentFloor() != absoluteFloor) {
+            this.pdrFloorOffset = desiredOffset;
+            this.isFloorOffsetInitialized = true;
+        }
     }
 
     private int resolveStep1InitializationFloor(@Nullable Integer preferredFloor) {
@@ -1176,9 +1326,34 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     private ParticleFilterEngine createParticleFilterEngine() {
+        ParticleInitializer.SpawnValidator particleValidator = new ParticleInitializer.SpawnValidator() {
+            @Override
+            public boolean isValid(double x, double y, int floor) {
+                return isValidParticlePrediction(x, y, floor);
+            }
+
+            @Override
+            public boolean isValidMotion(
+                    double previousX,
+                    double previousY,
+                    double predictedX,
+                    double predictedY,
+                    int previousFloor,
+                    int predictedFloor
+            ) {
+                return isValidParticleMotion(
+                        previousX,
+                        previousY,
+                        predictedX,
+                        predictedY,
+                        previousFloor,
+                        predictedFloor
+                );
+            }
+        };
         return new ParticleFilterEngine(
                 new ParticleInitializer(),
-                this::isValidParticlePrediction,
+                particleValidator,
                 this::allowsMapBasedFloorTransition
         );
     }
@@ -1200,19 +1375,32 @@ public class SensorFusion implements SensorEventListener, Observer {
         if (newFloor == previousFloor) {
             return true;
         }
-        if (!MapConstraintRepository.hasTransitionConstraints()) {
+        boolean hasAnyMapConstraints = MapConstraintRepository.hasAnyConstraints();
+        if (!hasAnyMapConstraints) {
             return true;
         }
+        if (!MapConstraintRepository.hasTransitionConstraints(previousFloor)
+                && !MapConstraintRepository.hasTransitionConstraints(newFloor)) {
+            return false;
+        }
         if (coordinateConverter == null) {
-            return true;
+            return false;
         }
         LatLng previousLatLng = coordinateConverter.toLatLng(previousXMeters, previousYMeters);
         LatLng predictedLatLng = coordinateConverter.toLatLng(predictedXMeters, predictedYMeters);
         if (previousLatLng == null || predictedLatLng == null) {
-            return true;
+            return false;
         }
-        return MapConstraintRepository.isPointInsideTransitionZone(previousLatLng)
-                || MapConstraintRepository.isPointInsideTransitionZone(predictedLatLng);
+        if (getElevator()) {
+            return MapConstraintRepository.isPointInsideLift(previousLatLng, previousFloor)
+                    || MapConstraintRepository.isPointInsideLift(predictedLatLng, newFloor)
+                    || MapConstraintRepository.doesPathIntersectLift(previousLatLng, predictedLatLng, previousFloor)
+                    || MapConstraintRepository.doesPathIntersectLift(previousLatLng, predictedLatLng, newFloor);
+        }
+        return MapConstraintRepository.isPointInsideStairs(previousLatLng, previousFloor)
+                || MapConstraintRepository.isPointInsideStairs(predictedLatLng, newFloor)
+                || MapConstraintRepository.doesPathIntersectStairs(previousLatLng, predictedLatLng, previousFloor)
+                || MapConstraintRepository.doesPathIntersectStairs(previousLatLng, predictedLatLng, newFloor);
     }
 
     private boolean isValidParticlePrediction(double x, double y, int floor) {
@@ -1226,8 +1414,8 @@ public class SensorFusion implements SensorEventListener, Observer {
             return true;
         }
 
-        if (MapConstraintRepository.hasWallConstraints()
-                && MapConstraintRepository.isPointInsideWall(candidateLatLng)) {
+        if (MapConstraintRepository.hasWallConstraints(floor)
+                && MapConstraintRepository.isPointInsideWall(candidateLatLng, floor)) {
             return false;
         }
 
@@ -1243,6 +1431,35 @@ public class SensorFusion implements SensorEventListener, Observer {
             return BuildingPolygon.inLibrary(candidateLatLng);
         }
         return true;
+    }
+
+    private boolean isValidParticleMotion(
+            double previousX,
+            double previousY,
+            double predictedX,
+            double predictedY,
+            int previousFloor,
+            int predictedFloor
+    ) {
+        if (!isValidParticlePrediction(predictedX, predictedY, predictedFloor)) {
+            return false;
+        }
+        if (coordinateConverter == null) {
+            return true;
+        }
+
+        LatLng previousLatLng = coordinateConverter.toLatLng(previousX, previousY);
+        LatLng predictedLatLng = coordinateConverter.toLatLng(predictedX, predictedY);
+        if (previousLatLng == null || predictedLatLng == null) {
+            return true;
+        }
+        if (MapConstraintRepository.hasWallConstraints(predictedFloor)
+                && MapConstraintRepository.doesPathIntersectWall(previousLatLng, predictedLatLng, predictedFloor)) {
+            return false;
+        }
+        return previousFloor == predictedFloor
+                || !MapConstraintRepository.hasWallConstraints(previousFloor)
+                || !MapConstraintRepository.doesPathIntersectWall(previousLatLng, predictedLatLng, previousFloor);
     }
 
     private int resolveConstraintBuildingMode() {
@@ -1485,13 +1702,206 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     /**
-     * Getter function for device orientation.
-     * Passes the orientation variable
+     * Getter function for the current heading.
      *
-     * @return orientation of device.
+     * @return heading in radians, relative to true north with clockwise positive rotation.
      */
     public float passOrientation(){
         return orientation[0];
+    }
+
+    /**
+     * Heading used by the map marker.
+     */
+    public float passDisplayOrientation() {
+        float resultRad;
+        if (displayOrientation == null || displayOrientation.length == 0 || Float.isNaN(displayOrientation[0])) {
+            resultRad = passOrientation();
+        } else {
+            resultRad = displayOrientation[0];
+        }
+        logArrowDisplayOrientationTrace(resultRad);
+        return resultRad;
+    }
+
+    // Mirror the corrected heading into the UI-facing path without changing marker/UI code.
+    private void updateDisplayOrientation(@NonNull float[] ignoredRotationMatrix) {
+        // 这次只修“手机顶部方向 != 地图箭头方向”。
+        // ARROW_DBG 已确认固定偏角出在 raw -> displayOrientation，
+        // 因此显示链路直接沿用原始 device azimuth，不改 raw orientation，也不影响 PF/PDR。
+        System.arraycopy(this.orientation, 0, this.displayOrientation, 0, this.orientation.length);
+    }
+
+    private void updateTrueNorthOrientation(@NonNull float[] horizontalWorldRotationMatrix) {
+        SensorManager.getOrientation(horizontalWorldRotationMatrix, this.orientation);
+        this.orientation[0] = toTrueNorthHeadingRad(this.orientation[0]);
+    }
+
+    @SuppressWarnings("deprecation")
+    private int getDisplayRotation() {
+        if (appContext == null) {
+            return Surface.ROTATION_0;
+        }
+        WindowManager windowManager = (WindowManager) appContext.getSystemService(Context.WINDOW_SERVICE);
+        if (windowManager == null || windowManager.getDefaultDisplay() == null) {
+            return Surface.ROTATION_0;
+        }
+        return windowManager.getDefaultDisplay().getRotation();
+    }
+
+    // 只跟踪地图箭头显示链路：原始 azimuth、displayOrientation 和当前屏幕 rotation。
+    private void logArrowRawOrientationTrace() {
+        if (!BuildConfig.DEBUG) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now - arrowDbgRawLastLogMs < ARROW_DBG_INTERVAL_MS) {
+            return;
+        }
+        float rawRad = orientation == null || orientation.length == 0 ? Float.NaN : orientation[0];
+        float displayRad = displayOrientation == null || displayOrientation.length == 0
+                ? Float.NaN
+                : displayOrientation[0];
+        int displayRotation = getDisplayRotation();
+        Log.d(
+                ARROW_DBG_TAG,
+                "stage=SensorFusion.raw"
+                        + " rawRad=" + formatDebugDouble(rawRad)
+                        + " rawDeg=" + formatDebugDouble(Math.toDegrees(rawRad))
+                        + " rawDeg360=" + formatDebugDouble(normalizeDegrees(Math.toDegrees(rawRad)))
+                        + " displayRad=" + formatDebugDouble(displayRad)
+                        + " displayDeg=" + formatDebugDouble(Math.toDegrees(displayRad))
+                        + " displayDeg360=" + formatDebugDouble(normalizeDegrees(Math.toDegrees(displayRad)))
+                        + " surfaceRotation=" + displayRotation
+                        + "(" + formatSurfaceRotation(displayRotation) + ")"
+        );
+        arrowDbgRawLastLogMs = now;
+    }
+
+    // 记录 UI 真正取走的 displayOrientation 返回值，便于和后续 setRotation 对齐。
+    private void logArrowDisplayOrientationTrace(float resultRad) {
+        if (!BuildConfig.DEBUG) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now - arrowDbgDisplayLastLogMs < ARROW_DBG_INTERVAL_MS) {
+            return;
+        }
+        float rawRad = orientation == null || orientation.length == 0 ? Float.NaN : orientation[0];
+        int displayRotation = getDisplayRotation();
+        Log.d(
+                ARROW_DBG_TAG,
+                "stage=SensorFusion.passDisplayOrientation"
+                        + " returnRad=" + formatDebugDouble(resultRad)
+                        + " returnDeg=" + formatDebugDouble(Math.toDegrees(resultRad))
+                        + " returnDeg360=" + formatDebugDouble(normalizeDegrees(Math.toDegrees(resultRad)))
+                        + " rawRad=" + formatDebugDouble(rawRad)
+                        + " rawDeg360=" + formatDebugDouble(normalizeDegrees(Math.toDegrees(rawRad)))
+                        + " surfaceRotation=" + displayRotation
+                        + "(" + formatSurfaceRotation(displayRotation) + ")"
+        );
+        arrowDbgDisplayLastLogMs = now;
+    }
+
+    private double normalizeDegrees(double degrees) {
+        if (!Double.isFinite(degrees)) {
+            return Double.NaN;
+        }
+        double normalized = degrees % 360.0;
+        return normalized < 0.0 ? normalized + 360.0 : normalized;
+    }
+
+    private float toTrueNorthHeadingRad(float magneticHeadingRad) {
+        ensureGeomagneticDeclination();
+        float headingTrueDeg = (float) Math.toDegrees(magneticHeadingRad)
+                + (hasGeomagneticDeclination ? geomagneticDeclinationDeg : 0f);
+        return normalizePositiveHeadingRad(headingTrueDeg);
+    }
+
+    private float normalizePositiveHeadingRad(float headingDeg) {
+        float normalizedDeg = headingDeg % 360f;
+        if (normalizedDeg < 0f) {
+            normalizedDeg += 360f;
+        }
+        return (float) Math.toRadians(normalizedDeg);
+    }
+
+    private void ensureGeomagneticDeclination() {
+        long nowMs = System.currentTimeMillis();
+        if (hasGeomagneticDeclination && !shouldRefreshGeomagneticDeclination(nowMs)) {
+            return;
+        }
+        if (isValidLatLng(latitude, longitude)) {
+            updateGeomagneticDeclination(latitude, longitude, (float) gnssAltitude, nowMs);
+            return;
+        }
+        if (startLocation != null && startLocation.length >= 2 && isValidLatLng(startLocation[0], startLocation[1])) {
+            updateGeomagneticDeclination(startLocation[0], startLocation[1], 0f, nowMs);
+            return;
+        }
+        LatLng fusedLatLng = getLatLngForFusedPose(latestFusedPose);
+        if (fusedLatLng != null) {
+            updateGeomagneticDeclination(fusedLatLng.latitude, fusedLatLng.longitude, 0f, nowMs);
+        }
+    }
+
+    private boolean shouldRefreshGeomagneticDeclination(long timestampMs) {
+        if (!hasGeomagneticDeclination) {
+            return true;
+        }
+        return Math.abs(timestampMs - geomagneticDeclinationTimestampMs) >= DECLINATION_REFRESH_INTERVAL_MS;
+    }
+
+    private void updateGeomagneticDeclination(
+            double latitudeDeg,
+            double longitudeDeg,
+            float altitudeMeters,
+            long timestampMs
+    ) {
+        if (!isValidLatLng(latitudeDeg, longitudeDeg)) {
+            return;
+        }
+        long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
+        if (hasGeomagneticDeclination
+                && !shouldRefreshGeomagneticDeclination(safeTimestampMs)
+                && Math.abs(latitudeDeg - geomagneticDeclinationLatitudeDeg) < 1e-4
+                && Math.abs(longitudeDeg - geomagneticDeclinationLongitudeDeg) < 1e-4
+                && Math.abs(altitudeMeters - geomagneticDeclinationAltitudeMeters) < 5f) {
+            return;
+        }
+        GeomagneticField geomagneticField = new GeomagneticField(
+                (float) latitudeDeg,
+                (float) longitudeDeg,
+                altitudeMeters,
+                safeTimestampMs
+        );
+        geomagneticDeclinationDeg = geomagneticField.getDeclination();
+        geomagneticDeclinationTimestampMs = safeTimestampMs;
+        geomagneticDeclinationLatitudeDeg = latitudeDeg;
+        geomagneticDeclinationLongitudeDeg = longitudeDeg;
+        geomagneticDeclinationAltitudeMeters = altitudeMeters;
+        hasGeomagneticDeclination = true;
+    }
+
+    private boolean isValidLatLng(double latitudeDeg, double longitudeDeg) {
+        return Double.isFinite(latitudeDeg)
+                && Double.isFinite(longitudeDeg)
+                && !(latitudeDeg == 0.0 && longitudeDeg == 0.0);
+    }
+
+    @NonNull
+    private String formatSurfaceRotation(int displayRotation) {
+        switch (displayRotation) {
+            case Surface.ROTATION_90:
+                return "ROTATION_90";
+            case Surface.ROTATION_180:
+                return "ROTATION_180";
+            case Surface.ROTATION_270:
+                return "ROTATION_270";
+            case Surface.ROTATION_0:
+            default:
+                return "ROTATION_0";
+        }
     }
 
     /**
@@ -1586,7 +1996,19 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     public int getCurrentFloor() {
-        return this.pdrProcessing == null ? 0 : this.pdrProcessing.getCurrentFloor();
+        return getAbsoluteCurrentFloor();
+    }
+
+    public void setVenueFloorHeightMeters(float floorHeightMeters) {
+        if (this.pdrProcessing != null && floorHeightMeters > 0f) {
+            this.pdrProcessing.setFloorHeightMeters(floorHeightMeters);
+        }
+    }
+
+    public void clearVenueFloorHeightOverride() {
+        if (this.pdrProcessing != null) {
+            this.pdrProcessing.clearFloorHeightOverride();
+        }
     }
 
     /**
@@ -1758,6 +2180,8 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.storeTrajectoryTimer = new Timer();
         this.storeTrajectoryTimer.schedule(new storeDataInTrajectory(), 0, TIME_CONST);
         this.pdrProcessing.resetPDR();
+        this.pdrFloorOffset = 0;
+        this.isFloorOffsetInitialized = false;
         this.elevation = 0f;
         this.elevator = false;
         this.particleFilterEngine = createParticleFilterEngine();
@@ -1766,9 +2190,19 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.coordinateConverter = hasManualStartLocation && startLocation != null && startLocation.length >= 2
                 ? new CoordinateConverter(startLocation[0], startLocation[1])
                 : null;
+        this.hasGeomagneticDeclination = false;
+        this.geomagneticDeclinationDeg = 0f;
+        this.geomagneticDeclinationTimestampMs = 0L;
+        this.geomagneticDeclinationLatitudeDeg = Double.NaN;
+        this.geomagneticDeclinationLongitudeDeg = Double.NaN;
+        this.geomagneticDeclinationAltitudeMeters = 0f;
         this.lastPredictHeadingRad = getCurrentHeadingRad();
         this.lastPredictElevation = this.elevation;
         this.lastRecordedFusedPoseTimestampMs = -1L;
+        this.lastWifiScanWallClockMs = -1L;
+        this.lastDisplayedFusedMarkerLatLng = null;
+        this.lastDisplayedFusedMarkerRawLatLng = null;
+        this.lastDisplayedFusedMarkerTimestampMs = -1L;
         if(settings.getBoolean("overwrite_constants", false)) {
             this.filter_coefficient = Float.parseFloat(settings.getString("accel_filter", "0.96"));
         } else {
@@ -1971,6 +2405,179 @@ public class SensorFusion implements SensorEventListener, Observer {
 
     public double getCurrentGnssAltitude() {
         return gnssAltitude;
+    }
+
+    private long resolveGnssObservationAgeMs(@NonNull Location location, long nowMs) {
+        long locationTimeMs = location.getTime();
+        if (locationTimeMs <= 0L) {
+            return -1L;
+        }
+        return Math.max(0L, nowMs - locationTimeMs);
+    }
+
+    private void logAbsoluteFusionTrace(
+            @NonNull String source,
+            long timestampMs,
+            long observationAgeMs,
+            double latitudeDeg,
+            double longitudeDeg,
+            @Nullable double[] localFix,
+            @Nullable Integer floorPrior,
+            float accuracyMeters
+    ) {
+        if (!DEBUG_FUSION_TRACE) {
+            return;
+        }
+        double[] displayedLocal = getLocalMetersForLatLng(lastDisplayedFusedMarkerLatLng);
+        double[] displayedRawLocal = getLocalMetersForLatLng(lastDisplayedFusedMarkerRawLatLng);
+        Log.d(
+                "SensorFusion",
+                "FUSION_DBG ts=" + timestampMs
+                        + " source=" + source
+                        + " rawLatLon=" + formatLatLon(latitudeDeg, longitudeDeg)
+                        + " localEN=" + formatLocal(localFix)
+                        + " floorPrior=" + (floorPrior == null ? "n/a" : floorPrior)
+                        + " currentFloor=" + getCurrentFloor()
+                        + " accuracyM=" + formatDebugDouble(accuracyMeters)
+                        + " obsAgeMs=" + observationAgeMs
+                        + " fused=" + formatFusedPose(latestFusedPose)
+                        + " displayedRaw=" + formatLatLng(lastDisplayedFusedMarkerRawLatLng)
+                        + " displayedRawEN=" + formatLocal(displayedRawLocal)
+                        + " displayedMarker=" + formatLatLng(lastDisplayedFusedMarkerLatLng)
+                        + " displayedMarkerEN=" + formatLocal(displayedLocal)
+                        + " displayedAgeMs=" + resolveDisplayedMarkerAgeMs(timestampMs)
+                        + " pf=" + buildParticleDebugSummary()
+        );
+    }
+
+    private void logPdrFusionTrace(
+            @Nullable PdrDelta pdrDelta,
+            int floor,
+            long timestampMs,
+            long observationAgeMs
+    ) {
+        if (!DEBUG_FUSION_TRACE) {
+            return;
+        }
+        float[] pdrPosition = pdrProcessing == null ? null : pdrProcessing.getPDRMovement();
+        double[] displayedLocal = getLocalMetersForLatLng(lastDisplayedFusedMarkerLatLng);
+        Log.d(
+                "SensorFusion",
+                "FUSION_DBG ts=" + timestampMs
+                        + " source=PDR"
+                        + " rawLatLon=n/a"
+                        + " localEN=" + formatFloatLocal(pdrPosition)
+                        + " stepLenM=" + formatDebugDouble(pdrDelta == null ? Double.NaN : pdrDelta.getStepLengthMeters())
+                        + " deltaHeadingRad=" + formatDebugDouble(pdrDelta == null ? Double.NaN : pdrDelta.getDeltaHeadingRad())
+                        + " heightDeltaM=" + formatDebugDouble(pdrDelta == null ? Double.NaN : pdrDelta.getHeightDeltaMeters())
+                        + " currentFloor=" + floor
+                        + " obsAgeMs=" + observationAgeMs
+                        + " fused=" + formatFusedPose(latestFusedPose)
+                        + " displayedMarker=" + formatLatLng(lastDisplayedFusedMarkerLatLng)
+                        + " displayedMarkerEN=" + formatLocal(displayedLocal)
+                        + " displayedAgeMs=" + resolveDisplayedMarkerAgeMs(timestampMs)
+                        + " pf=" + buildParticleDebugSummary()
+        );
+    }
+
+    private long resolveDisplayedMarkerAgeMs(long referenceTimestampMs) {
+        if (lastDisplayedFusedMarkerTimestampMs <= 0L) {
+            return -1L;
+        }
+        return Math.max(0L, referenceTimestampMs - lastDisplayedFusedMarkerTimestampMs);
+    }
+
+    @NonNull
+    private String buildParticleDebugSummary() {
+        if (particleFilterEngine == null) {
+            return "particleCount=0";
+        }
+        List<Particle> particles = particleFilterEngine.snapshotParticlesForTesting();
+        if (particles.isEmpty()) {
+            return "particleCount=0";
+        }
+        Particle bestParticle = null;
+        for (Particle particle : particles) {
+            if (bestParticle == null || particle.getWeight() > bestParticle.getWeight()) {
+                bestParticle = particle;
+            }
+        }
+        return "particleCount=" + particles.size()
+                + " bestParticle=" + formatParticle(bestParticle)
+                + " weightedMean=" + formatFusedPose(latestFusedPose)
+                + " wallReject=" + particleFilterEngine.getLastPredictWallRejectCount()
+                + " floorConstraintReject=" + particleFilterEngine.getLastPredictFloorConstraintRejectCount()
+                + " reanchor=" + particleFilterEngine.wasLastAbsoluteFixReanchored();
+    }
+
+    @NonNull
+    private String formatFusedPose(@Nullable FusedPose fusedPose) {
+        if (fusedPose == null) {
+            return "n/a";
+        }
+        return "{e=" + formatDebugDouble(fusedPose.getX())
+                + ",n=" + formatDebugDouble(fusedPose.getY())
+                + ",floor=" + fusedPose.getFloor()
+                + ",conf=" + formatDebugDouble(fusedPose.getConfidence())
+                + "}";
+    }
+
+    @NonNull
+    private String formatParticle(@Nullable Particle particle) {
+        if (particle == null) {
+            return "n/a";
+        }
+        return "{e=" + formatDebugDouble(particle.getX())
+                + ",n=" + formatDebugDouble(particle.getY())
+                + ",floor=" + particle.getFloor()
+                + ",w=" + formatDebugDouble(particle.getWeight())
+                + "}";
+    }
+
+    @NonNull
+    private String formatLatLng(@Nullable LatLng latLng) {
+        if (latLng == null) {
+            return "n/a";
+        }
+        return formatLatLon(latLng.latitude, latLng.longitude);
+    }
+
+    @NonNull
+    private String formatLatLon(double latitudeDeg, double longitudeDeg) {
+        if (!Double.isFinite(latitudeDeg) || !Double.isFinite(longitudeDeg)) {
+            return "n/a";
+        }
+        return "{lat=" + formatDebugDouble(latitudeDeg)
+                + ",lon=" + formatDebugDouble(longitudeDeg)
+                + "}";
+    }
+
+    @NonNull
+    private String formatLocal(@Nullable double[] localMeters) {
+        if (localMeters == null || localMeters.length < 2) {
+            return "n/a";
+        }
+        return "{e=" + formatDebugDouble(localMeters[0])
+                + ",n=" + formatDebugDouble(localMeters[1])
+                + "}";
+    }
+
+    @NonNull
+    private String formatFloatLocal(@Nullable float[] localMeters) {
+        if (localMeters == null || localMeters.length < 2) {
+            return "n/a";
+        }
+        return "{e=" + formatDebugDouble(localMeters[0])
+                + ",n=" + formatDebugDouble(localMeters[1])
+                + "}";
+    }
+
+    @NonNull
+    private String formatDebugDouble(double value) {
+        if (!Double.isFinite(value)) {
+            return "n/a";
+        }
+        return String.format(Locale.US, "%.3f", value);
     }
 
 
