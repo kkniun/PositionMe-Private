@@ -243,6 +243,22 @@ public class IndoorMapManager {
                 || MapConstraintRepository.hasVenueOutline());
     }
 
+    public boolean hasRequestedNearbyVenues() {
+        return requestInFlight || lastRequestTs > 0L;
+    }
+
+    public boolean isVenueRequestInFlight() {
+        return requestInFlight;
+    }
+
+    public boolean hasNearbyVenueCandidates() {
+        return !venuesById.isEmpty();
+    }
+
+    public boolean hasSelectedVenue() {
+        return !TextUtils.isEmpty(selectedVenueId);
+    }
+
     public int getFloorCount() {
         VenueModel selected = getSelectedVenue();
         if (selected == null) return 0;

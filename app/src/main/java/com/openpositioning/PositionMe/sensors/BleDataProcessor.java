@@ -60,6 +60,7 @@ public class BleDataProcessor implements Observable {
 
     private final ArrayList<Observer> observers = new ArrayList<>();
     private ScanCallback scanCallback;
+    private boolean isListening;
 
     // Flush window every SCAN_INTERVAL_MS
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -82,6 +83,7 @@ public class BleDataProcessor implements Observable {
             adapter = bluetoothManager.getAdapter();
         }
         this.bluetoothAdapter = adapter;
+        this.isListening = false;
 
         Log.i(TAG, "BleDataProcessor() init: bluetoothAdapter=" + (bluetoothAdapter == null ? "null" : "OK"));
     }
@@ -107,6 +109,9 @@ public class BleDataProcessor implements Observable {
 
     public void startListening() {
         Log.i(TAG, "startListening() called");
+        if (isListening) {
+            return;
+        }
 
         if (bluetoothAdapter == null) {
             Log.e(TAG, "BluetoothAdapter == null (Bluetooth not supported / emulator limitation)");
@@ -135,6 +140,7 @@ public class BleDataProcessor implements Observable {
         stopScanningInternal(); // ensure clean state
         startScanningInternal();
         scheduleFlush();
+        isListening = true;
 
         if (BuildConfig.DEBUG) {
             Log.d(TAG, "BLE scan started (mode=LOW_LATENCY, interval=" + SCAN_INTERVAL_MS + "ms)");
@@ -143,6 +149,9 @@ public class BleDataProcessor implements Observable {
 
     public void stopListening() {
         Log.i(TAG, "stopListening() called");
+        if (!isListening && scanCallback == null) {
+            return;
+        }
 
         stopScanningInternal();
         cancelFlush();
@@ -151,6 +160,7 @@ public class BleDataProcessor implements Observable {
             latestBleDeviceCount = 0;
             latestStrongestBleRssi = DEFAULT_STRONGEST_RSSI;
         }
+        isListening = false;
 
         if (BuildConfig.DEBUG) {
             Log.d(TAG, "BLE scan stopped");
@@ -319,6 +329,10 @@ public class BleDataProcessor implements Observable {
 
     public int getLatestBleDeviceCount() {
         return latestBleDeviceCount;
+    }
+
+    public boolean isListening() {
+        return isListening;
     }
 
     public int getLatestStrongestBleRssi() {

@@ -12,6 +12,13 @@ import retrofit2.Call;
 import retrofit2.Callback;
 import retrofit2.Response;
 
+/**
+ * Legacy/shared floorplan metadata holder.
+ *
+ * <p>The live recording runtime now uses {@code IndoorMapManager} directly for venue lookup and
+ * map-matching constraints. This ViewModel remains only for secondary flows that still exchange a
+ * selected venue id or older floorplan payloads.
+ */
 public class MapViewModel extends ViewModel {
 
     private FloorplanApiService apiService;

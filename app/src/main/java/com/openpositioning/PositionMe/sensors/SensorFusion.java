@@ -225,6 +225,8 @@ public class SensorFusion implements SensorEventListener, Observer {
     private boolean pfInitialized;
     private FusedPose latestFusedPose;
     private CoordinateConverter coordinateConverter;
+    private boolean listenersActive;
+    private final AbsoluteFloorTransitionResolver absoluteFloorTransitionResolver = new AbsoluteFloorTransitionResolver();
     private boolean hasManualStartLocation;
     private float lastPredictHeadingRad;
     private float lastPredictElevation;
@@ -354,6 +356,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.bootTime = SystemClock.uptimeMillis();
         // Initialise saveRecording to false
         this.saveRecording = false;
+        this.listenersActive = false;
 
         // Other initialisations...
         this.accelMagnitude = new ArrayList<>();
@@ -1051,7 +1054,8 @@ public class SensorFusion implements SensorEventListener, Observer {
         if (converter == null) {
             return;
         }
-        maybeCalibrateFloorOffset(floorPrior);
+        Integer acceptedFloorPrior = resolveAcceptedAbsoluteFloorPrior(latitudeDeg, longitudeDeg, floorPrior);
+        maybeCalibrateFloorOffset(acceptedFloorPrior);
         double[] localFix = converter.toLocalMeters(latitudeDeg, longitudeDeg);
         maybeSetInitialPositionIfAbsent(this.trajectory, latitudeDeg, longitudeDeg);
         this.latestFusedPose = applyAbsoluteFixForStep1(
@@ -1061,7 +1065,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                 latitudeDeg,
                 longitudeDeg,
                 initializationFloor,
-                floorPrior,
+                acceptedFloorPrior,
                 timestampMs,
                 accuracyMeters,
                 getCurrentHeadingRad()
@@ -1077,7 +1081,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                 latitudeDeg,
                 longitudeDeg,
                 localFix,
-                floorPrior,
+                acceptedFloorPrior,
                 accuracyMeters
         );
     }
@@ -1257,6 +1261,60 @@ public class SensorFusion implements SensorEventListener, Observer {
             this.pdrFloorOffset = desiredOffset;
             this.isFloorOffsetInitialized = true;
         }
+    }
+
+    @Nullable
+    private Integer resolveAcceptedAbsoluteFloorPrior(
+            double latitudeDeg,
+            double longitudeDeg,
+            @Nullable Integer reportedFloor
+    ) {
+        if (reportedFloor == null) {
+            absoluteFloorTransitionResolver.reset();
+            return null;
+        }
+        int currentFloor = latestFusedPose != null ? latestFusedPose.getFloor() : getAbsoluteCurrentFloor();
+        boolean hasMapConstraints = MapConstraintRepository.hasAnyConstraints();
+        boolean transitionAllowed = !hasMapConstraints
+                || reportedFloor == currentFloor
+                || allowsAbsoluteFixFloorTransition(
+                new LatLng(latitudeDeg, longitudeDeg),
+                currentFloor,
+                reportedFloor
+        );
+        return absoluteFloorTransitionResolver.resolveAcceptedFloor(
+                currentFloor,
+                reportedFloor,
+                pfInitialized,
+                hasMapConstraints,
+                transitionAllowed
+        );
+    }
+
+    private boolean allowsAbsoluteFixFloorTransition(
+            @NonNull LatLng absoluteFixLatLng,
+            int currentFloor,
+            int newFloor
+    ) {
+        if (newFloor == currentFloor) {
+            return true;
+        }
+        LatLng previousLatLng = getLatLngForFusedPose(latestFusedPose);
+        if (previousLatLng == null) {
+            previousLatLng = absoluteFixLatLng;
+        }
+        if (getElevator()) {
+            return MapConstraintRepository.isPointInsideLift(previousLatLng, currentFloor)
+                    || MapConstraintRepository.isPointInsideLift(absoluteFixLatLng, currentFloor)
+                    || MapConstraintRepository.isPointInsideLift(absoluteFixLatLng, newFloor)
+                    || MapConstraintRepository.doesPathIntersectLift(previousLatLng, absoluteFixLatLng, currentFloor)
+                    || MapConstraintRepository.doesPathIntersectLift(previousLatLng, absoluteFixLatLng, newFloor);
+        }
+        return MapConstraintRepository.isPointInsideStairs(previousLatLng, currentFloor)
+                || MapConstraintRepository.isPointInsideStairs(absoluteFixLatLng, currentFloor)
+                || MapConstraintRepository.isPointInsideStairs(absoluteFixLatLng, newFloor)
+                || MapConstraintRepository.doesPathIntersectStairs(previousLatLng, absoluteFixLatLng, currentFloor)
+                || MapConstraintRepository.doesPathIntersectStairs(previousLatLng, absoluteFixLatLng, newFloor);
     }
 
     private int resolveStep1InitializationFloor(@Nullable Integer preferredFloor) {
@@ -1936,6 +1994,14 @@ public class SensorFusion implements SensorEventListener, Observer {
         return this.wifiList;
     }
 
+    public boolean isRecordingInProgress() {
+        return saveRecording;
+    }
+
+    public boolean areListenersActive() {
+        return listenersActive;
+    }
+
     /**
      * 获取最近一次 BLE 扫描窗口的去重设备数量（只读展示用）。
      */
@@ -2050,20 +2116,22 @@ public class SensorFusion implements SensorEventListener, Observer {
      * @see GNSSDataProcessor handles location data.
      */
     public void resumeListening() {
-        accelerometerSensor.sensorManager.registerListener(this, accelerometerSensor.sensor, 10000, (int) maxReportLatencyNs);
-        accelerometerSensor.sensorManager.registerListener(this, linearAccelerationSensor.sensor, 10000, (int) maxReportLatencyNs);
-        accelerometerSensor.sensorManager.registerListener(this, gravitySensor.sensor, 10000, (int) maxReportLatencyNs);
-        barometerSensor.sensorManager.registerListener(this, barometerSensor.sensor, (int) 1e6);
-        gyroscopeSensor.sensorManager.registerListener(this, gyroscopeSensor.sensor, 10000, (int) maxReportLatencyNs);
-        lightSensor.sensorManager.registerListener(this, lightSensor.sensor, (int) 1e6);
-        proximitySensor.sensorManager.registerListener(this, proximitySensor.sensor, (int) 1e6);
-        magnetometerSensor.sensorManager.registerListener(this, magnetometerSensor.sensor, 10000, (int) maxReportLatencyNs);
-        stepDetectionSensor.sensorManager.registerListener(this, stepDetectionSensor.sensor, SensorManager.SENSOR_DELAY_NORMAL);
-        rotationSensor.sensorManager.registerListener(this, rotationSensor.sensor, (int) 1e6);
+        if (!listenersActive) {
+            accelerometerSensor.sensorManager.registerListener(this, accelerometerSensor.sensor, 10000, (int) maxReportLatencyNs);
+            accelerometerSensor.sensorManager.registerListener(this, linearAccelerationSensor.sensor, 10000, (int) maxReportLatencyNs);
+            accelerometerSensor.sensorManager.registerListener(this, gravitySensor.sensor, 10000, (int) maxReportLatencyNs);
+            barometerSensor.sensorManager.registerListener(this, barometerSensor.sensor, (int) 1e6);
+            gyroscopeSensor.sensorManager.registerListener(this, gyroscopeSensor.sensor, 10000, (int) maxReportLatencyNs);
+            lightSensor.sensorManager.registerListener(this, lightSensor.sensor, (int) 1e6);
+            proximitySensor.sensorManager.registerListener(this, proximitySensor.sensor, (int) 1e6);
+            magnetometerSensor.sensorManager.registerListener(this, magnetometerSensor.sensor, 10000, (int) maxReportLatencyNs);
+            stepDetectionSensor.sensorManager.registerListener(this, stepDetectionSensor.sensor, SensorManager.SENSOR_DELAY_NORMAL);
+            rotationSensor.sensorManager.registerListener(this, rotationSensor.sensor, (int) 1e6);
+            listenersActive = true;
+        }
         wifiProcessor.startListening();
         gnssProcessor.startLocationUpdates();
         bleProcessor.startListening();
-
     }
 
     /**
@@ -2076,8 +2144,7 @@ public class SensorFusion implements SensorEventListener, Observer {
      * @see GNSSDataProcessor handles location data.
      */
     public void stopListening() {
-        if(!saveRecording) {
-            // Unregister sensor-manager based devices
+        if (listenersActive) {
             accelerometerSensor.sensorManager.unregisterListener(this);
             barometerSensor.sensorManager.unregisterListener(this);
             gyroscopeSensor.sensorManager.unregisterListener(this);
@@ -2088,20 +2155,11 @@ public class SensorFusion implements SensorEventListener, Observer {
             rotationSensor.sensorManager.unregisterListener(this);
             linearAccelerationSensor.sensorManager.unregisterListener(this);
             gravitySensor.sensorManager.unregisterListener(this);
-            //The app often crashes here because the scan receiver stops after it has found the list.
-            // It will only unregister one if there is to unregister
-            try {
-                this.wifiProcessor.stopListening(); //error here?
-            } catch (Exception e) {
-                System.err.println("Wifi resumed before existing");
-            }
-            // Stop receiving location updates
-            this.gnssProcessor.stopUpdating();
-            try {
-                this.bleProcessor.stopListening();
-            } catch (Exception ignored) {}
-
+            listenersActive = false;
         }
+        wifiProcessor.stopListening();
+        gnssProcessor.stopUpdating();
+        bleProcessor.stopListening();
     }
 
     /**
@@ -2187,6 +2245,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.particleFilterEngine = createParticleFilterEngine();
         this.pfInitialized = false;
         this.latestFusedPose = null;
+        this.absoluteFloorTransitionResolver.reset();
         this.coordinateConverter = hasManualStartLocation && startLocation != null && startLocation.length >= 2
                 ? new CoordinateConverter(startLocation[0], startLocation[1])
                 : null;

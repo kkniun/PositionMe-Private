@@ -54,6 +54,7 @@ public class WifiDataProcessor implements Observable {
     private String lastToastMsg = "";
     private long lastToastTimeMs = 0L;
     private boolean isWifiReceiverRegistered = false;
+    private boolean isListening = false;
 
     // Application context for handling permissions and WifiManager instances
     private final Context context;
@@ -99,9 +100,9 @@ public class WifiDataProcessor implements Observable {
 //      //      wifiManager.setWifiEnabled(true);
 //      //  }
 
-        // Start wifi scan and return results via broadcast
-        if(permissionsGranted) {
-            this.scanWifiDataTimer.schedule(new scheduledWifiScan(), 0, SCAN_INTERVAL_MS);
+        if (!permissionsGranted) {
+            this.scanWifiDataTimer.cancel();
+            this.scanWifiDataTimer = null;
         }
 
         //Inform the user if wifi throttling is enabled on their device
@@ -238,6 +239,9 @@ public class WifiDataProcessor implements Observable {
      * broadcast receiver is registered to be called when the scan is complete.
      */
     private void startWifiScan() {
+        if (!isListening) {
+            return;
+        }
         //Check settings for wifi permissions
         if(checkWifiPermissions()) {
             long now = SystemClock.elapsedRealtime();
@@ -263,6 +267,10 @@ public class WifiDataProcessor implements Observable {
      * The method declares a new timer instance to schedule a scan for nearby wifis every 5 seconds.
      */
     public void startListening() {
+        if (isListening || !checkWifiPermissions()) {
+            return;
+        }
+        isListening = true;
         if (this.scanWifiDataTimer != null) {
             // 避免重复创建计时器导致扫描频率翻倍
             this.scanWifiDataTimer.cancel();
@@ -277,6 +285,10 @@ public class WifiDataProcessor implements Observable {
      * timer so that new scans are not initiated.
      */
     public void stopListening() {
+        if (!isListening && !isWifiReceiverRegistered && this.scanWifiDataTimer == null) {
+            return;
+        }
+        isListening = false;
         if (isWifiReceiverRegistered) {
             try {
                 context.unregisterReceiver(wifiScanReceiver);
@@ -289,6 +301,10 @@ public class WifiDataProcessor implements Observable {
             this.scanWifiDataTimer.cancel();
             this.scanWifiDataTimer = null;
         }
+    }
+
+    public boolean isListening() {
+        return isListening;
     }
 
     /**

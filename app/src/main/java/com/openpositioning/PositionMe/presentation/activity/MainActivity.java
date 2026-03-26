@@ -156,9 +156,8 @@ public class MainActivity extends AppCompatActivity implements Observer {
     public void onPause() {
         super.onPause();
 
-        //Ensure sensorFusion has been initialised before unregistering listeners
-        if(sensorFusion != null) {
-//            sensorFusion.stopListening();
+        if (sensorFusion != null && !sensorFusion.isRecordingInProgress()) {
+            sensorFusion.stopListening();
         }
     }
 

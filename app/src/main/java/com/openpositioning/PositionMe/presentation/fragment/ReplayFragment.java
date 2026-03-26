@@ -1,8 +1,5 @@
 package com.openpositioning.PositionMe.presentation.fragment;
 
-import android.graphics.Bitmap;
-import android.graphics.Color;
-import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.util.Log;
@@ -16,25 +13,10 @@ import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
-import androidx.lifecycle.ViewModelProvider;
-
-import com.bumptech.glide.Glide;
-import com.bumptech.glide.request.target.CustomTarget;
-import com.bumptech.glide.request.transition.Transition;
-import com.google.android.gms.maps.model.BitmapDescriptorFactory;
-import com.google.android.gms.maps.model.GroundOverlay;
-import com.google.android.gms.maps.model.GroundOverlayOptions;
 import com.google.android.gms.maps.model.LatLng;
-import com.google.android.gms.maps.model.LatLngBounds;
-import com.google.android.gms.maps.model.Polygon;
-import com.google.android.gms.maps.model.PolygonOptions;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.data.local.TrajParser;
 import com.openpositioning.PositionMe.presentation.activity.ReplayActivity;
-import com.openpositioning.PositionMe.viewmodels.MapViewModel;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -83,9 +65,6 @@ public class ReplayFragment extends Fragment {
     private int currentIndex = 0;
     private boolean isPlaying = false;
 
-    private MapViewModel mapViewModel;
-    private List<Polygon> venuePolygons = new ArrayList<>();
-    private GroundOverlay floorplanOverlay;
     private TextView replayFloorStatus;
     private TextView replayElevatorStatus;
 
@@ -144,16 +123,6 @@ public class ReplayFragment extends Fragment {
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
 
-        mapViewModel = new ViewModelProvider(this).get(MapViewModel.class);
-
-        mapViewModel.getFloorplanResponse().observe(getViewLifecycleOwner(), response -> {
-            if (response != null && trajectoryMapFragment.getMap() != null) {
-                Log.d(TAG, "Floorplan response received and observed by child fragment.");
-            } else {
-                Log.d(TAG, "Failed to fetch floorplans or no floorplans nearby.");
-            }
-        });
-
         trajectoryMapFragment = (TrajectoryMapFragment)
                 getChildFragmentManager().findFragmentById(R.id.replayMapFragmentContainer);
         if (trajectoryMapFragment == null) {
@@ -164,22 +133,20 @@ public class ReplayFragment extends Fragment {
                     .commit();
         }
 
-        trajectoryMapFragment.getMapAsync(googleMap -> {
-            googleMap.setOnPolygonClickListener(polygon -> {
-                Log.d(TAG, "A polygon was clicked!");
-                if (trajectoryMapFragment != null) {
-                    trajectoryMapFragment.handlePolygonClick(polygon);
-                }
-            });
+        LatLng replayStartLocation = getReplayStartLocation();
+        if (replayStartLocation != null) {
+            trajectoryMapFragment.primeIndoorMapContext(replayStartLocation);
+        }
 
+        trajectoryMapFragment.getMapAsync(googleMap -> {
             renderReplayTestPoints();
 
-            LatLng replayStartLocation = getReplayStartLocation();
             if (replayStartLocation != null) {
                 setupInitialMapPosition(
                         (float) replayStartLocation.latitude,
                         (float) replayStartLocation.longitude
                 );
+                trajectoryMapFragment.primeIndoorMapContext(replayStartLocation);
             } else {
                 Log.w(TAG, "Replay start location unavailable. Camera will remain at map default.");
             }
@@ -387,95 +354,5 @@ public class ReplayFragment extends Fragment {
     public void onDestroyView() {
         super.onDestroyView();
         playbackHandler.removeCallbacks(playbackRunnable);
-    }
-
-    /**
-     * Draws venue outlines on the map based on the API response.
-     *
-     * @param apiResponse The JSON object received from the floorplan API.
-     */
-    private void drawVenueOutlines(JsonObject apiResponse) {
-        for (Polygon p : venuePolygons) {
-            p.remove();
-        }
-        venuePolygons.clear();
-
-        JsonArray venues = apiResponse.getAsJsonArray("venues");
-        if (venues == null || trajectoryMapFragment.getMap() == null) return;
-
-        for (JsonElement venueElement : venues) {
-            JsonObject venue = venueElement.getAsJsonObject();
-            JsonArray outlineCoords = venue.getAsJsonObject("outline").getAsJsonArray("coordinates").get(0).getAsJsonArray();
-
-            PolygonOptions polygonOptions = new PolygonOptions()
-                    .strokeColor(Color.BLUE)
-                    .strokeWidth(5)
-                    .fillColor(Color.argb(50, 0, 0, 255))
-                    .clickable(true);
-
-            for (JsonElement coordElement : outlineCoords) {
-                JsonArray lngLat = coordElement.getAsJsonArray();
-                polygonOptions.add(new LatLng(lngLat.get(1).getAsDouble(), lngLat.get(0).getAsDouble()));
-            }
-
-            Polygon polygon = trajectoryMapFragment.getMap().addPolygon(polygonOptions);
-            polygon.setTag(venue);
-            venuePolygons.add(polygon);
-        }
-    }
-
-    /**
-     * Updates the selected venue and displays the first available floorplan.
-     *
-     * @param venueData The JSON data attached to the selected polygon.
-     */
-    private void selectVenue(JsonObject venueData) {
-        String venueId = venueData.get("id").getAsString();
-        Log.d(TAG, "Venue selected: " + venueId);
-
-        mapViewModel.setSelectedVenueId(venueId);
-
-        JsonArray floorplans = venueData.getAsJsonArray("floorplans");
-        if (floorplans != null && floorplans.size() > 0) {
-            JsonObject firstFloor = floorplans.get(0).getAsJsonObject();
-            displayFloorplan(firstFloor);
-        }
-    }
-
-    /**
-     * Displays a floorplan image as a ground overlay.
-     *
-     * @param floorplan The floor definition containing the image URL and bounding box.
-     */
-    private void displayFloorplan(JsonObject floorplan) {
-        if (floorplanOverlay != null) {
-            floorplanOverlay.remove();
-        }
-
-        String imageUrl = floorplan.get("url").getAsString();
-        JsonArray bbox = floorplan.getAsJsonArray("bbox");
-        LatLngBounds bounds = new LatLngBounds(
-                new LatLng(bbox.get(1).getAsDouble(), bbox.get(0).getAsDouble()),
-                new LatLng(bbox.get(3).getAsDouble(), bbox.get(2).getAsDouble())
-        );
-
-        Glide.with(this)
-                .asBitmap()
-                .load(imageUrl)
-                .into(new CustomTarget<Bitmap>() {
-                    @Override
-                    public void onResourceReady(@NonNull Bitmap resource, @Nullable Transition<? super Bitmap> transition) {
-                        if (trajectoryMapFragment.getMap() != null) {
-                            GroundOverlayOptions options = new GroundOverlayOptions()
-                                    .image(BitmapDescriptorFactory.fromBitmap(resource))
-                                    .positionFromBounds(bounds);
-                            floorplanOverlay = trajectoryMapFragment.getMap().addGroundOverlay(options);
-                        }
-                    }
-
-                    @Override
-                    public void onLoadCleared(@Nullable Drawable placeholder) {
-                    }
-                });
     }
 }

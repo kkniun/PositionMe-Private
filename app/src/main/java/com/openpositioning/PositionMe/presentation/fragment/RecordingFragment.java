@@ -26,6 +26,7 @@ import com.google.android.material.button.MaterialButton;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.content.ContextCompat;
 import androidx.fragment.app.Fragment;
 import androidx.preference.PreferenceManager;
 
@@ -75,7 +76,8 @@ public class RecordingFragment extends Fragment {
     private MaterialButton completeButton, cancelButton, addMarkerButton;
     private ImageView recIcon;
     private ProgressBar timeRemaining;
-    private TextView elevation, distanceTravelled, gnssError, floorStatus, elevatorStatus, systemStatus, lastUpdateTime, trackingContextHint;
+    private TextView elevation, distanceTravelled, gnssError, floorStatus, elevatorStatus,
+            systemStatus, lastUpdateTime, trackingConfidence, trackingContextHint;
 
     // Marker data  elements
     private final List<MarkerPoint> markerPoints = new ArrayList<>();
@@ -177,6 +179,7 @@ public class RecordingFragment extends Fragment {
         elevatorStatus = view.findViewById(R.id.elevatorStatus);
         systemStatus = view.findViewById(R.id.systemStatus);
         lastUpdateTime = view.findViewById(R.id.lastUpdateTime);
+        trackingConfidence = view.findViewById(R.id.trackingConfidence);
         trackingContextHint = view.findViewById(R.id.trackingContextHint);
 
         // Marker button and data
@@ -211,6 +214,7 @@ public class RecordingFragment extends Fragment {
         elevatorStatus.setText(getString(R.string.elevator_status_unknown));
         systemStatus.setText(getString(R.string.system_status_default));
         lastUpdateTime.setText(getString(R.string.last_update_default));
+        trackingConfidence.setText(getString(R.string.tracking_confidence_unknown));
         trackingContextHint.setVisibility(View.GONE);
 
         // Buttons
@@ -330,7 +334,13 @@ public class RecordingFragment extends Fragment {
      * Update the UI with sensor data and pass map updates to TrajectoryMapFragment.
      */
     private void updateUIandPosition() {
+        LatLng mapAnchor = getBestAvailableAbsoluteAnchor();
+        if (trajectoryMapFragment != null) {
+            trajectoryMapFragment.primeIndoorMapContext(mapAnchor);
+        }
+
         FusedPose fusedPose = sensorFusion.getLatestFusedPose();
+        updateTrackingConfidence(fusedPose);
         if (fusedPose == null) {
             floorStatus.setText(getString(R.string.floor_status_unknown));
             elevatorStatus.setText(getString(R.string.elevator_status_unknown));
@@ -341,8 +351,9 @@ public class RecordingFragment extends Fragment {
                             : R.string.system_status_no_pose)
             ));
             lastUpdateTime.setText(getString(R.string.last_update_value, getString(R.string.last_update_unknown)));
-            trackingContextHint.setVisibility(View.GONE);
+            updateTrackingContextHint(null);
             distanceTravelled.setVisibility(View.GONE);
+            updateObservationMarkers();
             if (sensorFusion.isWaitingForAbsoluteFix()) {
                 gnssError.setVisibility(View.VISIBLE);
                 gnssError.setText(getString(R.string.waiting_for_absolute_fix));
@@ -374,7 +385,7 @@ public class RecordingFragment extends Fragment {
                 R.string.last_update_value,
                 updateTimeFormat.format(new Date(fusedPose.getTimestampMs()))
         ));
-        updateTrackingContextHint();
+        updateTrackingContextHint(fusedPose);
 
         LatLng newLocation = sensorFusion.getLatLngForFusedPose(fusedPose);
         if (newLocation != null) {
@@ -409,25 +420,10 @@ public class RecordingFragment extends Fragment {
                 gnssError.setText(String.format(Locale.getDefault(), "%s %.2fm",
                         getString(R.string.gnss_error), errorDist));
             }
-            if (trajectoryMapFragment != null) {
-                trajectoryMapFragment.updateGNSS(gnssLocation);
-            }
         } else {
             gnssError.setVisibility(View.GONE);
         }
-
-        if (trajectoryMapFragment != null) {
-            LatLng wifiLocation = sensorFusion.getLatLngWifiPositioning();
-            if (wifiLocation != null) {
-                trajectoryMapFragment.updateWifiFix(wifiLocation, sensorFusion.getWifiFloor());
-            }
-
-            float[] pdrLocalPosition = sensorFusion.getSensorValueMap().get(SensorTypes.PDR);
-            LatLng pdrLocation = sensorFusion.getLatLngForLocalPosition(pdrLocalPosition);
-            if (pdrLocation != null) {
-                trajectoryMapFragment.updatePdrObservation(pdrLocation);
-            }
-        }
+        updateObservationMarkers();
 
         // Update previous
         previousLocalX = fusedPose.getX();
@@ -495,17 +491,128 @@ public class RecordingFragment extends Fragment {
         );
     }
 
-    private void updateTrackingContextHint() {
+    private void updateTrackingConfidence(@Nullable FusedPose fusedPose) {
+        if (trackingConfidence == null) {
+            return;
+        }
+        if (fusedPose == null) {
+            trackingConfidence.setText(getString(R.string.tracking_confidence_unknown));
+            trackingConfidence.setTextColor(ContextCompat.getColor(requireContext(), R.color.md_theme_secondary));
+            return;
+        }
+        int labelRes = resolveConfidenceLabel(fusedPose.getConfidence());
+        trackingConfidence.setText(getString(
+                R.string.tracking_confidence_value,
+                getString(labelRes),
+                fusedPose.getConfidence()
+        ));
+        trackingConfidence.setTextColor(ContextCompat.getColor(
+                requireContext(),
+                resolveConfidenceColor(fusedPose.getConfidence())
+        ));
+    }
+
+    private void updateTrackingContextHint(@Nullable FusedPose fusedPose) {
         if (trackingContextHint == null) {
             return;
         }
-        boolean hasAbsoluteTracking = sensorFusion.getCurrentGnssLatLng() != null
-                || sensorFusion.getLatLngWifiPositioning() != null;
-        boolean outsideMappedVenue = trajectoryMapFragment != null && !trajectoryMapFragment.isMappedVenueActive();
-        boolean showHint = hasAbsoluteTracking && outsideMappedVenue;
-        trackingContextHint.setVisibility(showHint ? View.VISIBLE : View.GONE);
-        if (showHint) {
-            trackingContextHint.setText(getString(R.string.tracking_context_fallback));
+        TrajectoryMapFragment.MapMatchingUiState mapState = trajectoryMapFragment == null
+                ? inferMapStateWithoutFragment()
+                : trajectoryMapFragment.getMapMatchingUiState();
+        boolean smoothingEnabled = trajectoryMapFragment != null
+                && trajectoryMapFragment.isDisplaySmoothingEnabled();
+        boolean lowConfidence = fusedPose != null && fusedPose.getConfidence() < 0.40;
+
+        int hintRes;
+        switch (mapState) {
+            case WAITING_FOR_ABSOLUTE_FIX:
+                hintRes = R.string.map_constraints_waiting_hint;
+                break;
+            case PENDING:
+                hintRes = R.string.map_constraints_pending_hint;
+                break;
+            case UNAVAILABLE:
+                hintRes = R.string.map_constraints_unavailable_hint;
+                break;
+            case ACTIVE:
+            default:
+                if (lowConfidence && smoothingEnabled) {
+                    hintRes = R.string.map_constraints_active_low_confidence_smoothing_hint;
+                } else if (lowConfidence) {
+                    hintRes = R.string.map_constraints_active_low_confidence_hint;
+                } else if (smoothingEnabled) {
+                    hintRes = R.string.map_constraints_active_smoothing_hint;
+                } else {
+                    hintRes = R.string.map_constraints_active_hint;
+                }
+                break;
+        }
+        trackingContextHint.setVisibility(View.VISIBLE);
+        trackingContextHint.setText(getString(hintRes));
+    }
+
+    @NonNull
+    private TrajectoryMapFragment.MapMatchingUiState inferMapStateWithoutFragment() {
+        if (getBestAvailableAbsoluteAnchor() == null) {
+            return TrajectoryMapFragment.MapMatchingUiState.WAITING_FOR_ABSOLUTE_FIX;
+        }
+        return TrajectoryMapFragment.MapMatchingUiState.PENDING;
+    }
+
+    private int resolveConfidenceLabel(double confidence) {
+        if (confidence >= 0.65) {
+            return R.string.tracking_confidence_high;
+        }
+        if (confidence >= 0.40) {
+            return R.string.tracking_confidence_medium;
+        }
+        return R.string.tracking_confidence_low;
+    }
+
+    private int resolveConfidenceColor(double confidence) {
+        if (confidence >= 0.65) {
+            return R.color.md_theme_secondary;
+        }
+        if (confidence >= 0.40) {
+            return R.color.md_theme_tertiary;
+        }
+        return R.color.md_theme_error;
+    }
+
+    @Nullable
+    private LatLng getBestAvailableAbsoluteAnchor() {
+        LatLng gnssLocation = sensorFusion.getCurrentGnssLatLng();
+        if (gnssLocation != null) {
+            return gnssLocation;
+        }
+        LatLng wifiLocation = sensorFusion.getLatLngWifiPositioning();
+        if (wifiLocation != null) {
+            return wifiLocation;
+        }
+        float[] start = sensorFusion.getGNSSLatitude(true);
+        if (start != null && start.length >= 2 && !(start[0] == 0f && start[1] == 0f)) {
+            return new LatLng(start[0], start[1]);
+        }
+        return null;
+    }
+
+    private void updateObservationMarkers() {
+        if (trajectoryMapFragment == null) {
+            return;
+        }
+        LatLng gnssLocation = sensorFusion.getCurrentGnssLatLng();
+        if (gnssLocation != null) {
+            trajectoryMapFragment.updateGNSS(gnssLocation);
+        }
+        LatLng wifiLocation = sensorFusion.getLatLngWifiPositioning();
+        if (wifiLocation != null) {
+            trajectoryMapFragment.updateWifiFix(wifiLocation, sensorFusion.getWifiFloor());
+        }
+
+        float[] pdrLocalPosition = sensorFusion.getSensorValueMap().get(SensorTypes.PDR);
+        LatLng pdrLocation = sensorFusion.getLatLngForLocalPosition(pdrLocalPosition);
+        if (pdrLocation != null) {
+            trajectoryMapFragment.updatePdrObservation(pdrLocation);
         }
     }
 
@@ -525,7 +632,9 @@ public class RecordingFragment extends Fragment {
     public void onPause() {
         super.onPause();
         refreshDataHandler.removeCallbacks(refreshDataTask);
-        sensorFusion.stopListening();
+        if (!sensorFusion.isRecordingInProgress()) {
+            sensorFusion.stopListening();
+        }
     }
 
     @Override

@@ -130,11 +130,21 @@
             </LinearLayout>
 
             <TextView
+                android:id="@+id/trackingConfidence"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/tracking_confidence_unknown"
+                android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                android:textColor="@color/md_theme_secondary"
+                android:textStyle="bold" />
+
+            <TextView
                 android:id="@+id/trackingContextHint"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="@string/tracking_context_fallback"
+                android:text="@string/map_constraints_waiting_hint"
                 android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                 android:textColor="@color/md_theme_tertiary"
                 android:visibility="gone" />

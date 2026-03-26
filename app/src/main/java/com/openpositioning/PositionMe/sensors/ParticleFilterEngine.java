@@ -223,12 +223,13 @@ public class ParticleFilterEngine {
             long timestampMs,
             double accuracyMeters
     ) {
+        Integer acceptedFloorPrior = sanitizeAbsoluteFloorPrior(fixX, fixY, floorPrior);
         lastAbsoluteFixReanchored = false;
         if (particles.isEmpty()) {
             initialize(
                     fixX,
                     fixY,
-                    resolveInitializationFloor(floorPrior),
+                    resolveInitializationFloor(acceptedFloorPrior),
                     timestampMs,
                     0.0,
                     DEFAULT_PARTICLE_COUNT,
@@ -240,7 +241,7 @@ public class ParticleFilterEngine {
         double measurementStdMeters = sanitizeAccuracyMeters(accuracyMeters);
         if (shouldReanchorToAbsoluteFix(fixX, fixY, measurementStdMeters)) {
             lastAbsoluteFixReanchored = true;
-            reanchorToAbsoluteFix(fixX, fixY, floorPrior, timestampMs, measurementStdMeters);
+            reanchorToAbsoluteFix(fixX, fixY, acceptedFloorPrior, timestampMs, measurementStdMeters);
             return;
         }
 
@@ -250,7 +251,7 @@ public class ParticleFilterEngine {
             double dy = particle.getY() - fixY;
             double distanceSq = dx * dx + dy * dy;
             double spatialLikelihood = Math.exp(-0.5 * distanceSq / variance);
-            double floorLikelihood = getFloorLikelihood(particle.getFloor(), floorPrior);
+            double floorLikelihood = getFloorLikelihood(particle.getFloor(), acceptedFloorPrior);
             double updatedWeight = sanitizeWeight(particle.getWeight()) * spatialLikelihood * floorLikelihood;
             particle.setWeight(Math.max(updatedWeight, MIN_WEIGHT));
         }
@@ -451,6 +452,29 @@ public class ParticleFilterEngine {
         ));
         lastTimestampMs = timestampMs;
         normalizeWeights();
+    }
+
+    @Nullable
+    private Integer sanitizeAbsoluteFloorPrior(double fixX, double fixY, @Nullable Integer floorPrior) {
+        if (floorPrior == null || particles.isEmpty() || floorTransitionGate == null) {
+            return floorPrior;
+        }
+        int currentFloor = resolveDominantFloor();
+        if (floorPrior == currentFloor) {
+            return floorPrior;
+        }
+        FusedPose currentPose = estimatePose();
+        if (currentPose == null) {
+            return null;
+        }
+        return floorTransitionGate.allowsFloorChange(
+                currentPose.getX(),
+                currentPose.getY(),
+                fixX,
+                fixY,
+                currentFloor,
+                floorPrior
+        ) ? floorPrior : null;
     }
 
     private double estimateCircularMeanHeading() {

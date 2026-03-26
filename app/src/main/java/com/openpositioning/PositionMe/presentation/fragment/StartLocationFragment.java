@@ -26,9 +26,11 @@ import com.openpositioning.PositionMe.utils.NucleusBuildingManager;
 import com.google.android.material.textfield.TextInputEditText;
 
 /**
- * A simple {@link Fragment} subclass. The startLocation fragment is displayed before the trajectory
- * recording starts. This fragment displays a map in which the user can adjust their location to
- * correct the PDR when it is complete
+ * Legacy developer-only manual-start fragment.
+ *
+ * <p>The default recording flow no longer routes through this screen; the primary runtime path now
+ * starts recording directly and initializes from live absolute fixes. This fragment is kept only
+ * as an isolated manual tool.
  *
  * @author Virginia Cangelosi
  * @see HomeFragment the previous fragment in the nav graph.

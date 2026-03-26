@@ -27,6 +27,8 @@ public class GNSSDataProcessor {
     private LocationManager locationManager;
     // Location listener to receive the location data broadcast by the system
     private LocationListener locationListener;
+    private boolean gpsUpdatesActive;
+    private boolean networkUpdatesActive;
 
     private static final long TOAST_DEBOUNCE_MS = 8000;
     private String lastToastMsg = "";
@@ -66,10 +68,8 @@ public class GNSSDataProcessor {
         if (!locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
             showDebouncedToast("Enable Cellular", Toast.LENGTH_SHORT);
         }
-        // Start location updates
-        if (permissionsGranted) {
-            startLocationUpdates();
-        }
+        gpsUpdatesActive = false;
+        networkUpdatesActive = false;
     }
 
     /**
@@ -103,18 +103,27 @@ public class GNSSDataProcessor {
      */
     @SuppressLint("MissingPermission")
     public void startLocationUpdates() {
-        //if (sharedPreferences.getBoolean("location", true)) {
         boolean permissionGranted = checkLocationPermissions();
-        if (permissionGranted && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) &&
-                locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)){
-
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, locationListener);
-            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, locationListener);
+        if (!permissionGranted) {
+            return;
         }
-        else if(permissionGranted && !locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)){
+
+        boolean gpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
+        boolean networkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+
+        if (gpsEnabled && !gpsUpdatesActive) {
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, locationListener);
+            gpsUpdatesActive = true;
+        }
+        if (networkEnabled && !networkUpdatesActive) {
+            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, locationListener);
+            networkUpdatesActive = true;
+        }
+
+        if (!gpsEnabled) {
             showDebouncedToast("Open GPS", Toast.LENGTH_LONG);
         }
-        else if(permissionGranted && !locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)){
+        if (!networkEnabled) {
             showDebouncedToast("Turn on WiFi", Toast.LENGTH_LONG);
         }
     }
@@ -123,7 +132,16 @@ public class GNSSDataProcessor {
      * Stops updates to the location listener via the location manager.
      */
     public void stopUpdating() {
+        if (!gpsUpdatesActive && !networkUpdatesActive) {
+            return;
+        }
         locationManager.removeUpdates(locationListener);
+        gpsUpdatesActive = false;
+        networkUpdatesActive = false;
+    }
+
+    public boolean isListening() {
+        return gpsUpdatesActive || networkUpdatesActive;
     }
 
     private void showDebouncedToast(String message, int duration) {
