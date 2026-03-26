@@ -73,6 +73,7 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double HEADING_MOVEMENT_MIN_DISTANCE_M = 0.8;
     private static final float HEADING_SENSOR_SMOOTH_ALPHA = 0.15f;
     private static final float HEADING_COURSE_BLEND_ALPHA = 0.35f;
+    private static final float FUSED_ICON_HEADING_OFFSET_DEG = 0f;
     private static final float DISABLED_ACTION_ALPHA = 0.4f;
     private static final float ENABLED_ACTION_ALPHA = 1f;
     private static final float DEFAULT_WAITING_CAMERA_ZOOM = 17.2f;
@@ -111,6 +112,7 @@ public class TrajectoryMapFragment extends Fragment {
     private LatLng lastHeadingLocation;
     private float filteredHeadingDeg = Float.NaN;
     private long lastFusedTrajectoryUpdateTimestampMs = -1L;
+    private boolean fusedTrajectoryDrawingEnabled = true;
 
     private BitmapDescriptor fusedMarkerIcon;
     private BitmapDescriptor gnssObservationIcon;
@@ -378,9 +380,8 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     public void updateGNSS(@NonNull LatLng gnssLocation) {
-        addObservationMarker(
+        upsertLatestObservationMarker(
                 gnssObservationMarkers,
-                lastGnssObservation,
                 gnssLocation,
                 "GNSS Position",
                 null,
@@ -392,9 +393,8 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     public void updateWifiFix(@NonNull LatLng wifiLocation, int floor) {
-        addObservationMarker(
+        upsertLatestObservationMarker(
                 wifiObservationMarkers,
-                lastWifiObservation,
                 wifiLocation,
                 "WiFi Position",
                 "Floor " + floor,
@@ -463,6 +463,14 @@ public class TrajectoryMapFragment extends Fragment {
         return indoorMapManager.getCurrentFloorLabel();
     }
 
+    @Nullable
+    public Integer getCurrentDisplayedFloorSemanticLevel() {
+        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
+            return null;
+        }
+        return indoorMapManager.getCurrentFloorSemanticLevel();
+    }
+
     public void syncDisplayedFloor(int floor) {
         if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
             return;
@@ -527,6 +535,16 @@ public class TrajectoryMapFragment extends Fragment {
         updateWaitingStateUi();
     }
 
+    public void setFusedTrajectoryDrawingEnabled(boolean enabled, boolean resetExistingPath) {
+        fusedTrajectoryDrawingEnabled = enabled;
+        if (resetExistingPath) {
+            fusedTrajectoryRawPoints.clear();
+            lastFusedTrajectoryRawLocation = null;
+            lastFusedTrajectoryUpdateTimestampMs = -1L;
+            refreshFusedTrajectoryPolyline();
+        }
+    }
+
     public void getMapAsync(OnMapReadyCallback callback) {
         if (gMap != null) {
             callback.onMapReady(gMap);
@@ -578,7 +596,7 @@ public class TrajectoryMapFragment extends Fragment {
             fusedMarker.setPosition(displayedLocation);
         }
         if (fusedMarker != null) {
-            fusedMarker.setRotation(orientation);
+            fusedMarker.setRotation(normalizeDegrees(orientation + FUSED_ICON_HEADING_OFFSET_DEG));
             fusedMarker.setVisible(isFusedOn);
         }
     }
@@ -639,6 +657,9 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     private void maybeAppendFusedTrajectory(@NonNull LatLng rawLocation, long timestampMs) {
+        if (!fusedTrajectoryDrawingEnabled) {
+            return;
+        }
         if (fusedTrajectoryRawPoints.isEmpty()) {
             fusedTrajectoryRawPoints.add(rawLocation);
             lastFusedTrajectoryRawLocation = rawLocation;
@@ -743,6 +764,40 @@ public class TrajectoryMapFragment extends Fragment {
         while (markers.size() > MAX_RAW_OBSERVATIONS) {
             Marker oldest = markers.removeFirst();
             oldest.remove();
+        }
+    }
+
+    private void upsertLatestObservationMarker(
+            @NonNull ArrayDeque<Marker> markers,
+            @NonNull LatLng newLocation,
+            @NonNull String title,
+            @Nullable String snippet,
+            @NonNull BitmapDescriptor icon,
+            boolean visible,
+            float zIndex
+    ) {
+        if (gMap == null) {
+            return;
+        }
+        Marker marker = markers.peekLast();
+        if (marker != null) {
+            marker.setPosition(newLocation);
+            marker.setTitle(title);
+            marker.setSnippet(snippet);
+            marker.setVisible(visible);
+            marker.setZIndex(zIndex);
+            return;
+        }
+        Marker created = gMap.addMarker(new MarkerOptions()
+                .position(newLocation)
+                .title(title)
+                .snippet(snippet)
+                .anchor(0.5f, 0.5f)
+                .zIndex(zIndex)
+                .icon(icon)
+                .visible(visible));
+        if (created != null) {
+            markers.addLast(created);
         }
     }
 

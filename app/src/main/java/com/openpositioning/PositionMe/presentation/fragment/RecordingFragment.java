@@ -100,6 +100,7 @@ public class RecordingFragment extends Fragment {
     private CountDownTimer autoStop;
     private long headingDbgUiLastLogMs = 0;
     private static final long AUTO_FLOOR_STABLE_MS = 1200L;
+    private static final long INITIAL_TRAJECTORY_DRAW_DELAY_MS = 5000L;
     private Integer pendingAutoFloorSemantic = null;
     private long pendingAutoFloorSinceMs = 0L;
 
@@ -118,6 +119,14 @@ public class RecordingFragment extends Fragment {
             updateUIandPosition();
             // Loop again
             refreshDataHandler.postDelayed(refreshDataTask, 200);
+        }
+    };
+    private final Runnable enableTrajectoryDrawingTask = new Runnable() {
+        @Override
+        public void run() {
+            if (trajectoryMapFragment != null) {
+                trajectoryMapFragment.setFusedTrajectoryDrawingEnabled(true, true);
+            }
         }
     };
 
@@ -164,6 +173,11 @@ public class RecordingFragment extends Fragment {
                     .beginTransaction()
                     .replace(R.id.trajectoryMapFragmentContainer, trajectoryMapFragment)
                     .commit();
+        }
+        if (trajectoryMapFragment != null) {
+            trajectoryMapFragment.setFusedTrajectoryDrawingEnabled(false, true);
+            refreshDataHandler.removeCallbacks(enableTrajectoryDrawingTask);
+            refreshDataHandler.postDelayed(enableTrajectoryDrawingTask, INITIAL_TRAJECTORY_DRAW_DELAY_MS);
         }
 
         // Initialize UI references
@@ -465,28 +479,17 @@ public class RecordingFragment extends Fragment {
         return getString(R.string.floor_status_value, floor);
     }
 
-    /**
-     * Auto-floor strategy (WiFi-first only):
-     * - Only WiFi floor is allowed to drive map floor switching.
-     * - Fused/barometric floors are intentionally ignored here.
-     */
     private void maybeSyncDisplayedFloorFromWifi() {
         if (trajectoryMapFragment == null || !trajectoryMapFragment.isMappedVenueActive()) {
             return;
         }
-        if (sensorFusion.getLatLngWifiPositioning() == null) {
-            // Keep current displayed floor while WiFi floor is temporarily unavailable.
+        Integer candidateFloor = resolveAutoFloorCandidate();
+        if (candidateFloor == null) {
             pendingAutoFloorSemantic = null;
             return;
         }
-        int candidateFloor = sensorFusion.getWifiFloor();
-        String currentLabel = trajectoryMapFragment.getCurrentDisplayedFloorLabel();
-        String candidateLabel = trajectoryMapFragment.getFloorDisplayLabelFor(candidateFloor);
-        if (candidateLabel == null || candidateLabel.isEmpty()) {
-            pendingAutoFloorSemantic = null;
-            return;
-        }
-        if (candidateLabel.equals(currentLabel)) {
+        Integer currentSemanticFloor = trajectoryMapFragment.getCurrentDisplayedFloorSemanticLevel();
+        if (currentSemanticFloor != null && currentSemanticFloor == candidateFloor) {
             pendingAutoFloorSemantic = null;
             return;
         }
@@ -501,6 +504,18 @@ public class RecordingFragment extends Fragment {
             trajectoryMapFragment.syncDisplayedFloor(candidateFloor);
             pendingAutoFloorSemantic = null;
         }
+    }
+
+    @Nullable
+    private Integer resolveAutoFloorCandidate() {
+        if (sensorFusion.getLatLngWifiPositioning() != null) {
+            return sensorFusion.getWifiFloor();
+        }
+        FusedPose fusedPose = sensorFusion.getLatestFusedPose();
+        if (fusedPose != null) {
+            return fusedPose.getFloor();
+        }
+        return null;
     }
 
     private float normalizeHeadingDeg(double headingDeg) {
@@ -551,6 +566,7 @@ public class RecordingFragment extends Fragment {
     public void onPause() {
         super.onPause();
         refreshDataHandler.removeCallbacks(refreshDataTask);
+        refreshDataHandler.removeCallbacks(enableTrajectoryDrawingTask);
         sensorFusion.stopListening();
     }
 
@@ -567,6 +583,7 @@ public class RecordingFragment extends Fragment {
     @Override
     public void onDestroyView() {
         super.onDestroyView();
+        refreshDataHandler.removeCallbacks(enableTrajectoryDrawingTask);
         Activity activity = getActivity();
         boolean isFinishing = activity != null && activity.isFinishing();
         boolean isChangingConfig = activity != null && activity.isChangingConfigurations();

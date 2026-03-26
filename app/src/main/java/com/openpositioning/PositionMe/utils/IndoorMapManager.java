@@ -265,6 +265,25 @@ public class IndoorMapManager {
     }
 
     @Nullable
+    public Integer getCurrentFloorSemanticLevel() {
+        VenueModel selected = getSelectedVenue();
+        if (selected == null) {
+            return null;
+        }
+        if (!selected.floors.isEmpty()) {
+            int bounded = Math.max(0, Math.min(currentFloor, selected.floors.size() - 1));
+            return selected.floors.get(bounded).floorIndex;
+        }
+        List<String> keys = getShapeFloorKeys(selected);
+        if (keys.isEmpty()) {
+            return null;
+        }
+        int bounded = Math.max(0, Math.min(currentFloor, keys.size() - 1));
+        Double rank = parseFloorLabelRank(keys.get(bounded));
+        return rank == null ? null : (int) Math.round(rank);
+    }
+
+    @Nullable
     public String getFloorLabelForIndex(int floorIndex) {
         VenueModel selected = getSelectedVenue();
         if (selected == null) {

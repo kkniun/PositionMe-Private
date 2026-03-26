@@ -18,7 +18,9 @@ public class ParticleFilterEngine {
 
     private static final int DEFAULT_PARTICLE_COUNT = 100;
     private static final double DEFAULT_INITIAL_STD_M = 2.0;
-    private static final double DEFAULT_PREDICTION_NOISE_STD_M = 0.35;
+    private static final double DEFAULT_PREDICTION_NOISE_STD_M = 0.15;
+    private static final double MIN_PREDICTION_NOISE_STD_M = 0.03;
+    private static final double PREDICTION_NOISE_SCALE_WITH_STEP = 0.18;
     private static final double DEFAULT_HEADING_NOISE_STD_RAD = Math.toRadians(4.0);
     private static final double DEFAULT_ABSOLUTE_FIX_STD_M = 4.0;
     private static final double FLOOR_MISMATCH_PENALTY = 0.2;
@@ -28,6 +30,8 @@ public class ParticleFilterEngine {
     private static final double MIN_RECOVERY_DISTANCE_M = 8.0;
     private static final double MIN_SUPPORT_WEIGHT_RATIO = 0.2;
     private static final double MIN_HEIGHT_DELTA_FOR_FLOOR_CHANGE_M = 1.5;
+    private static final int PATH_VALIDATION_SAMPLES = 6;
+    private static final double MIN_STAIRS_STEP_LENGTH_M = 0.25;
 
     private final ParticleInitializer particleInitializer;
     private final ParticleInitializer.SpawnValidator spawnValidator;
@@ -134,9 +138,14 @@ public class ParticleFilterEngine {
             return;
         }
 
-        double stepLengthMeters = delta.getStepLengthMeters();
+        double stepLengthMeters = Math.max(0.0, delta.getStepLengthMeters());
         double deltaHeadingRad = delta.getDeltaHeadingRad();
         double heightDeltaMeters = delta.getHeightDeltaMeters();
+            boolean elevatorLikely = delta.isElevatorLikely();
+        double predictionNoiseStd = Math.max(
+                MIN_PREDICTION_NOISE_STD_M,
+                Math.min(DEFAULT_PREDICTION_NOISE_STD_M, stepLengthMeters * PREDICTION_NOISE_SCALE_WITH_STEP)
+        );
         for (Particle particle : particles) {
             double previousX = particle.getX();
             double previousY = particle.getY();
@@ -151,11 +160,17 @@ public class ParticleFilterEngine {
             double[] localStep = PdrProcessing.projectStepToLocalFrame(stepLengthMeters, predictedHeadingRad);
             double predictedX = previousX
                     + localStep[0]
-                    + random.nextGaussian() * DEFAULT_PREDICTION_NOISE_STD_M;
+                    + random.nextGaussian() * predictionNoiseStd;
             double predictedY = previousY
                     + localStep[1]
-                    + random.nextGaussian() * DEFAULT_PREDICTION_NOISE_STD_M;
-            int predictedFloor = resolvePredictedFloor(previousFloor, floor, heightDeltaMeters);
+                    + random.nextGaussian() * predictionNoiseStd;
+            int predictedFloor = resolvePredictedFloor(
+                    previousFloor,
+                    floor,
+                    heightDeltaMeters,
+                    stepLengthMeters,
+                    elevatorLikely
+            );
 
             if (predictedFloor != previousFloor
                     && floorTransitionGate != null
@@ -170,8 +185,15 @@ public class ParticleFilterEngine {
                 predictedFloor = previousFloor;
             }
 
-            // Map matching / walls: reject illegal (x,y,floor).
-            if (!spawnValidator.isValid(predictedX, predictedY, predictedFloor)) {
+            // Map matching / walls: reject illegal end state and wall-crossing trajectories.
+            if (!isPathPredictionValid(
+                    previousX,
+                    previousY,
+                    previousFloor,
+                    predictedX,
+                    predictedY,
+                    predictedFloor
+            )) {
                 predictedX = previousX;
                 predictedY = previousY;
                 predictedFloor = previousFloor;
@@ -462,7 +484,13 @@ public class ParticleFilterEngine {
         return weight;
     }
 
-    private int resolvePredictedFloor(int previousFloor, int externalFloor, double heightDeltaMeters) {
+    private int resolvePredictedFloor(
+            int previousFloor,
+            int externalFloor,
+            double heightDeltaMeters,
+            double stepLengthMeters,
+            boolean elevatorLikely
+    ) {
         // Step 1 keeps barometer/PDR floor as a conservative prior. A tiny vertical delta should
         // not snap the whole cloud onto a new floor during normal planar tracking.
         if (externalFloor == previousFloor) {
@@ -471,7 +499,38 @@ public class ParticleFilterEngine {
         if (Math.abs(heightDeltaMeters) < MIN_HEIGHT_DELTA_FOR_FLOOR_CHANGE_M) {
             return previousFloor;
         }
+        // Distinguish stairs/lift at motion-model level:
+        // - elevator-like transitions can happen with almost no horizontal movement;
+        // - stair transitions should include at least small horizontal displacement.
+        if (!elevatorLikely && stepLengthMeters < MIN_STAIRS_STEP_LENGTH_M) {
+            return previousFloor;
+        }
         return externalFloor;
+    }
+
+    private boolean isPathPredictionValid(
+            double fromX,
+            double fromY,
+            int fromFloor,
+            double toX,
+            double toY,
+            int toFloor
+    ) {
+        if (!spawnValidator.isValid(toX, toY, toFloor)) {
+            return false;
+        }
+        if (fromFloor != toFloor) {
+            return true;
+        }
+        for (int i = 1; i < PATH_VALIDATION_SAMPLES; i++) {
+            double t = i / (double) PATH_VALIDATION_SAMPLES;
+            double sampleX = fromX + ((toX - fromX) * t);
+            double sampleY = fromY + ((toY - fromY) * t);
+            if (!spawnValidator.isValid(sampleX, sampleY, toFloor)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private int resolveInitializationFloor(@Nullable Integer floorPrior) {

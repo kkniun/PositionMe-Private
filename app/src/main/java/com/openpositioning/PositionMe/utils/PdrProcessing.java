@@ -9,6 +9,7 @@ import androidx.preference.PreferenceManager;
 import com.openpositioning.PositionMe.sensors.PdrDelta;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -38,7 +39,23 @@ public class PdrProcessing {
     private static final float movementThreshold = 0.3f; // m/s^2
     // Threshold under which movement is considered non-existent
     private static final float epsilon = 0.18f;
-    private static final int MIN_REQUIRED_SAMPLES = 2;
+    private static final int MIN_REQUIRED_SAMPLES = 8;
+    private static final float MIN_STEP_LENGTH_M = 0.20f;
+    private static final float MAX_STEP_LENGTH_M = 0.90f;
+    private static final float STEP_LENGTH_SMOOTHING_ALPHA = 0.28f;
+    private static final float STEP_LENGTH_GAIN = 0.88f;
+    private static final float CADENCE_REFERENCE_HZ = 1.8f;
+    private static final float CADENCE_FACTOR_MIN = 0.82f;
+    private static final float CADENCE_FACTOR_MAX = 1.24f;
+    private static final long DEFAULT_STEP_INTERVAL_MS = 520L;
+    private static final long MIN_STEP_INTERVAL_MS = 280L;
+    private static final float MIN_DYNAMIC_RANGE_FOR_STEP = 0.08f;
+    private static final float ELEVATOR_STEP_SUPPRESSION = 0.75f;
+    private static final float MIN_STEP_SCALE = 0.75f;
+    private static final float MAX_STEP_SCALE = 1.40f;
+    private static final float BASE_STEP_SCALE_CALIBRATION_ALPHA = 0.08f;
+    private static final float MIN_CALIBRATION_FIX_QUALITY_M = 15.0f;
+    private static final float MIN_CALIBRATION_DISPLACEMENT_M = 3.0f;
     //endregion
 
     //region Instance variables
@@ -72,6 +89,13 @@ public class PdrProcessing {
     // Step sum and length aggregation variables
     private float sumStepLength = 0;
     private int stepCount = 0;
+    private float adaptiveStepScale = 1.0f;
+    private final CircularFloatBuffer recentStepLengthBuffer = new CircularFloatBuffer(6);
+    private boolean calibrationAnchorReady = false;
+    private float anchorPdrX = 0f;
+    private float anchorPdrY = 0f;
+    private float anchorFusedX = 0f;
+    private float anchorFusedY = 0f;
     //endregion
 
     /**
@@ -150,12 +174,43 @@ public class PdrProcessing {
             float deltaHeadingRad,
             float heightDeltaMeters
     ) {
-        float computedStepLength = computeStepLength(accelMagnitudeOvertime);
+        return buildStepDelta(
+                accelMagnitudeOvertime,
+                deltaHeadingRad,
+                heightDeltaMeters,
+                false,
+                DEFAULT_STEP_INTERVAL_MS
+        );
+    }
+
+    public PdrDelta buildStepDelta(
+            List<Double> accelMagnitudeOvertime,
+            float deltaHeadingRad,
+            float heightDeltaMeters,
+            boolean elevatorLikely
+    ) {
+        return buildStepDelta(
+                accelMagnitudeOvertime,
+                deltaHeadingRad,
+                heightDeltaMeters,
+                elevatorLikely,
+                DEFAULT_STEP_INTERVAL_MS
+        );
+    }
+
+    public PdrDelta buildStepDelta(
+            List<Double> accelMagnitudeOvertime,
+            float deltaHeadingRad,
+            float heightDeltaMeters,
+            boolean elevatorLikely,
+            long stepIntervalMs
+    ) {
+        float computedStepLength = computeStepLength(accelMagnitudeOvertime, elevatorLikely, stepIntervalMs);
         if (computedStepLength > 0f) {
             sumStepLength += computedStepLength;
             stepCount++;
         }
-        return new PdrDelta(computedStepLength, deltaHeadingRad, heightDeltaMeters);
+        return new PdrDelta(computedStepLength, deltaHeadingRad, heightDeltaMeters, elevatorLikely);
     }
 
     /**
@@ -275,7 +330,11 @@ public class PdrProcessing {
         return bounce * K * 2;
     }
 
-    private float computeStepLength(List<Double> accelMagnitudeOvertime) {
+    private float computeStepLength(
+            List<Double> accelMagnitudeOvertime,
+            boolean elevatorLikely,
+            long stepIntervalMs
+    ) {
         if (useManualStep) {
             return this.stepLength;
         }
@@ -285,8 +344,96 @@ public class PdrProcessing {
         if (accelMagnitudeOvertime.isEmpty()) {
             return 0f;
         }
-        this.stepLength = weibergMinMax(accelMagnitudeOvertime);
+        float rawStep = robustWeibergStep(accelMagnitudeOvertime);
+        float cadenceFactor = computeCadenceFactor(stepIntervalMs);
+        float scaledStep;
+        if (rawStep > 0f) {
+            scaledStep = rawStep * STEP_LENGTH_GAIN * cadenceFactor * adaptiveStepScale;
+        } else {
+            // Keep moving when step detector fires but waveform quality is poor.
+            // This avoids "stuck in place" behaviour under noisy linear acceleration streams.
+            float baseStride = this.stepLength > 0f ? this.stepLength : 0.68f;
+            scaledStep = baseStride * cadenceFactor * adaptiveStepScale;
+        }
+        if (elevatorLikely) {
+            scaledStep *= ELEVATOR_STEP_SUPPRESSION;
+        }
+        float smoothedStep = scaledStep;
+        if (this.stepLength > 0f) {
+            smoothedStep = STEP_LENGTH_SMOOTHING_ALPHA * scaledStep
+                    + (1f - STEP_LENGTH_SMOOTHING_ALPHA) * this.stepLength;
+        }
+        this.stepLength = clamp(applyRecentStepMedianGuard(smoothedStep), MIN_STEP_LENGTH_M, MAX_STEP_LENGTH_M);
+        recentStepLengthBuffer.putNewest(this.stepLength);
         return this.stepLength;
+    }
+
+    private float robustWeibergStep(List<Double> accelMagnitudeOvertime) {
+        List<Double> validAccel = accelMagnitudeOvertime.stream()
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        if (validAccel.size() < MIN_REQUIRED_SAMPLES) {
+            return 0f;
+        }
+        List<Double> sorted = new ArrayList<>(validAccel);
+        Collections.sort(sorted);
+
+        double p10 = percentile(sorted, 0.10);
+        double p90 = percentile(sorted, 0.90);
+        if (Double.isNaN(p10) || Double.isNaN(p90) || p90 <= p10) {
+            return 0f;
+        }
+        if ((p90 - p10) < MIN_DYNAMIC_RANGE_FOR_STEP) {
+            return 0f;
+        }
+
+        float bounce = (float) Math.pow((p90 - p10), 0.25);
+        float k = K;
+        if (this.settings.getBoolean("overwrite_constants", false)) {
+            k = Float.parseFloat(settings.getString("weiberg_k", "0.934"));
+        }
+        return bounce * k * 2f;
+    }
+
+    private double percentile(List<Double> sortedValues, double percentile) {
+        if (sortedValues == null || sortedValues.isEmpty()) {
+            return Double.NaN;
+        }
+        double bounded = Math.max(0.0, Math.min(1.0, percentile));
+        double index = bounded * (sortedValues.size() - 1);
+        int lower = (int) Math.floor(index);
+        int upper = (int) Math.ceil(index);
+        if (lower == upper) {
+            return sortedValues.get(lower);
+        }
+        double weight = index - lower;
+        return sortedValues.get(lower) * (1.0 - weight) + sortedValues.get(upper) * weight;
+    }
+
+    private float clamp(float value, float minValue, float maxValue) {
+        return Math.max(minValue, Math.min(maxValue, value));
+    }
+
+    private float computeCadenceFactor(long stepIntervalMs) {
+        long safeInterval = Math.max(MIN_STEP_INTERVAL_MS, stepIntervalMs);
+        float cadenceHz = 1000f / safeInterval;
+        float cadenceFactor = (float) Math.pow(cadenceHz / CADENCE_REFERENCE_HZ, 0.22);
+        return clamp(cadenceFactor, CADENCE_FACTOR_MIN, CADENCE_FACTOR_MAX);
+    }
+
+    private float applyRecentStepMedianGuard(float candidateStep) {
+        List<Float> recent = recentStepLengthBuffer.getListCopy();
+        if (recent == null || recent.isEmpty()) {
+            return candidateStep;
+        }
+        List<Float> sorted = new ArrayList<>(recent);
+        Collections.sort(sorted);
+        float median = sorted.get(sorted.size() / 2);
+        if (median <= 0f) {
+            return candidateStep;
+        }
+        float bounded = clamp(candidateStep, median * 0.55f, median * 1.60f);
+        return bounded;
     }
 
     /**
@@ -454,6 +601,56 @@ public class PdrProcessing {
         this.startElevationBuffer = new Float[3];
         // Start floor - assumed to be zero
         this.currentFloor = 0;
+        this.adaptiveStepScale = 1.0f;
+        this.calibrationAnchorReady = false;
+        this.anchorPdrX = 0f;
+        this.anchorPdrY = 0f;
+        this.anchorFusedX = 0f;
+        this.anchorFusedY = 0f;
+    }
+
+    /**
+     * Online scale calibration using fused absolute position displacement.
+     * Keeps PDR step model aligned with long-term travelled distance.
+     */
+    public void updateStepScaleFromAbsoluteFix(float fusedX, float fusedY, float fixAccuracyMeters) {
+        if (Float.isNaN(fixAccuracyMeters) || fixAccuracyMeters > MIN_CALIBRATION_FIX_QUALITY_M) {
+            return;
+        }
+        if (!calibrationAnchorReady) {
+            calibrationAnchorReady = true;
+            anchorPdrX = positionX;
+            anchorPdrY = positionY;
+            anchorFusedX = fusedX;
+            anchorFusedY = fusedY;
+            return;
+        }
+
+        float pdrDx = positionX - anchorPdrX;
+        float pdrDy = positionY - anchorPdrY;
+        float fusedDx = fusedX - anchorFusedX;
+        float fusedDy = fusedY - anchorFusedY;
+
+        float pdrDistance = (float) Math.hypot(pdrDx, pdrDy);
+        float fusedDistance = (float) Math.hypot(fusedDx, fusedDy);
+        if (pdrDistance < MIN_CALIBRATION_DISPLACEMENT_M || fusedDistance < MIN_CALIBRATION_DISPLACEMENT_M) {
+            return;
+        }
+
+        float observedScale = fusedDistance / Math.max(pdrDistance, 1e-3f);
+        observedScale = clamp(observedScale, MIN_STEP_SCALE, MAX_STEP_SCALE);
+        float confidence = clamp((MIN_CALIBRATION_FIX_QUALITY_M - fixAccuracyMeters) / MIN_CALIBRATION_FIX_QUALITY_M, 0.15f, 1.0f);
+        float alpha = BASE_STEP_SCALE_CALIBRATION_ALPHA * confidence;
+        adaptiveStepScale = clamp(
+                (1f - alpha) * adaptiveStepScale + alpha * observedScale,
+                MIN_STEP_SCALE,
+                MAX_STEP_SCALE
+        );
+
+        anchorPdrX = positionX;
+        anchorPdrY = positionY;
+        anchorFusedX = fusedX;
+        anchorFusedY = fusedY;
     }
 
     /**

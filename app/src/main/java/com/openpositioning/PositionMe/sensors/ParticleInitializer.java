@@ -11,6 +11,9 @@ public class ParticleInitializer {
 
     private static final double DEFAULT_POSITION_STD_M = 2.0;
     private static final int MAX_ATTEMPTS_PER_PARTICLE = 16;
+    private static final double SEARCH_RADIUS_STEP_M = 0.6;
+    private static final int SEARCH_RADIUS_STEPS = 24;
+    private static final int SEARCH_DIRECTIONS = 16;
     private static final SpawnValidator ALLOW_ALL_VALIDATOR = (x, y, floor) -> true;
 
     private final Random random;
@@ -81,13 +84,64 @@ public class ParticleInitializer {
             }
 
             if (!accepted) {
-                sampleX = fixX;
-                sampleY = fixY;
+                double[] nearestValid = findNearestValidSample(fixX, fixY, floor, effectiveValidator);
+                if (nearestValid != null) {
+                    sampleX = nearestValid[0];
+                    sampleY = nearestValid[1];
+                    accepted = true;
+                }
+            }
+
+            if (!accepted) {
+                if (!particles.isEmpty()) {
+                    Particle anchor = particles.get(random.nextInt(particles.size()));
+                    sampleX = anchor.getX();
+                    sampleY = anchor.getY();
+                } else if (effectiveValidator.isValid(fixX, fixY, floor)) {
+                    sampleX = fixX;
+                    sampleY = fixY;
+                } else {
+                    double[] nearestValid = findNearestValidSample(fixX, fixY, floor, effectiveValidator);
+                    if (nearestValid != null) {
+                        sampleX = nearestValid[0];
+                        sampleY = nearestValid[1];
+                    } else {
+                        // Last-resort fallback only when no valid sample could be found.
+                        sampleX = fixX;
+                        sampleY = fixY;
+                    }
+                }
             }
 
             particles.add(new Particle(sampleX, sampleY, floor, initialWeight, headingRad));
         }
 
         return particles;
+    }
+
+    private double[] findNearestValidSample(
+            double centerX,
+            double centerY,
+            int floor,
+            SpawnValidator validator
+    ) {
+        if (validator == null) {
+            return null;
+        }
+        if (validator.isValid(centerX, centerY, floor)) {
+            return new double[]{centerX, centerY};
+        }
+        for (int radiusStep = 1; radiusStep <= SEARCH_RADIUS_STEPS; radiusStep++) {
+            double radius = radiusStep * SEARCH_RADIUS_STEP_M;
+            for (int direction = 0; direction < SEARCH_DIRECTIONS; direction++) {
+                double angle = (Math.PI * 2.0 * direction) / SEARCH_DIRECTIONS;
+                double candidateX = centerX + (Math.cos(angle) * radius);
+                double candidateY = centerY + (Math.sin(angle) * radius);
+                if (validator.isValid(candidateX, candidateY, floor)) {
+                    return new double[]{candidateX, candidateY};
+                }
+            }
+        }
+        return null;
     }
 }

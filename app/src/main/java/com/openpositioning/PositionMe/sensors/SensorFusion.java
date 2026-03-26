@@ -5,6 +5,7 @@ import android.content.SharedPreferences;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
+import android.hardware.GeomagneticField;
 import android.hardware.SensorManager;
 import android.app.ActivityManager;
 import android.content.Intent;
@@ -13,6 +14,9 @@ import android.location.LocationListener;
 import android.location.LocationManager;
 import android.os.Build;
 import android.os.PowerManager;
+import android.view.Display;
+import android.view.Surface;
+import android.view.WindowManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
@@ -86,6 +90,7 @@ public class SensorFusion implements SensorEventListener, Observer {
 
     // Define a threshold for large time gaps (in milliseconds)
     private static final long LARGE_GAP_THRESHOLD_MS = 500;  // Adjust this if needed
+    private static final long MIN_STEP_INTERVAL_MS = 280;
 
     //region Static variables
     // Singleton Class
@@ -105,7 +110,16 @@ public class SensorFusion implements SensorEventListener, Observer {
     private static final float GNSS_GPS_ACCURACY_WEIGHT_FACTOR = 0.65f;
     private static final float GNSS_NETWORK_ACCURACY_PENALTY_FACTOR = 1.35f;
     private static final float MIN_GNSS_EFFECTIVE_ACCURACY_M = 1.5f;
+    private static final float HEADING_BIAS_ALPHA = 0.08f;
+    private static final float MAX_HEADING_BIAS_RAD = (float) Math.toRadians(45.0);
+    private static final float MAX_BIAS_CALIBRATION_FIX_ACCURACY_M = 12.0f;
+    private static final double MIN_BIAS_CALIBRATION_DISPLACEMENT_M = 2.5;
     private static final double MIN_ABSOLUTE_FIX_START_STD_M = 1.0;
+    private static final double MIN_PDR_DRIFT_COMPENSATION_M = 1.0;
+    private static final double PDR_HARD_REANCHOR_DISTANCE_M = 18.0;
+    private static final float PDR_SOFT_REANCHOR_ALPHA = 0.18f;
+    private static final float MAX_PDR_COMPENSATION_FIX_ACCURACY_M = 15.0f;
+    private static final float PDR_HARD_REANCHOR_FIX_ACCURACY_M = 2.5f;
     //endregion
 
     //region Instance variables
@@ -213,6 +227,10 @@ public class SensorFusion implements SensorEventListener, Observer {
     private float lastPredictHeadingRad;
     private float lastPredictElevation;
     private long lastRecordedFusedPoseTimestampMs;
+    private float headingBiasRad;
+    private double lastHeadingCalibrationFixX = Double.NaN;
+    private double lastHeadingCalibrationFixY = Double.NaN;
+    private float lastHeadingCalibrationFixAccuracy = Float.NaN;
 
     // Trajectory displaying class
     private PathView pathView;
@@ -460,9 +478,7 @@ public class SensorFusion implements SensorEventListener, Observer {
 
             case Sensor.TYPE_ROTATION_VECTOR:
                 this.rotation = sensorEvent.values.clone();
-                float[] rotationVectorDCM = new float[9];
-                SensorManager.getRotationMatrixFromVector(rotationVectorDCM, this.rotation);
-                SensorManager.getOrientation(rotationVectorDCM, this.orientation);
+                updateOrientationFromRotationVector(this.rotation);
 
                 if (DEBUG_HEADING) {
                     long now = SystemClock.elapsedRealtime();
@@ -478,13 +494,14 @@ public class SensorFusion implements SensorEventListener, Observer {
                 long stepTime = SystemClock.uptimeMillis() - bootTime;
 
 
-                if (currentTime - lastStepTime < 20) {
+                if (currentTime - lastStepTime < MIN_STEP_INTERVAL_MS) {
                     Log.e("SensorFusion", "Ignoring step event, too soon after last step event:" + (currentTime - lastStepTime) + " ms");
                     // Ignore rapid successive step events
                     break;
                 }
 
                 else {
+                    long stepIntervalMs = lastStepTime <= 0 ? 520L : (currentTime - lastStepTime);
                     lastStepTime = currentTime;
                     // Log if accelMagnitude is empty
                     if (accelMagnitude.isEmpty()) {
@@ -496,13 +513,15 @@ public class SensorFusion implements SensorEventListener, Observer {
                                 "stepDetection triggered, accelMagnitude size = " + accelMagnitude.size());
                     }
 
-                    float currentHeadingRad = getCurrentHeadingRad();
+                    float currentHeadingRad = getCorrectedHeadingRad();
                     float deltaHeadingRad = normalizeHeadingDelta(currentHeadingRad - lastPredictHeadingRad);
                     float heightDeltaMeters = this.elevation - lastPredictElevation;
                     PdrDelta pdrDelta = this.pdrProcessing.buildStepDelta(
                             this.accelMagnitude,
                             deltaHeadingRad,
-                            heightDeltaMeters
+                            heightDeltaMeters,
+                            this.elevator,
+                            stepIntervalMs
                     );
                     float[] previousPdr = this.pdrProcessing.getPDRMovement();
                     float[] newCords = this.pdrProcessing.applyStepDelta(pdrDelta, currentHeadingRad);
@@ -1003,6 +1022,8 @@ public class SensorFusion implements SensorEventListener, Observer {
             return;
         }
         maybeSetInitialPositionIfAbsent(this.trajectory, latitudeDeg, longitudeDeg);
+        double[] localFix = converter.toLocalMeters(latitudeDeg, longitudeDeg);
+        maybeCalibrateHeadingBiasFromAbsoluteFix(localFix[0], localFix[1], accuracyMeters);
         this.latestFusedPose = applyAbsoluteFixForStep1(
                 this.particleFilterEngine,
                 converter,
@@ -1013,10 +1034,18 @@ public class SensorFusion implements SensorEventListener, Observer {
                 floorPrior,
                 timestampMs,
                 accuracyMeters,
-                getCurrentHeadingRad()
+                getCorrectedHeadingRad()
         );
         this.pfInitialized = this.latestFusedPose != null;
-        this.lastPredictHeadingRad = getCurrentHeadingRad();
+        if (this.latestFusedPose != null) {
+            this.pdrProcessing.updateStepScaleFromAbsoluteFix(
+                    (float) this.latestFusedPose.getX(),
+                    (float) this.latestFusedPose.getY(),
+                    accuracyMeters
+            );
+        }
+        compensatePdrDriftWithFusedPose(accuracyMeters);
+        this.lastPredictHeadingRad = getCorrectedHeadingRad();
         this.lastPredictElevation = this.elevation;
         recordLatestFusedPoseIfNeeded();
     }
@@ -1195,6 +1224,38 @@ public class SensorFusion implements SensorEventListener, Observer {
         return orientation[0];
     }
 
+    private float getCorrectedHeadingRad() {
+        float rawHeading = getCurrentHeadingRad();
+        return normalizeHeading(rawHeading + headingBiasRad);
+    }
+
+    private void maybeCalibrateHeadingBiasFromAbsoluteFix(double fixX, double fixY, float accuracyMeters) {
+        if (Float.isNaN(accuracyMeters) || accuracyMeters > MAX_BIAS_CALIBRATION_FIX_ACCURACY_M) {
+            return;
+        }
+
+        if (!Double.isNaN(lastHeadingCalibrationFixX)
+                && !Double.isNaN(lastHeadingCalibrationFixY)
+                && !Float.isNaN(lastHeadingCalibrationFixAccuracy)
+                && lastHeadingCalibrationFixAccuracy <= MAX_BIAS_CALIBRATION_FIX_ACCURACY_M) {
+            double dx = fixX - lastHeadingCalibrationFixX;
+            double dy = fixY - lastHeadingCalibrationFixY;
+            double displacement = Math.hypot(dx, dy);
+            if (displacement >= MIN_BIAS_CALIBRATION_DISPLACEMENT_M) {
+                float motionHeading = (float) Math.atan2(dx, dy);
+                float sensorHeading = getCurrentHeadingRad();
+                float observedBias = normalizeHeadingDelta(motionHeading - sensorHeading);
+                float biasError = normalizeHeadingDelta(observedBias - headingBiasRad);
+                headingBiasRad = normalizeHeadingDelta(headingBiasRad + HEADING_BIAS_ALPHA * biasError);
+                headingBiasRad = Math.max(-MAX_HEADING_BIAS_RAD, Math.min(MAX_HEADING_BIAS_RAD, headingBiasRad));
+            }
+        }
+
+        lastHeadingCalibrationFixX = fixX;
+        lastHeadingCalibrationFixY = fixY;
+        lastHeadingCalibrationFixAccuracy = accuracyMeters;
+    }
+
     private ParticleFilterEngine createParticleFilterEngine() {
         return new ParticleFilterEngine(
                 new ParticleInitializer(),
@@ -1294,6 +1355,15 @@ public class SensorFusion implements SensorEventListener, Observer {
         if (normalized > Math.PI) {
             normalized -= twoPi;
         } else if (normalized < -Math.PI) {
+            normalized += twoPi;
+        }
+        return normalized;
+    }
+
+    private float normalizeHeading(float headingRad) {
+        float twoPi = (float) (Math.PI * 2.0);
+        float normalized = headingRad % twoPi;
+        if (normalized < 0f) {
             normalized += twoPi;
         }
         return normalized;
@@ -1512,6 +1582,108 @@ public class SensorFusion implements SensorEventListener, Observer {
      */
     public float passOrientation(){
         return orientation[0];
+    }
+
+    /**
+     * Heading used by fusion after bias calibration.
+     * This should be used for map arrow rotation to keep UI consistent with PF/PDR prediction.
+     */
+    public float passCorrectedOrientation() {
+        return getCorrectedHeadingRad();
+    }
+
+    private void compensatePdrDriftWithFusedPose(float fixAccuracyMeters) {
+        if (latestFusedPose == null || pdrProcessing == null) {
+            return;
+        }
+        if (Float.isNaN(fixAccuracyMeters) || fixAccuracyMeters > MAX_PDR_COMPENSATION_FIX_ACCURACY_M) {
+            return;
+        }
+
+        float[] rawPdr = pdrProcessing.getPDRMovement();
+        if (rawPdr == null || rawPdr.length < 2) {
+            return;
+        }
+        double driftX = latestFusedPose.getX() - rawPdr[0];
+        double driftY = latestFusedPose.getY() - rawPdr[1];
+        double driftDistance = Math.hypot(driftX, driftY);
+        if (driftDistance < MIN_PDR_DRIFT_COMPENSATION_M) {
+            return;
+        }
+
+        if (driftDistance >= PDR_HARD_REANCHOR_DISTANCE_M
+                && fixAccuracyMeters <= PDR_HARD_REANCHOR_FIX_ACCURACY_M) {
+            pdrProcessing.setPdrPosition((float) latestFusedPose.getX(), (float) latestFusedPose.getY());
+            return;
+        }
+
+        float correctedX = (float) (rawPdr[0] + (driftX * PDR_SOFT_REANCHOR_ALPHA));
+        float correctedY = (float) (rawPdr[1] + (driftY * PDR_SOFT_REANCHOR_ALPHA));
+        pdrProcessing.setPdrPosition(correctedX, correctedY);
+    }
+
+    private void updateOrientationFromRotationVector(float[] rotationVectorValues) {
+        if (rotationVectorValues == null || rotationVectorValues.length == 0) {
+            return;
+        }
+        float[] rotationMatrix = new float[9];
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, rotationVectorValues);
+
+        float[] adjustedMatrix = new float[9];
+        int axisX = SensorManager.AXIS_X;
+        int axisY = SensorManager.AXIS_Y;
+        int displayRotation = Surface.ROTATION_0;
+        try {
+            WindowManager windowManager = (WindowManager) appContext.getSystemService(Context.WINDOW_SERVICE);
+            if (windowManager != null) {
+                Display display = windowManager.getDefaultDisplay();
+                if (display != null) {
+                    displayRotation = display.getRotation();
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        switch (displayRotation) {
+            case Surface.ROTATION_90:
+                axisX = SensorManager.AXIS_Y;
+                axisY = SensorManager.AXIS_MINUS_X;
+                break;
+            case Surface.ROTATION_180:
+                axisX = SensorManager.AXIS_MINUS_X;
+                axisY = SensorManager.AXIS_MINUS_Y;
+                break;
+            case Surface.ROTATION_270:
+                axisX = SensorManager.AXIS_MINUS_Y;
+                axisY = SensorManager.AXIS_X;
+                break;
+            case Surface.ROTATION_0:
+            default:
+                axisX = SensorManager.AXIS_X;
+                axisY = SensorManager.AXIS_Y;
+                break;
+        }
+
+        SensorManager.remapCoordinateSystem(rotationMatrix, axisX, axisY, adjustedMatrix);
+        SensorManager.getOrientation(adjustedMatrix, this.orientation);
+        this.orientation[0] = toTrueNorthHeading(this.orientation[0]);
+    }
+
+    private float toTrueNorthHeading(float magneticHeadingRad) {
+        if (Float.isNaN(magneticHeadingRad)) {
+            return 0f;
+        }
+        if (latitude == 0f && longitude == 0f) {
+            return normalizeHeading(magneticHeadingRad);
+        }
+        GeomagneticField geomagneticField = new GeomagneticField(
+                latitude,
+                longitude,
+                (float) gnssAltitude,
+                System.currentTimeMillis()
+        );
+        float declinationRad = (float) Math.toRadians(geomagneticField.getDeclination());
+        return normalizeHeading(magneticHeadingRad + declinationRad);
     }
 
     /**
@@ -1807,9 +1979,13 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.coordinateConverter = hasManualStartLocation && startLocation != null && startLocation.length >= 2
                 ? new CoordinateConverter(startLocation[0], startLocation[1])
                 : null;
-        this.lastPredictHeadingRad = getCurrentHeadingRad();
+        this.lastPredictHeadingRad = getCorrectedHeadingRad();
         this.lastPredictElevation = this.elevation;
         this.lastRecordedFusedPoseTimestampMs = -1L;
+        this.headingBiasRad = 0f;
+        this.lastHeadingCalibrationFixX = Double.NaN;
+        this.lastHeadingCalibrationFixY = Double.NaN;
+        this.lastHeadingCalibrationFixAccuracy = Float.NaN;
         if(settings.getBoolean("overwrite_constants", false)) {
             this.filter_coefficient = Float.parseFloat(settings.getString("accel_filter", "0.96"));
         } else {
@@ -2101,11 +2277,13 @@ public class SensorFusion implements SensorEventListener, Observer {
                     secondCounter = 0;
                     //Current Wifi Object
                     Wifi currentWifi = wifiProcessor.getCurrentWifiData();
-                    trajectory.addApsData(Traj.WiFiAPData.newBuilder()
-                            .setMac(currentWifi.getBssid())
-                            .setSsid(currentWifi.getSsid())
-                            .setFrequency(currentWifi.getFrequency())
-                            .setRttEnabled(currentWifi.isRttSupported()));
+                    if (currentWifi != null && currentWifi.getBssid() != 0) {
+                        trajectory.addApsData(Traj.WiFiAPData.newBuilder()
+                                .setMac(currentWifi.getBssid())
+                                .setSsid(WifiDataProcessor.normalizeSsid(currentWifi.getSsid()))
+                                .setFrequency(WifiDataProcessor.normalizeFrequency(currentWifi.getFrequency()))
+                                .setRttEnabled(currentWifi.isRttSupported()));
+                    }
                 }
                 else {
                     secondCounter++;
