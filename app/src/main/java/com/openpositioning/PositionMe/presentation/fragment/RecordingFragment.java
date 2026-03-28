@@ -389,7 +389,7 @@ public class RecordingFragment extends Fragment {
 
         LatLng newLocation = sensorFusion.getLatLngForFusedPose(fusedPose);
         if (newLocation != null) {
-            double orientationDeg = normalizeHeadingDeg(Math.toDegrees(sensorFusion.passOrientation()));
+            double orientationDeg = normalizeHeadingDeg(Math.toDegrees(sensorFusion.getMapHeadingRad()));
             if (SensorFusion.DEBUG_HEADING) {
                 long now = SystemClock.elapsedRealtime();
                 if (now - headingDbgUiLastLogMs >= 1000) {

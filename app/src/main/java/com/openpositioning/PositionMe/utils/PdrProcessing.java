@@ -43,7 +43,7 @@ public class PdrProcessing {
     private static final float MIN_STEP_LENGTH_M = 0.20f;
     private static final float MAX_STEP_LENGTH_M = 0.90f;
     private static final float STEP_LENGTH_SMOOTHING_ALPHA = 0.28f;
-    private static final float STEP_LENGTH_GAIN = 0.88f;
+    private static final float STEP_LENGTH_GAIN = 0.93f;
     private static final float CADENCE_REFERENCE_HZ = 1.8f;
     private static final float CADENCE_FACTOR_MIN = 0.82f;
     private static final float CADENCE_FACTOR_MAX = 1.24f;
@@ -53,9 +53,9 @@ public class PdrProcessing {
     private static final float ELEVATOR_STEP_SUPPRESSION = 0.75f;
     private static final float MIN_STEP_SCALE = 0.75f;
     private static final float MAX_STEP_SCALE = 1.40f;
-    private static final float BASE_STEP_SCALE_CALIBRATION_ALPHA = 0.08f;
+    private static final float BASE_STEP_SCALE_CALIBRATION_ALPHA = 0.10f;
     private static final float MIN_CALIBRATION_FIX_QUALITY_M = 15.0f;
-    private static final float MIN_CALIBRATION_DISPLACEMENT_M = 3.0f;
+    private static final float MIN_CALIBRATION_DISPLACEMENT_M = 2.2f;
     //endregion
 
     //region Instance variables
@@ -279,15 +279,9 @@ public class PdrProcessing {
             this.elevation = absoluteElevation - startElevation;
             // Add to buffer
             this.elevationList.putNewest(absoluteElevation);
-
-            // Convert the smoothed relative height into an absolute floor candidate.
-            if(this.elevationList.isFull() && this.floorHeight > 0) {
-                List<Float> elevationMemory = this.elevationList.getListCopy();
-                OptionalDouble currentAvg = elevationMemory.stream().mapToDouble(f -> f).average();
-                float finishAvg = currentAvg.isPresent() ? (float) currentAvg.getAsDouble() : 0;
-                float relativeElevation = finishAvg - startElevation;
-                this.currentFloor = Math.round(relativeElevation / this.floorHeight);
-            }
+            // Elevation-dominant floor estimation: each floor occupies a height band centered on
+            // n * floorHeight, i.e. [(n-0.5)h, (n+0.5)h).
+            this.currentFloor = resolveFloorFromElevation(this.elevation);
             // Return current elevation
             return elevation;
         }
@@ -466,6 +460,13 @@ public class PdrProcessing {
         return this.currentFloor;
     }
 
+    private int resolveFloorFromElevation(float relativeElevationMeters) {
+        if (floorHeight <= 0f || Float.isNaN(relativeElevationMeters) || Float.isInfinite(relativeElevationMeters)) {
+            return currentFloor;
+        }
+        return Math.round(relativeElevationMeters / floorHeight);
+    }
+
     /**
      * Override floor height at runtime (for example from venue metadata).
      */
@@ -485,8 +486,8 @@ public class PdrProcessing {
             return;
         }
         this.startElevation = absoluteElevationMeters - (anchorFloor * floorHeight);
-        this.currentFloor = anchorFloor;
         this.elevation = absoluteElevationMeters - this.startElevation;
+        this.currentFloor = resolveFloorFromElevation(this.elevation);
         this.setupIndex = 3; // mark baseline as initialized
         this.startElevationBuffer = new Float[]{startElevation, startElevation, startElevation};
 

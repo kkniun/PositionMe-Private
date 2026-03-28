@@ -64,15 +64,18 @@ import java.util.Map;
 public class TrajectoryMapFragment extends Fragment {
 
     private static final int MAX_RAW_OBSERVATIONS = 12;
-    private static final long FUSED_PATH_UPDATE_INTERVAL_MS = 1000L;
-    private static final double FUSED_PATH_MOVEMENT_THRESHOLD_M = 0.75;
+    private static final long FUSED_PATH_UPDATE_INTERVAL_MS = 480L;
+    private static final double FUSED_PATH_MOVEMENT_THRESHOLD_M = 0.22;
     // Suppress visually duplicate trajectory vertices when the displayed position is effectively stationary.
-    private static final double TRAJECTORY_DUPLICATE_SUPPRESS_THRESHOLD_M = 0.15;
+    private static final double TRAJECTORY_DUPLICATE_SUPPRESS_THRESHOLD_M = 0.12;
     private static final double RAW_POINT_DUPLICATE_THRESHOLD_M = 0.25;
-    private static final double DISPLAY_SMOOTHING_ALPHA = 0.35;
-    private static final double HEADING_MOVEMENT_MIN_DISTANCE_M = 0.8;
-    private static final float HEADING_SENSOR_SMOOTH_ALPHA = 0.15f;
-    private static final float HEADING_COURSE_BLEND_ALPHA = 0.35f;
+    /** Lower = smoother marker trail, less jitter (per UI tick). */
+    private static final double DISPLAY_SMOOTHING_ALPHA = 0.16;
+    /** Cap metres moved toward the raw fix per tick to avoid visible teleports after WiFi/GNSS jumps. */
+    private static final double MAX_DISPLAY_STEP_METERS = 0.9;
+    private static final double HEADING_MOVEMENT_MIN_DISTANCE_M = 1.05;
+    private static final float HEADING_SENSOR_SMOOTH_ALPHA = 0.09f;
+    private static final float HEADING_COURSE_BLEND_ALPHA = 0.22f;
     private static final float FUSED_ICON_HEADING_OFFSET_DEG = 0f;
     private static final float DISABLED_ACTION_ALPHA = 0.4f;
     private static final float ENABLED_ACTION_ALPHA = 1f;
@@ -363,6 +366,8 @@ public class TrajectoryMapFragment extends Fragment {
 
         float resolvedHeadingDeg = resolveDisplayHeading(displayedLocation, orientation);
         updateFusedMarker(displayedLocation, resolvedHeadingDeg);
+        // Polyline must follow the estimator (raw fused WGS84), not UI-smoothed coordinates — smoothing
+        // is display-only for the marker and would geometrically distort the recorded path.
         maybeAppendFusedTrajectory(newLocation, timestampMs);
 
         if (!hasAutoCenteredOnFirstFix) {
@@ -372,16 +377,17 @@ public class TrajectoryMapFragment extends Fragment {
         updateWaitingStateUi();
 
         if (indoorMapManager != null) {
-            indoorMapManager.setCurrentLocation(displayedLocation);
-            indoorMapManager.refreshNearbyVenues(displayedLocation, sensorFusion.getWifiList());
+            indoorMapManager.setCurrentLocation(newLocation);
+            indoorMapManager.refreshNearbyVenues(newLocation, sensorFusion.getWifiList());
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
             updateVenueLabel();
         }
     }
 
     public void updateGNSS(@NonNull LatLng gnssLocation) {
-        upsertLatestObservationMarker(
+        addObservationMarker(
                 gnssObservationMarkers,
+                lastGnssObservation,
                 gnssLocation,
                 "GNSS Position",
                 null,
@@ -393,8 +399,9 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     public void updateWifiFix(@NonNull LatLng wifiLocation, int floor) {
-        upsertLatestObservationMarker(
+        addObservationMarker(
                 wifiObservationMarkers,
+                lastWifiObservation,
                 wifiLocation,
                 "WiFi Position",
                 "Floor " + floor,
@@ -693,19 +700,8 @@ public class TrajectoryMapFragment extends Fragment {
         if (fusedTrajectoryPolyline == null) {
             return;
         }
-        List<LatLng> displayedPoints = new ArrayList<>(fusedTrajectoryRawPoints.size());
-        if (displaySmoothingEnabled) {
-            LatLng smoothedPoint = null;
-            for (LatLng rawPoint : fusedTrajectoryRawPoints) {
-                smoothedPoint = smoothedPoint == null
-                        ? rawPoint
-                        : interpolate(smoothedPoint, rawPoint, DISPLAY_SMOOTHING_ALPHA);
-                displayedPoints.add(smoothedPoint);
-            }
-        } else {
-            displayedPoints.addAll(fusedTrajectoryRawPoints);
-        }
-        fusedTrajectoryPolyline.setPoints(displayedPoints);
+        // Vertices are raw fused WGS84 samples (estimator output), not UI-smoothed marker positions.
+        fusedTrajectoryPolyline.setPoints(new ArrayList<>(fusedTrajectoryRawPoints));
         fusedTrajectoryPolyline.setVisible(isFusedOn);
     }
 
@@ -719,7 +715,12 @@ public class TrajectoryMapFragment extends Fragment {
             smoothedFusedLocation = rawLocation;
             return rawLocation;
         }
-        smoothedFusedLocation = interpolate(smoothedFusedLocation, rawLocation, DISPLAY_SMOOTHING_ALPHA);
+        double distMeters = UtilFunctions.distanceBetweenPoints(smoothedFusedLocation, rawLocation);
+        double alpha = DISPLAY_SMOOTHING_ALPHA;
+        if (distMeters > 1e-6 && distMeters > MAX_DISPLAY_STEP_METERS) {
+            alpha = Math.min(alpha, MAX_DISPLAY_STEP_METERS / distMeters);
+        }
+        smoothedFusedLocation = interpolate(smoothedFusedLocation, rawLocation, alpha);
         return smoothedFusedLocation;
     }
 
@@ -764,40 +765,6 @@ public class TrajectoryMapFragment extends Fragment {
         while (markers.size() > MAX_RAW_OBSERVATIONS) {
             Marker oldest = markers.removeFirst();
             oldest.remove();
-        }
-    }
-
-    private void upsertLatestObservationMarker(
-            @NonNull ArrayDeque<Marker> markers,
-            @NonNull LatLng newLocation,
-            @NonNull String title,
-            @Nullable String snippet,
-            @NonNull BitmapDescriptor icon,
-            boolean visible,
-            float zIndex
-    ) {
-        if (gMap == null) {
-            return;
-        }
-        Marker marker = markers.peekLast();
-        if (marker != null) {
-            marker.setPosition(newLocation);
-            marker.setTitle(title);
-            marker.setSnippet(snippet);
-            marker.setVisible(visible);
-            marker.setZIndex(zIndex);
-            return;
-        }
-        Marker created = gMap.addMarker(new MarkerOptions()
-                .position(newLocation)
-                .title(title)
-                .snippet(snippet)
-                .anchor(0.5f, 0.5f)
-                .zIndex(zIndex)
-                .icon(icon)
-                .visible(visible));
-        if (created != null) {
-            markers.addLast(created);
         }
     }
 

@@ -106,19 +106,29 @@ public class SensorFusion implements SensorEventListener, Observer {
     // String for creating WiFi fingerprint JSO N object
     private static final String WIFI_FINGERPRINT= "wf";
     private static final String DEFAULT_COLLECTION_VENUE = "traj";
-    private static final float DEFAULT_WIFI_ACCURACY_M = 5.0f;
+    /** Conservative for fusion: API does not return horizontal uncertainty; under-estimating widens bad snaps. */
+    private static final float DEFAULT_WIFI_ACCURACY_M = 10.0f;
     private static final float GNSS_GPS_ACCURACY_WEIGHT_FACTOR = 0.65f;
     private static final float GNSS_NETWORK_ACCURACY_PENALTY_FACTOR = 1.35f;
     private static final float MIN_GNSS_EFFECTIVE_ACCURACY_M = 1.5f;
-    private static final float HEADING_BIAS_ALPHA = 0.08f;
+    private static final float HEADING_BIAS_ALPHA = 0.11f;
     private static final float MAX_HEADING_BIAS_RAD = (float) Math.toRadians(45.0);
     private static final float MAX_BIAS_CALIBRATION_FIX_ACCURACY_M = 12.0f;
     private static final double MIN_BIAS_CALIBRATION_DISPLACEMENT_M = 2.5;
     private static final double MIN_ABSOLUTE_FIX_START_STD_M = 1.0;
-    private static final double MIN_PDR_DRIFT_COMPENSATION_M = 1.0;
-    private static final double PDR_HARD_REANCHOR_DISTANCE_M = 18.0;
-    private static final float PDR_SOFT_REANCHOR_ALPHA = 0.18f;
-    private static final float MAX_PDR_COMPENSATION_FIX_ACCURACY_M = 15.0f;
+    /** Before the particle filter is initialised, keep collecting fixes and lock the ENU origin on the best-accuracy fix, or after a timeout (whichever comes first). */
+    private static final float FIRST_ORIGIN_MAX_ACCURACY_M = 18.0f;
+    private static final long FIRST_ORIGIN_FALLBACK_MS = 4000L;
+    /** Minimum GNSS speed (m/s) to trust course bearing for initial heading alignment. */
+    private static final float MIN_GNSS_SPEED_FOR_COURSE_HEADING_MPS = 0.45f;
+    private static final double MIN_PDR_DRIFT_COMPENSATION_M = 0.45;
+    /** Fused mean must move at least this far before overwriting integrated PDR (avoids freeze when PF rejects all motion). */
+    private static final double MIN_FUSED_MOVE_TO_RESYNC_PDR_M = 0.02;
+    /** Binary-search iterations to find the longest wall-safe prefix of each PDR step (sliding along walls). */
+    private static final int MAP_CLIP_SEGMENT_ITERS = 16;
+    private static final double PDR_HARD_REANCHOR_DISTANCE_M = 14.0;
+    private static final float PDR_SOFT_REANCHOR_ALPHA = 0.34f;
+    private static final float MAX_PDR_COMPENSATION_FIX_ACCURACY_M = 22.0f;
     private static final float PDR_HARD_REANCHOR_FIX_ACCURACY_M = 2.5f;
     //endregion
 
@@ -227,7 +237,28 @@ public class SensorFusion implements SensorEventListener, Observer {
     private float lastPredictHeadingRad;
     private float lastPredictElevation;
     private long lastRecordedFusedPoseTimestampMs;
+    /** Last PDR step length (m) for map-based floor gating (stairs vs lift). */
+    private float lastFloorGateStepLengthM;
+    private boolean lastFloorGateElevatorLikely;
+    private static final double MIN_STAIRS_HORIZONTAL_FOR_FLOOR_GATE_M = 0.25;
+    // Elevator detection: if horizontal position is effectively unchanged but elevation is rising,
+    // classify as elevator ride. Used for both UI and map-based floor transition gating.
+    private static final float ELEVATOR_STATIONARY_HORIZONTAL_DELTA_M = 0.25f;
+    private static final float ELEVATOR_STATIONARY_RADIUS_M = 1.8f;
+    private static final float ELEVATOR_ELEVATION_CHANGE_THRESHOLD_M = 0.5f;
+    private static final int ELEVATOR_ASCENT_CONFIRMATION_STEPS = 1;
+    private int elevatorAscentStreak = 0;
+    private static final long ELEVATOR_FORCE_ON_DURATION_MS = 5000L;
+    private long elevatorForceOnUntilMs = -1L;
+    private float elevatorAnchorXMeters = Float.NaN;
+    private float elevatorAnchorYMeters = Float.NaN;
+    private float elevatorAnchorElevationMeters = Float.NaN;
     private float headingBiasRad;
+    /** True-north course of travel from GNSS when moving; used once to seed heading bias at PF init. */
+    private float lastGnssCourseRad = Float.NaN;
+    private double pendingBestOriginLat = Double.NaN;
+    private double pendingBestOriginLon = Double.NaN;
+    private float pendingBestAccuracyM = Float.POSITIVE_INFINITY;
     private double lastHeadingCalibrationFixX = Double.NaN;
     private double lastHeadingCalibrationFixY = Double.NaN;
     private float lastHeadingCalibrationFixAccuracy = Float.NaN;
@@ -275,6 +306,10 @@ public class SensorFusion implements SensorEventListener, Observer {
         // PDR elevation initial values
         this.elevation = 0;
         this.elevator = false;
+        this.elevatorAscentStreak = 0;
+        this.elevatorAnchorXMeters = Float.NaN;
+        this.elevatorAnchorYMeters = Float.NaN;
+        this.elevatorAnchorElevationMeters = Float.NaN;
         // PDR position array
         this.startLocation = new float[2];
         // Empty array initialisation
@@ -358,6 +393,12 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.coordinateConverter = null;
         this.hasManualStartLocation = false;
         this.lastPredictHeadingRad = 0f;
+        this.lastFloorGateStepLengthM = 0f;
+        this.lastFloorGateElevatorLikely = false;
+        this.lastGnssCourseRad = Float.NaN;
+        this.pendingBestOriginLat = Double.NaN;
+        this.pendingBestOriginLon = Double.NaN;
+        this.pendingBestAccuracyM = Float.POSITIVE_INFINITY;
         this.lastPredictElevation = 0f;
         this.lastRecordedFusedPoseTimestampMs = -1L;
 
@@ -421,6 +462,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                     this.elevation = pdrProcessing.updateElevation(
                             SensorManager.getAltitude(SensorManager.PRESSURE_STANDARD_ATMOSPHERE, pressure)
                     );
+                    updateElevatorStateFromBarometer(currentTime);
                 }
                 break;
 
@@ -516,40 +558,81 @@ public class SensorFusion implements SensorEventListener, Observer {
                     float currentHeadingRad = getCorrectedHeadingRad();
                     float deltaHeadingRad = normalizeHeadingDelta(currentHeadingRad - lastPredictHeadingRad);
                     float heightDeltaMeters = this.elevation - lastPredictElevation;
+                    float[] previousPdr = this.pdrProcessing.getPDRMovement();
+                    boolean provisionalElevatorLikely = this.elevator;
                     PdrDelta pdrDelta = this.pdrProcessing.buildStepDelta(
                             this.accelMagnitude,
                             deltaHeadingRad,
                             heightDeltaMeters,
-                            this.elevator,
+                            provisionalElevatorLikely,
                             stepIntervalMs
                     );
-                    float[] previousPdr = this.pdrProcessing.getPDRMovement();
                     float[] newCords = this.pdrProcessing.applyStepDelta(pdrDelta, currentHeadingRad);
                     int currentPdrFloor = this.pdrProcessing.getCurrentFloor();
-                    if (!isValidParticlePrediction(newCords[0], newCords[1], currentPdrFloor)) {
-                        // Keep raw PDR inside map constraints too (same wall/outline rules as PF particles).
-                        this.pdrProcessing.setPdrPosition(previousPdr[0], previousPdr[1]);
-                        newCords = previousPdr;
+                    double clipT = clipSegmentToMapMaxTFraction(
+                            previousPdr[0],
+                            previousPdr[1],
+                            newCords[0],
+                            newCords[1],
+                            currentPdrFloor
+                    );
+                    if (clipT < 1.0 - 1e-9) {
+                        double dx = newCords[0] - previousPdr[0];
+                        double dy = newCords[1] - previousPdr[1];
+                        float cx = (float) (previousPdr[0] + dx * clipT);
+                        float cy = (float) (previousPdr[1] + dy * clipT);
+                        this.pdrProcessing.setPdrPosition(cx, cy);
+                        newCords = new float[]{cx, cy};
+                    }
+                    PdrDelta pdrDeltaForPf = pdrDelta;
+                    if (clipT < 1.0 - 1e-9) {
+                        float scaledStep = pdrDelta.getStepLengthMeters() * (float) clipT;
+                        pdrDeltaForPf = new PdrDelta(
+                                scaledStep,
+                                pdrDelta.getDeltaHeadingRad(),
+                                pdrDelta.getHeightDeltaMeters(),
+                                pdrDelta.isElevatorLikely()
+                        );
                     }
 
                     // Clear the accelMagnitude after using it
                     this.accelMagnitude.clear();
+                    double fusedXBefore = Double.NaN;
+                    double fusedYBefore = Double.NaN;
+                    if (this.latestFusedPose != null) {
+                        fusedXBefore = this.latestFusedPose.getX();
+                        fusedYBefore = this.latestFusedPose.getY();
+                    }
                     handlePdrPredict(
-                            pdrDelta,
+                            pdrDeltaForPf,
                             currentPdrFloor,
                             currentTime
                     );
                     this.lastPredictHeadingRad = currentHeadingRad;
                     this.lastPredictElevation = this.elevation;
 
+                    // When the particle cloud actually moves, snap PDR to the fused mean so PathView / protobuf
+                    // match PF. If every prediction was rejected (same fused pose), keep integrated PDR so the
+                    // user does not appear frozen at the origin.
+                    float[] pdrPublish = newCords;
+                    if (this.latestFusedPose != null) {
+                        double fx = this.latestFusedPose.getX();
+                        double fy = this.latestFusedPose.getY();
+                        boolean fusedMoved = Double.isNaN(fusedXBefore)
+                                || Math.hypot(fx - fusedXBefore, fy - fusedYBefore) > MIN_FUSED_MOVE_TO_RESYNC_PDR_M;
+                        if (fusedMoved) {
+                            pdrPublish = new float[]{(float) fx, (float) fy};
+                            this.pdrProcessing.setPdrPosition(pdrPublish[0], pdrPublish[1]);
+                        }
+                    }
 
                     if (saveRecording) {
-                        this.pathView.drawTrajectory(newCords);
+                        this.pathView.drawTrajectory(pdrPublish);
                         stepCounter++;
                         trajectory.addPdrData(Traj.RelativePosition.newBuilder()
                                 .setRelativeTimestamp(SystemClock.uptimeMillis() - bootTime)
-                                .setX(newCords[0])
-                                .setY(newCords[1])
+                                .setX(pdrPublish[0])
+                                .setY(pdrPublish[1])
                                 .setFloor(this.pdrProcessing.getCurrentFloor())
                                 .setElevator(this.elevator)
                                 .setElevation(this.elevation));
@@ -629,6 +712,9 @@ public class SensorFusion implements SensorEventListener, Observer {
                 );
             }
             gnssAltitude = location.getAltitude();
+            if (location.hasBearing() && location.getSpeed() >= MIN_GNSS_SPEED_FOR_COURSE_HEADING_MPS) {
+                lastGnssCourseRad = (float) Math.toRadians(location.getBearing());
+            }
 
         }
     }
@@ -922,6 +1008,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                     if (wifiLocation == null) {
                         return;
                     }
+                    int elevationDrivenFloor = getCurrentFloor();
                     handleAbsoluteFixInternal(
                             new AbsoluteFix(
                                     System.currentTimeMillis(),
@@ -929,8 +1016,8 @@ public class SensorFusion implements SensorEventListener, Observer {
                                     wifiLocation.longitude,
                                     DEFAULT_WIFI_ACCURACY_M
                             ),
-                            resolveStep1InitializationFloor(floor),
-                            floor
+                            resolveStep1InitializationFloor(elevationDrivenFloor),
+                            elevationDrivenFloor
                     );
                 }
 
@@ -963,22 +1050,24 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     public void handleAbsoluteFix(@NonNull AbsoluteFix absoluteFix, int floor) {
+        int elevationDrivenFloor = getCurrentFloor();
         handleAbsoluteFixInternal(
                 absoluteFix.getLatitudeDeg(),
                 absoluteFix.getLongitudeDeg(),
-                floor,
-                floor,
+                elevationDrivenFloor,
+                elevationDrivenFloor,
                 absoluteFix.getTimestampMs(),
                 absoluteFix.getAccuracyMeters()
         );
     }
 
     public void handleAbsoluteFix(double latitudeDeg, double longitudeDeg, int floor, long timestampMs) {
+        int elevationDrivenFloor = getCurrentFloor();
         handleAbsoluteFixInternal(
                 latitudeDeg,
                 longitudeDeg,
-                floor,
-                floor,
+                elevationDrivenFloor,
+                elevationDrivenFloor,
                 timestampMs,
                 DEFAULT_WIFI_ACCURACY_M
         );
@@ -991,11 +1080,12 @@ public class SensorFusion implements SensorEventListener, Observer {
             long timestampMs,
             float accuracyMeters
     ) {
+        int elevationDrivenFloor = getCurrentFloor();
         handleAbsoluteFixInternal(
                 latitudeDeg,
                 longitudeDeg,
-                floor,
-                floor,
+                elevationDrivenFloor,
+                elevationDrivenFloor,
                 timestampMs,
                 accuracyMeters
         );
@@ -1013,6 +1103,37 @@ public class SensorFusion implements SensorEventListener, Observer {
             return;
         }
 
+        float sanitizedAccuracy = sanitizeAccuracyForFusion(accuracyMeters);
+        this.latitude = (float) latitudeDeg;
+        this.longitude = (float) longitudeDeg;
+
+        if (!pfInitialized && coordinateConverter == null && !hasManualStartLocation) {
+            if (Double.isNaN(pendingBestOriginLat) || sanitizedAccuracy < pendingBestAccuracyM) {
+                pendingBestOriginLat = latitudeDeg;
+                pendingBestOriginLon = longitudeDeg;
+                pendingBestAccuracyM = sanitizedAccuracy;
+            }
+            long elapsedSinceStart = System.currentTimeMillis() - absoluteStartTime;
+            boolean accuracyCommit = pendingBestAccuracyM <= FIRST_ORIGIN_MAX_ACCURACY_M;
+            boolean timeoutCommit = elapsedSinceStart >= FIRST_ORIGIN_FALLBACK_MS
+                    && !Double.isNaN(pendingBestOriginLat);
+            if (!accuracyCommit && !timeoutCommit) {
+                return;
+            }
+            if (accuracyCommit) {
+                // High-confidence fix: anchor where the best sample was observed.
+                latitudeDeg = pendingBestOriginLat;
+                longitudeDeg = pendingBestOriginLon;
+                accuracyMeters = pendingBestAccuracyM;
+            } else {
+                // Timeout: anchor to this event’s position so the user is not left at a stale “best” point.
+                accuracyMeters = sanitizedAccuracy;
+            }
+            this.latitude = (float) latitudeDeg;
+            this.longitude = (float) longitudeDeg;
+            maybeSeedInitialHeadingBiasFromGnssCourse();
+        }
+
         if (this.particleFilterEngine == null) {
             this.particleFilterEngine = createParticleFilterEngine();
         }
@@ -1023,7 +1144,9 @@ public class SensorFusion implements SensorEventListener, Observer {
         }
         maybeSetInitialPositionIfAbsent(this.trajectory, latitudeDeg, longitudeDeg);
         double[] localFix = converter.toLocalMeters(latitudeDeg, longitudeDeg);
-        maybeCalibrateHeadingBiasFromAbsoluteFix(localFix[0], localFix[1], accuracyMeters);
+        float reportedAccuracy = sanitizeAccuracyForFusion(accuracyMeters);
+        float fusionMeasurementAccuracy = sharpenAccuracyForParticleFusion(reportedAccuracy);
+        maybeCalibrateHeadingBiasFromAbsoluteFix(localFix[0], localFix[1], reportedAccuracy);
         this.latestFusedPose = applyAbsoluteFixForStep1(
                 this.particleFilterEngine,
                 converter,
@@ -1033,7 +1156,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                 initializationFloor,
                 floorPrior,
                 timestampMs,
-                accuracyMeters,
+                fusionMeasurementAccuracy,
                 getCorrectedHeadingRad()
         );
         this.pfInitialized = this.latestFusedPose != null;
@@ -1041,10 +1164,10 @@ public class SensorFusion implements SensorEventListener, Observer {
             this.pdrProcessing.updateStepScaleFromAbsoluteFix(
                     (float) this.latestFusedPose.getX(),
                     (float) this.latestFusedPose.getY(),
-                    accuracyMeters
+                    reportedAccuracy
             );
         }
-        compensatePdrDriftWithFusedPose(accuracyMeters);
+        compensatePdrDriftWithFusedPose(fusionMeasurementAccuracy);
         this.lastPredictHeadingRad = getCorrectedHeadingRad();
         this.lastPredictElevation = this.elevation;
         recordLatestFusedPoseIfNeeded();
@@ -1072,6 +1195,9 @@ public class SensorFusion implements SensorEventListener, Observer {
         if (!pfInitialized || this.particleFilterEngine == null || pdrDelta == null) {
             return;
         }
+
+        this.lastFloorGateStepLengthM = (float) Math.max(0.0, pdrDelta.getStepLengthMeters());
+        this.lastFloorGateElevatorLikely = pdrDelta.isElevatorLikely();
 
         this.latestFusedPose = applyPdrPredictionForStep1(
                 this.particleFilterEngine,
@@ -1229,6 +1355,39 @@ public class SensorFusion implements SensorEventListener, Observer {
         return normalizeHeading(rawHeading + headingBiasRad);
     }
 
+    private static float sanitizeAccuracyForFusion(float accuracyMeters) {
+        if (Float.isNaN(accuracyMeters) || Float.isInfinite(accuracyMeters) || accuracyMeters <= 0f) {
+            return DEFAULT_WIFI_ACCURACY_M;
+        }
+        return Math.max(1.0f, accuracyMeters);
+    }
+
+    /**
+     * Tighter effective std for the PF measurement model so GNSS/WiFi pulls the cloud more than
+     * pure dead-reckoning between updates (reduces slow drift when fixes are plausible).
+     */
+    private static float sharpenAccuracyForParticleFusion(float reportedAccuracyMeters) {
+        float r = sanitizeAccuracyForFusion(reportedAccuracyMeters);
+        float s = r * 0.70f;
+        return Math.max(2.8f, Math.min(20f, s));
+    }
+
+    /**
+     * When the device is moving, GNSS course (true north) is a strong prior for the walking direction
+     * arrow and PDR heading at the first fusion update.
+     */
+    private void maybeSeedInitialHeadingBiasFromGnssCourse() {
+        if (pfInitialized || Float.isNaN(lastGnssCourseRad)) {
+            return;
+        }
+        if (orientation == null || orientation.length == 0 || Float.isNaN(orientation[0])) {
+            return;
+        }
+        float rawHeading = orientation[0];
+        float delta = normalizeHeadingDelta(lastGnssCourseRad - rawHeading);
+        headingBiasRad = Math.max(-MAX_HEADING_BIAS_RAD, Math.min(MAX_HEADING_BIAS_RAD, delta));
+    }
+
     private void maybeCalibrateHeadingBiasFromAbsoluteFix(double fixX, double fixY, float accuracyMeters) {
         if (Float.isNaN(accuracyMeters) || accuracyMeters > MAX_BIAS_CALIBRATION_FIX_ACCURACY_M) {
             return;
@@ -1260,15 +1419,95 @@ public class SensorFusion implements SensorEventListener, Observer {
         return new ParticleFilterEngine(
                 new ParticleInitializer(),
                 this::isValidParticlePrediction,
-                this::allowsMapBasedFloorTransition
+                this::allowsMapBasedFloorTransition,
+                this::isValidPathSegmentForMapMatching
         );
     }
 
     /**
-     * When map_shapes provides stairs/lift polygons for the UI-selected floor, only allow a change
-     * in particle floor (from barometer / PdrProcessing) if the step starts or ends inside one
-     * of those zones. If no transition geometry is loaded, fail-open so height-based floor still works.
-     * WiFi/GNSS absolute fixes use {@link #handleAbsoluteFix} and are not gated here.
+     * Rejects straight-line motion that enters a wall polygon or leaves the venue footprint,
+     * even when both endpoints look valid (thin walls / concave outlines).
+     */
+    private boolean isValidPathSegmentForMapMatching(
+            double fromX,
+            double fromY,
+            double toX,
+            double toY,
+            int fromFloor,
+            int toFloor
+    ) {
+        if (fromFloor != toFloor) {
+            return true;
+        }
+        if (coordinateConverter == null) {
+            return true;
+        }
+        LatLng a = coordinateConverter.toLatLng(fromX, fromY);
+        LatLng b = coordinateConverter.toLatLng(toX, toY);
+        if (a == null || b == null) {
+            return true;
+        }
+        if (MapConstraintRepository.hasWallConstraints()) {
+            if (MapConstraintRepository.isPointInsideWall(a) || MapConstraintRepository.isPointInsideWall(b)) {
+                return false;
+            }
+            if (MapConstraintRepository.segmentIntersectsAnyWallPolygon(a, b)) {
+                return false;
+            }
+        }
+        if (MapConstraintRepository.hasVenueOutline()) {
+            if (!MapConstraintRepository.isPointInsideVenueOutline(a)
+                    || !MapConstraintRepository.isPointInsideVenueOutline(b)) {
+                return false;
+            }
+            if (MapConstraintRepository.segmentLeavesVenueInterior(a, b)) {
+                return false;
+            }
+        }
+        return isValidParticlePrediction(fromX, fromY, fromFloor)
+                && isValidParticlePrediction(toX, toY, toFloor);
+    }
+
+    /**
+     * Largest {@code t in [0,1]} such that the segment from {@code (fromX,fromY)} to the interpolated
+     * endpoint passes map constraints. Lets the user slide along walls instead of freezing when the full
+     * step would cross a wall or leave the venue.
+     */
+    private double clipSegmentToMapMaxTFraction(
+            double fromX,
+            double fromY,
+            double toX,
+            double toY,
+            int floor
+    ) {
+        if (isValidPathSegmentForMapMatching(fromX, fromY, toX, toY, floor, floor)) {
+            return 1.0;
+        }
+        double dx = toX - fromX;
+        double dy = toY - fromY;
+        if (dx == 0.0 && dy == 0.0) {
+            return 0.0;
+        }
+        double lo = 0.0;
+        double hi = 1.0;
+        for (int i = 0; i < MAP_CLIP_SEGMENT_ITERS; i++) {
+            double mid = (lo + hi) * 0.5;
+            double mx = fromX + dx * mid;
+            double my = fromY + dy * mid;
+            if (isValidPathSegmentForMapMatching(fromX, fromY, mx, my, floor, floor)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    /**
+     * Map-matching floor changes (assignment 3.2): only near lift or stairs features. Lift zones
+     * allow barometer-driven vertical moves with little horizontal motion; stairs require meaningful
+     * horizontal displacement so lifts and stairs are distinguishable at the motion-model level.
+     * If no transition geometry is loaded, fail-open. WiFi/GNSS fixes are not gated here.
      */
     private boolean allowsMapBasedFloorTransition(
             double previousXMeters,
@@ -1292,8 +1531,24 @@ public class SensorFusion implements SensorEventListener, Observer {
         if (previousLatLng == null || predictedLatLng == null) {
             return true;
         }
-        return MapConstraintRepository.isPointInsideTransitionZone(previousLatLng)
-                || MapConstraintRepository.isPointInsideTransitionZone(predictedLatLng);
+        boolean inLift = MapConstraintRepository.isPointInsideLiftZone(previousLatLng)
+                || MapConstraintRepository.isPointInsideLiftZone(predictedLatLng);
+        boolean inStairs = MapConstraintRepository.isPointInsideStairsZone(previousLatLng)
+                || MapConstraintRepository.isPointInsideStairsZone(predictedLatLng);
+        if (!inLift && !inStairs) {
+            return false;
+        }
+        if (inLift) {
+            return true;
+        }
+        double horizontalParticleMeters = Math.hypot(
+                predictedXMeters - previousXMeters,
+                predictedYMeters - previousYMeters);
+        double motionMeters = Math.max(horizontalParticleMeters, lastFloorGateStepLengthM);
+        if (lastFloorGateElevatorLikely && motionMeters < MIN_STAIRS_HORIZONTAL_FOR_FLOOR_GATE_M) {
+            return false;
+        }
+        return motionMeters >= MIN_STAIRS_HORIZONTAL_FOR_FLOOR_GATE_M;
     }
 
     private boolean isValidParticlePrediction(double x, double y, int floor) {
@@ -1592,6 +1847,28 @@ public class SensorFusion implements SensorEventListener, Observer {
         return getCorrectedHeadingRad();
     }
 
+    /**
+     * Heading for map arrow: matches calibrated sensor azimuth with the particle filter’s mean
+     * heading so the icon aligns with fused motion (RecordingFragment should use this, not raw
+     * {@link #passOrientation()}).
+     */
+    public float getMapHeadingRad() {
+        float sensorHeading = getCorrectedHeadingRad();
+        if (!pfInitialized || particleFilterEngine == null) {
+            return sensorHeading;
+        }
+        double particleHeading = particleFilterEngine.getWeightedMeanHeadingRad();
+        if (Double.isNaN(particleHeading)) {
+            return sensorHeading;
+        }
+        // Prefer calibrated magnetometer for display stability; blend PF heading to match fused track.
+        final double ws = 0.62;
+        final double wp = 0.38;
+        double sx = ws * Math.sin(sensorHeading) + wp * Math.sin(particleHeading);
+        double sy = ws * Math.cos(sensorHeading) + wp * Math.cos(particleHeading);
+        return normalizeHeading((float) Math.atan2(sx, sy));
+    }
+
     private void compensatePdrDriftWithFusedPose(float fixAccuracyMeters) {
         if (latestFusedPose == null || pdrProcessing == null) {
             return;
@@ -1810,6 +2087,57 @@ public class SensorFusion implements SensorEventListener, Observer {
         return this.elevator;
     }
 
+    private void updateElevatorStateFromBarometer(long currentTimeMs) {
+        if (pdrProcessing == null) {
+            return;
+        }
+
+        float[] currentPdr = pdrProcessing.getPDRMovement();
+        if (currentPdr == null || currentPdr.length < 2) {
+            return;
+        }
+
+        if (!Float.isFinite(elevatorAnchorXMeters)
+                || !Float.isFinite(elevatorAnchorYMeters)
+                || !Float.isFinite(elevatorAnchorElevationMeters)) {
+            elevatorAnchorXMeters = currentPdr[0];
+            elevatorAnchorYMeters = currentPdr[1];
+            elevatorAnchorElevationMeters = this.elevation;
+        }
+
+        double anchorDistance = Math.hypot(
+                currentPdr[0] - elevatorAnchorXMeters,
+                currentPdr[1] - elevatorAnchorYMeters
+        );
+        boolean withinElevatorRange = anchorDistance <= ELEVATOR_STATIONARY_RADIUS_M;
+        if (!this.elevator && !withinElevatorRange) {
+            // Start a new local "elevator-sized" anchor region when user walks away.
+            elevatorAnchorXMeters = currentPdr[0];
+            elevatorAnchorYMeters = currentPdr[1];
+            elevatorAnchorElevationMeters = this.elevation;
+            withinElevatorRange = true;
+        }
+
+        boolean elevationChangedEnough = Math.abs(
+                this.elevation - elevatorAnchorElevationMeters
+        ) >= ELEVATOR_ELEVATION_CHANGE_THRESHOLD_M;
+
+        if (withinElevatorRange && elevationChangedEnough) {
+            elevatorForceOnUntilMs = currentTimeMs + ELEVATOR_FORCE_ON_DURATION_MS;
+        }
+
+        boolean desiredElevator = elevatorForceOnUntilMs > currentTimeMs;
+        if (desiredElevator != this.elevator) {
+            this.elevator = desiredElevator;
+        }
+
+        if (!desiredElevator && !withinElevatorRange) {
+            elevatorAnchorXMeters = Float.NaN;
+            elevatorAnchorYMeters = Float.NaN;
+            elevatorAnchorElevationMeters = Float.NaN;
+        }
+    }
+
     /**
      * Estimates position of the phone based on proximity and light sensors.
      *
@@ -1973,6 +2301,10 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.pdrProcessing.resetPDR();
         this.elevation = 0f;
         this.elevator = false;
+        this.elevatorAscentStreak = 0;
+        this.elevatorAnchorXMeters = Float.NaN;
+        this.elevatorAnchorYMeters = Float.NaN;
+        this.elevatorAnchorElevationMeters = Float.NaN;
         this.particleFilterEngine = createParticleFilterEngine();
         this.pfInitialized = false;
         this.latestFusedPose = null;
@@ -1981,6 +2313,12 @@ public class SensorFusion implements SensorEventListener, Observer {
                 : null;
         this.lastPredictHeadingRad = getCorrectedHeadingRad();
         this.lastPredictElevation = this.elevation;
+        this.lastFloorGateStepLengthM = 0f;
+        this.lastFloorGateElevatorLikely = false;
+        this.lastGnssCourseRad = Float.NaN;
+        this.pendingBestOriginLat = Double.NaN;
+        this.pendingBestOriginLon = Double.NaN;
+        this.pendingBestAccuracyM = Float.POSITIVE_INFINITY;
         this.lastRecordedFusedPoseTimestampMs = -1L;
         this.headingBiasRad = 0f;
         this.lastHeadingCalibrationFixX = Double.NaN;

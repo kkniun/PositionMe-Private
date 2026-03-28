@@ -16,41 +16,59 @@ import java.util.Random;
  */
 public class ParticleFilterEngine {
 
+    /**
+     * Optional segment-wise map check (e.g. wall crossing) in local metres / floor indices.
+     */
+    public interface PathSegmentValidator {
+        boolean isValidSegment(
+                double fromX,
+                double fromY,
+                double toX,
+                double toY,
+                int fromFloor,
+                int toFloor
+        );
+    }
+
     private static final int DEFAULT_PARTICLE_COUNT = 100;
     private static final double DEFAULT_INITIAL_STD_M = 2.0;
-    private static final double DEFAULT_PREDICTION_NOISE_STD_M = 0.15;
-    private static final double MIN_PREDICTION_NOISE_STD_M = 0.03;
-    private static final double PREDICTION_NOISE_SCALE_WITH_STEP = 0.18;
-    private static final double DEFAULT_HEADING_NOISE_STD_RAD = Math.toRadians(4.0);
+    private static final double DEFAULT_PREDICTION_NOISE_STD_M = 0.095;
+    private static final double MIN_PREDICTION_NOISE_STD_M = 0.025;
+    private static final double PREDICTION_NOISE_SCALE_WITH_STEP = 0.14;
+    private static final double DEFAULT_HEADING_NOISE_STD_RAD = Math.toRadians(2.75);
     private static final double DEFAULT_ABSOLUTE_FIX_STD_M = 4.0;
     private static final double FLOOR_MISMATCH_PENALTY = 0.2;
-    private static final double RESAMPLE_THRESHOLD_RATIO = 0.5;
+    private static final double RESAMPLE_THRESHOLD_RATIO = 0.42;
     private static final double MIN_WEIGHT = 1e-12;
     private static final double RECOVERY_DISTANCE_STD_MULTIPLIER = 6.0;
     private static final double MIN_RECOVERY_DISTANCE_M = 8.0;
     private static final double MIN_SUPPORT_WEIGHT_RATIO = 0.2;
     private static final double MIN_HEIGHT_DELTA_FOR_FLOOR_CHANGE_M = 1.5;
-    private static final int PATH_VALIDATION_SAMPLES = 6;
+    private static final int PATH_VALIDATION_SAMPLES = 18;
     private static final double MIN_STAIRS_STEP_LENGTH_M = 0.25;
+    /** Use the top-weight particles covering this fraction of mass for the reported XY (reduces tail-pull from stale modes). */
+    private static final double ROBUST_MEAN_WEIGHT_COVER = 0.78;
 
     private final ParticleInitializer particleInitializer;
     private final ParticleInitializer.SpawnValidator spawnValidator;
     @Nullable
     private final FloorTransitionGate floorTransitionGate;
+    @Nullable
+    private final PathSegmentValidator pathSegmentValidator;
     private final Random random;
     private final List<Particle> particles = new ArrayList<>();
 
     private long lastTimestampMs;
 
     public ParticleFilterEngine() {
-        this(new ParticleInitializer(), ParticleInitializer.allowAll(), null, new Random());
+        this(new ParticleInitializer(), ParticleInitializer.allowAll(), null, null, new Random());
     }
 
     public ParticleFilterEngine(
             ParticleInitializer particleInitializer,
             ParticleInitializer.SpawnValidator spawnValidator
     ) {
-        this(particleInitializer, spawnValidator, null, new Random());
+        this(particleInitializer, spawnValidator, null, null, new Random());
     }
 
     /**
@@ -62,7 +80,19 @@ public class ParticleFilterEngine {
             ParticleInitializer.SpawnValidator spawnValidator,
             @Nullable FloorTransitionGate floorTransitionGate
     ) {
-        this(particleInitializer, spawnValidator, floorTransitionGate, new Random());
+        this(particleInitializer, spawnValidator, floorTransitionGate, null, new Random());
+    }
+
+    /**
+     * @param pathSegmentValidator if non-null, each step segment is validated (wall crossing, etc.)
+     */
+    public ParticleFilterEngine(
+            ParticleInitializer particleInitializer,
+            ParticleInitializer.SpawnValidator spawnValidator,
+            @Nullable FloorTransitionGate floorTransitionGate,
+            @Nullable PathSegmentValidator pathSegmentValidator
+    ) {
+        this(particleInitializer, spawnValidator, floorTransitionGate, pathSegmentValidator, new Random());
     }
 
     ParticleFilterEngine(
@@ -70,7 +100,7 @@ public class ParticleFilterEngine {
             ParticleInitializer.SpawnValidator spawnValidator,
             Random random
     ) {
-        this(particleInitializer, spawnValidator, null, random);
+        this(particleInitializer, spawnValidator, null, null, random);
     }
 
     ParticleFilterEngine(
@@ -79,11 +109,22 @@ public class ParticleFilterEngine {
             @Nullable FloorTransitionGate floorTransitionGate,
             Random random
     ) {
+        this(particleInitializer, spawnValidator, floorTransitionGate, null, random);
+    }
+
+    ParticleFilterEngine(
+            ParticleInitializer particleInitializer,
+            ParticleInitializer.SpawnValidator spawnValidator,
+            @Nullable FloorTransitionGate floorTransitionGate,
+            @Nullable PathSegmentValidator pathSegmentValidator,
+            Random random
+    ) {
         this.particleInitializer = particleInitializer;
         this.spawnValidator = spawnValidator == null
                 ? ParticleInitializer.allowAll()
                 : spawnValidator;
         this.floorTransitionGate = floorTransitionGate;
+        this.pathSegmentValidator = pathSegmentValidator;
         this.random = random;
     }
 
@@ -141,7 +182,7 @@ public class ParticleFilterEngine {
         double stepLengthMeters = Math.max(0.0, delta.getStepLengthMeters());
         double deltaHeadingRad = delta.getDeltaHeadingRad();
         double heightDeltaMeters = delta.getHeightDeltaMeters();
-            boolean elevatorLikely = delta.isElevatorLikely();
+        boolean elevatorLikely = delta.isElevatorLikely();
         double predictionNoiseStd = Math.max(
                 MIN_PREDICTION_NOISE_STD_M,
                 Math.min(DEFAULT_PREDICTION_NOISE_STD_M, stepLengthMeters * PREDICTION_NOISE_SCALE_WITH_STEP)
@@ -371,16 +412,9 @@ public class ParticleFilterEngine {
         boolean useAllParticles = selectedFloorWeight <= 0.0;
         double normalizationBase = useAllParticles ? totalWeight : selectedFloorWeight * totalWeight;
 
-        double meanX = 0.0;
-        double meanY = 0.0;
-        for (Particle particle : particles) {
-            if (!useAllParticles && particle.getFloor() != estimatedFloor) {
-                continue;
-            }
-            double normalizedWeight = sanitizeWeight(particle.getWeight()) / normalizationBase;
-            meanX += particle.getX() * normalizedWeight;
-            meanY += particle.getY() * normalizedWeight;
-        }
+        double[] robustMean = computeRobustWeightedMeanXY(particles, estimatedFloor, useAllParticles);
+        double meanX = robustMean[0];
+        double meanY = robustMean[1];
 
         double variance = 0.0;
         for (Particle particle : particles) {
@@ -398,6 +432,58 @@ public class ParticleFilterEngine {
         long timestamp = lastTimestampMs > 0 ? lastTimestampMs : System.currentTimeMillis();
 
         return new FusedPose(meanX, meanY, estimatedFloor, confidence, timestamp);
+    }
+
+    /**
+     * Weighted mean over the heaviest particles that carry {@link #ROBUST_MEAN_WEIGHT_COVER} of the
+     * on-floor mass. Ignores long low-weight tails that often correspond to rejected-but-not-resampled ghosts.
+     */
+    private double[] computeRobustWeightedMeanXY(
+            List<Particle> particleList,
+            int estimatedFloor,
+            boolean useAllParticles
+    ) {
+        List<Particle> floorParticles = new ArrayList<>();
+        for (Particle particle : particleList) {
+            if (!useAllParticles && particle.getFloor() != estimatedFloor) {
+                continue;
+            }
+            double w = sanitizeWeight(particle.getWeight());
+            if (w > 0.0) {
+                floorParticles.add(particle);
+            }
+        }
+        if (floorParticles.isEmpty()) {
+            return new double[]{0.0, 0.0};
+        }
+        floorParticles.sort((a, b) -> Double.compare(
+                sanitizeWeight(b.getWeight()),
+                sanitizeWeight(a.getWeight())
+        ));
+        double floorMass = 0.0;
+        for (Particle p : floorParticles) {
+            floorMass += sanitizeWeight(p.getWeight());
+        }
+        double targetCover = ROBUST_MEAN_WEIGHT_COVER * floorMass;
+        double cum = 0.0;
+        double sumW = 0.0;
+        double sumX = 0.0;
+        double sumY = 0.0;
+        for (Particle p : floorParticles) {
+            double w = sanitizeWeight(p.getWeight());
+            cum += w;
+            sumX += p.getX() * w;
+            sumY += p.getY() * w;
+            sumW += w;
+            if (cum >= targetCover) {
+                break;
+            }
+        }
+        if (sumW <= 0.0) {
+            Particle p0 = floorParticles.get(0);
+            return new double[]{p0.getX(), p0.getY()};
+        }
+        return new double[]{sumX / sumW, sumY / sumW};
     }
 
     private double sanitizeAccuracyMeters(double accuracyMeters) {
@@ -458,7 +544,15 @@ public class ParticleFilterEngine {
         normalizeWeights();
     }
 
-    private double estimateCircularMeanHeading() {
+    /**
+     * Weighted circular mean heading of the particle cloud (same convention as PDR azimuth).
+     *
+     * @return radians, or NaN if undefined
+     */
+    public double getWeightedMeanHeadingRad() {
+        if (particles.isEmpty()) {
+            return Double.NaN;
+        }
         double sinSum = 0.0;
         double cosSum = 0.0;
         double weightSum = 0.0;
@@ -472,9 +566,14 @@ public class ParticleFilterEngine {
             weightSum += weight;
         }
         if (weightSum <= 0.0 || (Math.abs(sinSum) < 1e-9 && Math.abs(cosSum) < 1e-9)) {
-            return 0.0;
+            return Double.NaN;
         }
         return normalizeHeading(Math.atan2(sinSum, cosSum));
+    }
+
+    private double estimateCircularMeanHeading() {
+        double h = getWeightedMeanHeadingRad();
+        return Double.isNaN(h) ? 0.0 : h;
     }
 
     private double sanitizeWeight(double weight) {
@@ -521,6 +620,10 @@ public class ParticleFilterEngine {
         }
         if (fromFloor != toFloor) {
             return true;
+        }
+        if (pathSegmentValidator != null
+                && !pathSegmentValidator.isValidSegment(fromX, fromY, toX, toY, fromFloor, toFloor)) {
+            return false;
         }
         for (int i = 1; i < PATH_VALIDATION_SAMPLES; i++) {
             double t = i / (double) PATH_VALIDATION_SAMPLES;

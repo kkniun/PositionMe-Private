@@ -576,19 +576,22 @@ public class IndoorMapManager {
             return;
         }
 
-// clamp currentFloor 到 key 范围
+        // Clamp currentFloor to the available shape key range.
         currentFloor = Math.max(0, Math.min(currentFloor, keys.size() - 1));
         String key = keys.get(currentFloor);
 
         List<List<LatLng>> wallPolygons = extractWallPolygonsForKey(payload, key);
-        List<List<LatLng>> transitionPolygons = extractTransitionPolygonsForKey(payload, key);
+        List<List<LatLng>> liftPolygons = new ArrayList<>();
+        List<List<LatLng>> stairsPolygons = new ArrayList<>();
+        extractTransitionPolygonsForKey(payload, key, liftPolygons, stairsPolygons);
         MapConstraintRepository.updateCurrentFloorConstraints(
                 venue.id,
                 key,
                 currentFloor,
                 venue.outline,
                 wallPolygons,
-                transitionPolygons
+                liftPolygons,
+                stairsPolygons
         );
 
         int[] counts = new int[]{0, 0};
@@ -623,14 +626,17 @@ public class IndoorMapManager {
         String key = keys.get(shapeFloorIndex);
 
         List<List<LatLng>> wallPolygons = extractWallPolygonsForKey(venue.mapShapesPayload, key);
-        List<List<LatLng>> transitionPolygons = extractTransitionPolygonsForKey(venue.mapShapesPayload, key);
+        List<List<LatLng>> liftPolygons = new ArrayList<>();
+        List<List<LatLng>> stairsPolygons = new ArrayList<>();
+        extractTransitionPolygonsForKey(venue.mapShapesPayload, key, liftPolygons, stairsPolygons);
         MapConstraintRepository.updateCurrentFloorConstraints(
                 venue.id,
                 key,
                 shapeFloorIndex,
                 venue.outline,
                 wallPolygons,
-                transitionPolygons
+                liftPolygons,
+                stairsPolygons
         );
     }
 
@@ -732,9 +738,15 @@ public class IndoorMapManager {
     }
 
     private static boolean isTransitionSemanticTag(@NonNull String tag) {
-        return "stairs".equals(tag) || "stair".equals(tag)
-                || "lift".equals(tag) || "elevator".equals(tag)
-                || "escalator".equals(tag);
+        return isLiftSemanticTag(tag) || isStairsSemanticTag(tag);
+    }
+
+    private static boolean isLiftSemanticTag(@NonNull String tag) {
+        return "lift".equals(tag) || "elevator".equals(tag);
+    }
+
+    private static boolean isStairsSemanticTag(@NonNull String tag) {
+        return "stairs".equals(tag) || "stair".equals(tag) || "escalator".equals(tag);
     }
 
     private void collectWallPolygonsFromGeometry(
@@ -777,29 +789,32 @@ public class IndoorMapManager {
         }
     }
 
-    @NonNull
-    private List<List<LatLng>> extractTransitionPolygonsForKey(@NonNull String payload, @NonNull String floorKey) {
-        List<List<LatLng>> transitionPolygons = new ArrayList<>();
+    private void extractTransitionPolygonsForKey(
+            @NonNull String payload,
+            @NonNull String floorKey,
+            @NonNull List<List<LatLng>> liftPolygons,
+            @NonNull List<List<LatLng>> stairsPolygons
+    ) {
         try {
             JSONObject root = new JSONObject(payload.trim());
             Object child = root.opt(floorKey);
             if (child instanceof JSONObject) {
-                collectTransitionPolygonsFromObject((JSONObject) child, transitionPolygons);
+                collectTransitionPolygonsFromObject((JSONObject) child, liftPolygons, stairsPolygons);
             } else if (child instanceof String) {
                 String raw = ((String) child).trim();
                 if (raw.startsWith("{")) {
-                    collectTransitionPolygonsFromObject(new JSONObject(raw), transitionPolygons);
+                    collectTransitionPolygonsFromObject(new JSONObject(raw), liftPolygons, stairsPolygons);
                 }
             }
         } catch (JSONException e) {
             Log.e(TAG, "Failed to extract transition polygons for key=" + floorKey, e);
         }
-        return transitionPolygons;
     }
 
     private void collectTransitionPolygonsFromObject(
             @NonNull JSONObject obj,
-            @NonNull List<List<LatLng>> transitionPolygons
+            @NonNull List<List<LatLng>> liftPolygons,
+            @NonNull List<List<LatLng>> stairsPolygons
     ) {
         if ("FeatureCollection".equalsIgnoreCase(obj.optString("type")) || obj.has("features")) {
             JSONArray features = obj.optJSONArray("features");
@@ -815,8 +830,13 @@ public class IndoorMapManager {
                 if (!isTransitionFeature(properties)) {
                     continue;
                 }
+                String tag = primarySemanticTag(properties);
                 JSONObject geometry = feature.optJSONObject("geometry");
-                collectWallPolygonsFromGeometry(geometry, transitionPolygons);
+                if (isLiftSemanticTag(tag)) {
+                    collectWallPolygonsFromGeometry(geometry, liftPolygons);
+                } else if (isStairsSemanticTag(tag)) {
+                    collectWallPolygonsFromGeometry(geometry, stairsPolygons);
+                }
             }
             return;
         }
@@ -829,12 +849,12 @@ public class IndoorMapManager {
             String key = names.optString(i, "");
             Object child = obj.opt(key);
             if (child instanceof JSONObject) {
-                collectTransitionPolygonsFromObject((JSONObject) child, transitionPolygons);
+                collectTransitionPolygonsFromObject((JSONObject) child, liftPolygons, stairsPolygons);
             } else if (child instanceof String) {
                 String raw = ((String) child).trim();
                 try {
                     if (raw.startsWith("{")) {
-                        collectTransitionPolygonsFromObject(new JSONObject(raw), transitionPolygons);
+                        collectTransitionPolygonsFromObject(new JSONObject(raw), liftPolygons, stairsPolygons);
                     }
                 } catch (JSONException ignored) {
                 }
