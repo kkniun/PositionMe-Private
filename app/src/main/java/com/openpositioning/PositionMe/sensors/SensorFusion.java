@@ -107,19 +107,15 @@ public class SensorFusion implements SensorEventListener, Observer {
     private static final String WIFI_FINGERPRINT= "wf";
     private static final String DEFAULT_COLLECTION_VENUE = "traj";
     private static final float DEFAULT_WIFI_ACCURACY_M = 5.0f;
+    /**
+     * OpenPositioning often returns the same lat/lon while the fingerprint still matches the old AP
+     * cell. Do not re-apply that fix to fusion unless the reported position moves at least this far
+     * (new cell / map point) or the reported floor changes.
+     */
+    private static final double WIFI_FUSION_MIN_DISPLACEMENT_M = 4.0;
     private static final float GNSS_GPS_ACCURACY_WEIGHT_FACTOR = 0.65f;
     private static final float GNSS_NETWORK_ACCURACY_PENALTY_FACTOR = 1.35f;
     private static final float MIN_GNSS_EFFECTIVE_ACCURACY_M = 1.5f;
-    private static final float HEADING_BIAS_ALPHA = 0.08f;
-    private static final float MAX_HEADING_BIAS_RAD = (float) Math.toRadians(45.0);
-    private static final float MAX_BIAS_CALIBRATION_FIX_ACCURACY_M = 12.0f;
-    private static final double MIN_BIAS_CALIBRATION_DISPLACEMENT_M = 2.5;
-    private static final double MIN_ABSOLUTE_FIX_START_STD_M = 1.0;
-    private static final double MIN_PDR_DRIFT_COMPENSATION_M = 1.0;
-    private static final double PDR_HARD_REANCHOR_DISTANCE_M = 18.0;
-    private static final float PDR_SOFT_REANCHOR_ALPHA = 0.18f;
-    private static final float MAX_PDR_COMPENSATION_FIX_ACCURACY_M = 15.0f;
-    private static final float PDR_HARD_REANCHOR_FIX_ACCURACY_M = 2.5f;
     //endregion
 
     //region Instance variables
@@ -219,23 +215,23 @@ public class SensorFusion implements SensorEventListener, Observer {
 
     // PDR calculation class
     private PdrProcessing pdrProcessing;
-    private ParticleFilterEngine particleFilterEngine;
-    private boolean pfInitialized;
+    private final AssignmentFusionEngine assignmentFusion = new AssignmentFusionEngine();
     private FusedPose latestFusedPose;
     private CoordinateConverter coordinateConverter;
     private boolean hasManualStartLocation;
     private float lastPredictHeadingRad;
     private float lastPredictElevation;
     private long lastRecordedFusedPoseTimestampMs;
-    private float headingBiasRad;
-    private double lastHeadingCalibrationFixX = Double.NaN;
-    private double lastHeadingCalibrationFixY = Double.NaN;
-    private float lastHeadingCalibrationFixAccuracy = Float.NaN;
 
     // Trajectory displaying class
     private PathView pathView;
     // WiFi positioning object
     private WiFiPositioning wiFiPositioning;
+    /** Last WiFi fix that was applied to {@link #assignmentFusion}; used to skip stale repeated fixes. */
+    @Nullable
+    private LatLng lastWifiLatLngAppliedToFusion;
+    @Nullable
+    private Integer lastWifiFloorAppliedToFusion;
 
     // Convert "AA:BB:CC:DD:EE:FF" -> int64 (same idea as WiFi bssid long)
     private long macStringToLong(String mac) {
@@ -352,8 +348,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.settings = PreferenceManager.getDefaultSharedPreferences(context);
         this.pathView = new PathView(context, null);
         this.wiFiPositioning = new WiFiPositioning(context);
-        this.particleFilterEngine = createParticleFilterEngine();
-        this.pfInitialized = false;
+        this.assignmentFusion.reset();
         this.latestFusedPose = null;
         this.coordinateConverter = null;
         this.hasManualStartLocation = false;
@@ -513,7 +508,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                                 "stepDetection triggered, accelMagnitude size = " + accelMagnitude.size());
                     }
 
-                    float currentHeadingRad = getCorrectedHeadingRad();
+                    float currentHeadingRad = getCurrentHeadingRad();
                     float deltaHeadingRad = normalizeHeadingDelta(currentHeadingRad - lastPredictHeadingRad);
                     float heightDeltaMeters = this.elevation - lastPredictElevation;
                     PdrDelta pdrDelta = this.pdrProcessing.buildStepDelta(
@@ -541,7 +536,6 @@ public class SensorFusion implements SensorEventListener, Observer {
                     );
                     this.lastPredictHeadingRad = currentHeadingRad;
                     this.lastPredictElevation = this.elevation;
-
 
                     if (saveRecording) {
                         this.pathView.drawTrajectory(newCords);
@@ -894,6 +888,27 @@ public class SensorFusion implements SensorEventListener, Observer {
 
 
     /**
+     * Apply WiFi to fusion only when the server returns a meaningfully new estimate (different map
+     * point or floor). Repeated identical fixes would otherwise drag fused/PDR back to the old AP cell.
+     */
+    private boolean shouldApplyWifiFixToFusion(@NonNull LatLng wifiLocation, int floor) {
+        if (lastWifiLatLngAppliedToFusion == null) {
+            return true;
+        }
+        double movedMeters = UtilFunctions.distanceBetweenPoints(
+                lastWifiLatLngAppliedToFusion,
+                wifiLocation
+        );
+        boolean floorChanged = lastWifiFloorAppliedToFusion == null
+                || floor != lastWifiFloorAppliedToFusion;
+        if (movedMeters >= WIFI_FUSION_MIN_DISPLACEMENT_M || floorChanged) {
+            return true;
+        }
+        Log.d("SensorFusion", "WiFi fusion skipped (same fix as last apply): d=" + movedMeters + "m");
+        return false;
+    }
+
+    /**
      * Function to create a request to obtain a wifi location for the obtained wifi fingerprint
      *
      */
@@ -922,6 +937,14 @@ public class SensorFusion implements SensorEventListener, Observer {
                     if (wifiLocation == null) {
                         return;
                     }
+                    if (!shouldApplyWifiFixToFusion(wifiLocation, floor)) {
+                        return;
+                    }
+                    lastWifiLatLngAppliedToFusion = new LatLng(
+                            wifiLocation.latitude,
+                            wifiLocation.longitude
+                    );
+                    lastWifiFloorAppliedToFusion = floor;
                     handleAbsoluteFixInternal(
                             new AbsoluteFix(
                                     System.currentTimeMillis(),
@@ -1013,39 +1036,43 @@ public class SensorFusion implements SensorEventListener, Observer {
             return;
         }
 
-        if (this.particleFilterEngine == null) {
-            this.particleFilterEngine = createParticleFilterEngine();
-        }
-
         CoordinateConverter converter = getOrCreateCoordinateConverter(latitudeDeg, longitudeDeg);
         if (converter == null) {
             return;
         }
         maybeSetInitialPositionIfAbsent(this.trajectory, latitudeDeg, longitudeDeg);
         double[] localFix = converter.toLocalMeters(latitudeDeg, longitudeDeg);
-        maybeCalibrateHeadingBiasFromAbsoluteFix(localFix[0], localFix[1], accuracyMeters);
-        this.latestFusedPose = applyAbsoluteFixForStep1(
-                this.particleFilterEngine,
-                converter,
-                this.pfInitialized,
-                latitudeDeg,
-                longitudeDeg,
-                initializationFloor,
-                floorPrior,
-                timestampMs,
-                accuracyMeters,
-                getCorrectedHeadingRad()
-        );
-        this.pfInitialized = this.latestFusedPose != null;
+
+        if (!assignmentFusion.isInitialized()) {
+            this.latestFusedPose = assignmentFusion.initFromAbsolute(
+                    localFix[0],
+                    localFix[1],
+                    initializationFloor,
+                    timestampMs,
+                    getCurrentHeadingRad()
+            );
+        } else {
+            this.latestFusedPose = assignmentFusion.applyAbsoluteObservation(
+                    localFix[0],
+                    localFix[1],
+                    floorPrior,
+                    accuracyMeters,
+                    timestampMs
+            );
+        }
+
         if (this.latestFusedPose != null) {
             this.pdrProcessing.updateStepScaleFromAbsoluteFix(
                     (float) this.latestFusedPose.getX(),
                     (float) this.latestFusedPose.getY(),
                     accuracyMeters
             );
+            this.pdrProcessing.setPdrPosition(
+                    (float) this.latestFusedPose.getX(),
+                    (float) this.latestFusedPose.getY()
+            );
         }
-        compensatePdrDriftWithFusedPose(accuracyMeters);
-        this.lastPredictHeadingRad = getCorrectedHeadingRad();
+        this.lastPredictHeadingRad = getCurrentHeadingRad();
         this.lastPredictElevation = this.elevation;
         recordLatestFusedPoseIfNeeded();
     }
@@ -1067,18 +1094,16 @@ public class SensorFusion implements SensorEventListener, Observer {
             return;
         }
 
-        // Formal fusion flow must wait for the first real absolute fix.
-        // PDR-only prediction is ignored until GNSS/WiFi/other absolute positioning arrives.
-        if (!pfInitialized || this.particleFilterEngine == null || pdrDelta == null) {
+        if (!assignmentFusion.isInitialized() || pdrDelta == null) {
             return;
         }
 
-        this.latestFusedPose = applyPdrPredictionForStep1(
-                this.particleFilterEngine,
-                this.pfInitialized,
+        this.latestFusedPose = assignmentFusion.predictFromPdr(
                 pdrDelta,
                 floor,
-                timestampMs
+                timestampMs,
+                this::allowsMapBasedFloorTransition,
+                this::isValidParticlePrediction
         );
         recordLatestFusedPoseIfNeeded();
     }
@@ -1088,7 +1113,7 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     public boolean isWaitingForAbsoluteFix() {
-        return saveRecording && !pfInitialized;
+        return saveRecording && !assignmentFusion.isInitialized();
     }
 
     @Nullable
@@ -1168,100 +1193,11 @@ public class SensorFusion implements SensorEventListener, Observer {
         return getCurrentFloor();
     }
 
-    static FusedPose applyAbsoluteFixForStep1(
-            @NonNull ParticleFilterEngine particleFilterEngine,
-            @NonNull CoordinateConverter coordinateConverter,
-            boolean pfInitialized,
-            double latitudeDeg,
-            double longitudeDeg,
-            int initializationFloor,
-            @Nullable Integer floorPrior,
-            long timestampMs,
-            float accuracyMeters,
-            float headingRad
-    ) {
-        double[] localFix = coordinateConverter.toLocalMeters(latitudeDeg, longitudeDeg);
-        if (!pfInitialized) {
-            particleFilterEngine.initialize(
-                    localFix[0],
-                    localFix[1],
-                    initializationFloor,
-                    timestampMs,
-                    headingRad,
-                    Math.max(MIN_ABSOLUTE_FIX_START_STD_M, accuracyMeters)
-            );
-        } else {
-            particleFilterEngine.updateWithAbsoluteFix(
-                    localFix[0],
-                    localFix[1],
-                    floorPrior,
-                    timestampMs,
-                    accuracyMeters
-            );
-        }
-        return particleFilterEngine.estimatePose();
-    }
-
-    @Nullable
-    static FusedPose applyPdrPredictionForStep1(
-            @NonNull ParticleFilterEngine particleFilterEngine,
-            boolean pfInitialized,
-            @Nullable PdrDelta pdrDelta,
-            int floor,
-            long timestampMs
-    ) {
-        if (!pfInitialized || pdrDelta == null) {
-            return particleFilterEngine.estimatePose();
-        }
-        particleFilterEngine.predict(pdrDelta, floor, timestampMs);
-        return particleFilterEngine.estimatePose();
-    }
-
     private float getCurrentHeadingRad() {
         if (orientation == null || orientation.length == 0 || Float.isNaN(orientation[0])) {
             return 0f;
         }
         return orientation[0];
-    }
-
-    private float getCorrectedHeadingRad() {
-        float rawHeading = getCurrentHeadingRad();
-        return normalizeHeading(rawHeading + headingBiasRad);
-    }
-
-    private void maybeCalibrateHeadingBiasFromAbsoluteFix(double fixX, double fixY, float accuracyMeters) {
-        if (Float.isNaN(accuracyMeters) || accuracyMeters > MAX_BIAS_CALIBRATION_FIX_ACCURACY_M) {
-            return;
-        }
-
-        if (!Double.isNaN(lastHeadingCalibrationFixX)
-                && !Double.isNaN(lastHeadingCalibrationFixY)
-                && !Float.isNaN(lastHeadingCalibrationFixAccuracy)
-                && lastHeadingCalibrationFixAccuracy <= MAX_BIAS_CALIBRATION_FIX_ACCURACY_M) {
-            double dx = fixX - lastHeadingCalibrationFixX;
-            double dy = fixY - lastHeadingCalibrationFixY;
-            double displacement = Math.hypot(dx, dy);
-            if (displacement >= MIN_BIAS_CALIBRATION_DISPLACEMENT_M) {
-                float motionHeading = (float) Math.atan2(dx, dy);
-                float sensorHeading = getCurrentHeadingRad();
-                float observedBias = normalizeHeadingDelta(motionHeading - sensorHeading);
-                float biasError = normalizeHeadingDelta(observedBias - headingBiasRad);
-                headingBiasRad = normalizeHeadingDelta(headingBiasRad + HEADING_BIAS_ALPHA * biasError);
-                headingBiasRad = Math.max(-MAX_HEADING_BIAS_RAD, Math.min(MAX_HEADING_BIAS_RAD, headingBiasRad));
-            }
-        }
-
-        lastHeadingCalibrationFixX = fixX;
-        lastHeadingCalibrationFixY = fixY;
-        lastHeadingCalibrationFixAccuracy = accuracyMeters;
-    }
-
-    private ParticleFilterEngine createParticleFilterEngine() {
-        return new ParticleFilterEngine(
-                new ParticleInitializer(),
-                this::isValidParticlePrediction,
-                this::allowsMapBasedFloorTransition
-        );
     }
 
     /**
@@ -1585,41 +1521,10 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     /**
-     * Heading used by fusion after bias calibration.
-     * This should be used for map arrow rotation to keep UI consistent with PF/PDR prediction.
+     * Alias for {@link #passOrientation()} kept for API compatibility.
      */
     public float passCorrectedOrientation() {
-        return getCorrectedHeadingRad();
-    }
-
-    private void compensatePdrDriftWithFusedPose(float fixAccuracyMeters) {
-        if (latestFusedPose == null || pdrProcessing == null) {
-            return;
-        }
-        if (Float.isNaN(fixAccuracyMeters) || fixAccuracyMeters > MAX_PDR_COMPENSATION_FIX_ACCURACY_M) {
-            return;
-        }
-
-        float[] rawPdr = pdrProcessing.getPDRMovement();
-        if (rawPdr == null || rawPdr.length < 2) {
-            return;
-        }
-        double driftX = latestFusedPose.getX() - rawPdr[0];
-        double driftY = latestFusedPose.getY() - rawPdr[1];
-        double driftDistance = Math.hypot(driftX, driftY);
-        if (driftDistance < MIN_PDR_DRIFT_COMPENSATION_M) {
-            return;
-        }
-
-        if (driftDistance >= PDR_HARD_REANCHOR_DISTANCE_M
-                && fixAccuracyMeters <= PDR_HARD_REANCHOR_FIX_ACCURACY_M) {
-            pdrProcessing.setPdrPosition((float) latestFusedPose.getX(), (float) latestFusedPose.getY());
-            return;
-        }
-
-        float correctedX = (float) (rawPdr[0] + (driftX * PDR_SOFT_REANCHOR_ALPHA));
-        float correctedY = (float) (rawPdr[1] + (driftY * PDR_SOFT_REANCHOR_ALPHA));
-        pdrProcessing.setPdrPosition(correctedX, correctedY);
+        return passOrientation();
     }
 
     private void updateOrientationFromRotationVector(float[] rotationVectorValues) {
@@ -1973,19 +1878,16 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.pdrProcessing.resetPDR();
         this.elevation = 0f;
         this.elevator = false;
-        this.particleFilterEngine = createParticleFilterEngine();
-        this.pfInitialized = false;
+        this.assignmentFusion.reset();
         this.latestFusedPose = null;
         this.coordinateConverter = hasManualStartLocation && startLocation != null && startLocation.length >= 2
                 ? new CoordinateConverter(startLocation[0], startLocation[1])
                 : null;
-        this.lastPredictHeadingRad = getCorrectedHeadingRad();
+        this.lastPredictHeadingRad = getCurrentHeadingRad();
         this.lastPredictElevation = this.elevation;
         this.lastRecordedFusedPoseTimestampMs = -1L;
-        this.headingBiasRad = 0f;
-        this.lastHeadingCalibrationFixX = Double.NaN;
-        this.lastHeadingCalibrationFixY = Double.NaN;
-        this.lastHeadingCalibrationFixAccuracy = Float.NaN;
+        this.lastWifiLatLngAppliedToFusion = null;
+        this.lastWifiFloorAppliedToFusion = null;
         if(settings.getBoolean("overwrite_constants", false)) {
             this.filter_coefficient = Float.parseFloat(settings.getString("accel_filter", "0.96"));
         } else {

@@ -1,7 +1,7 @@
 package com.openpositioning.PositionMe.sensors;
 
 /**
- * Decides whether a particle may change floor during {@link ParticleFilterEngine#predict}.
+ * Decides whether the fused track may change floor during a PDR prediction step.
  * Used to enforce map-based rules (e.g. only near stairs/lift polygons).
  */
 public interface FloorTransitionGate {
