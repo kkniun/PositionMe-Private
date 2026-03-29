@@ -8,6 +8,7 @@ import android.location.Location;
 import com.openpositioning.PositionMe.BuildConfig;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.Log;
 
@@ -25,6 +26,7 @@ import com.google.android.gms.maps.model.Polyline;
 import com.google.android.gms.maps.model.PolylineOptions;
 import com.google.android.gms.maps.model.Polygon;
 import com.google.android.gms.maps.model.PolygonOptions;
+import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.sensors.Wifi;
 
 import org.json.JSONArray;
@@ -51,6 +53,8 @@ import okhttp3.ResponseBody;
 
 public class IndoorMapManager {
     private final Map<String, List<String>> shapeFloorKeysCache = new HashMap<>();
+    private static final Map<String, Map<Integer, String>> floorDisplayLabelsByVenueId = new HashMap<>();
+    private static final Map<String, FloorBounds> floorBoundsByVenueId = new HashMap<>();
 
     private static final String TAG = "IndoorMapManager";
     private static final String FLOORPLAN_REQUEST_URL =
@@ -61,7 +65,8 @@ public class IndoorMapManager {
     private static final long REQUEST_INTERVAL_MS = 8_000L;
     private static final float REQUEST_DISTANCE_M = 8f;
     private static final float DEFAULT_FLOOR_HEIGHT_M = 3.6f;
-    private static final double WALL_LINE_HALF_WIDTH_M = 0.2;
+    private static final long AUTO_FLOOR_STABLE_MS = 600L;
+    private static final double WALL_LINE_HALF_WIDTH_M = 0.30;
     private static final double TRANSITION_LINE_HALF_WIDTH_M = 1.0;
     private static final int LOG_PREVIEW_LIMIT = 220;
 
@@ -81,6 +86,7 @@ public class IndoorMapManager {
     private final Map<String, BitmapDescriptor> floorImageCache = new HashMap<>();
     private final List<Polygon> floorShapePolygons = new ArrayList<>();
     private final List<Polyline> floorShapePolylines = new ArrayList<>();
+    private final AutoFloorSwitchGate autoFloorSwitchGate = new AutoFloorSwitchGate();
 
     private GroundOverlay groundOverlay;
     private LatLng currentLocation;
@@ -95,9 +101,30 @@ public class IndoorMapManager {
     private String selectedVenueId;
     private boolean autoSelectFirstVenue;
     private VenueSelectionListener venueSelectionListener;
+    @Nullable
+    private String lastNearbyVenueFingerprint;
+    @Nullable
+    private String renderedShapeVenueId;
+    @Nullable
+    private String renderedShapeFloorKey;
+    private int renderedShapePayloadHash;
+    @Nullable
+    private String renderedGroundOverlayImageUrl;
+    @Nullable
+    private LatLngBounds renderedGroundOverlayBounds;
 
     public interface VenueSelectionListener {
         void onVenueSelected(@Nullable String venueId, @Nullable String venueName);
+    }
+
+    public static final class FloorBounds {
+        public final int minFloor;
+        public final int maxFloor;
+
+        public FloorBounds(int minFloor, int maxFloor) {
+            this.minFloor = minFloor;
+            this.maxFloor = maxFloor;
+        }
     }
 
     public IndoorMapManager(@NonNull GoogleMap map) {
@@ -211,6 +238,7 @@ public class IndoorMapManager {
         if (BuildConfig.DEBUG) {
             Log.d(TAG, "FLOOR_UI: venue selected id=" + venue.id);
         }
+        autoFloorSwitchGate.reset();
         floorHeight = venue.floorHeight;
         if (!venue.floors.isEmpty()) {
             currentFloor = snapToNearestFloor(currentFloor, getAvailableImageFloors(venue));
@@ -237,10 +265,17 @@ public class IndoorMapManager {
     }
 
     public boolean hasActiveMapMatchingConstraints() {
+        return MapConstraintReadiness.hasFloorLevelActiveMapMatchingConstraints(
+                selectedVenueId,
+                hasVectorMapShapes,
+                currentFloor
+        );
+    }
+
+    public boolean hasDisplayOnlyIndoorMap() {
         return !TextUtils.isEmpty(selectedVenueId)
-                && hasVectorMapShapes
-                && (MapConstraintRepository.hasAnyConstraints()
-                || MapConstraintRepository.hasVenueOutline());
+                && isIndoorMapSet
+                && !hasVectorMapShapes;
     }
 
     public boolean hasRequestedNearbyVenues() {
@@ -269,7 +304,46 @@ public class IndoorMapManager {
 
 
     public int getCurrentFloor() {
+        // UI/map state only. This value may be a default or residual venue floor and must not be
+        // treated as a trusted absolute floor source unless the caller has already passed the
+        // trusted-floor gate from SensorFusion/UI coordination.
         return currentFloor;
+    }
+
+    @Nullable
+    public static synchronized String resolveFloorDisplayLabel(@Nullable String venueId, int absoluteFloor) {
+        if (TextUtils.isEmpty(venueId)) {
+            return null;
+        }
+        Map<Integer, String> labels = floorDisplayLabelsByVenueId.get(venueId);
+        if (labels == null) {
+            labels = floorDisplayLabelsByVenueId.get(normalizeVenueIdKey(venueId));
+        }
+        if (labels == null) {
+            return null;
+        }
+        String label = labels.get(absoluteFloor);
+        return TextUtils.isEmpty(label) ? null : label;
+    }
+
+    @Nullable
+    public static synchronized FloorBounds resolveFloorBounds(@Nullable String venueId) {
+        if (TextUtils.isEmpty(venueId)) {
+            return null;
+        }
+        FloorBounds bounds = floorBoundsByVenueId.get(venueId);
+        if (bounds == null) {
+            bounds = floorBoundsByVenueId.get(normalizeVenueIdKey(venueId));
+        }
+        return bounds;
+    }
+
+    public static synchronized int clampFloorToVenue(@Nullable String venueId, int absoluteFloor) {
+        FloorBounds bounds = resolveFloorBounds(venueId);
+        if (bounds == null) {
+            return absoluteFloor;
+        }
+        return Math.max(bounds.minFloor, Math.min(bounds.maxFloor, absoluteFloor));
     }
 
     @Nullable
@@ -300,12 +374,29 @@ public class IndoorMapManager {
                     + " currentFloor(before)=" + currentFloor
                     + " bounded(absFloor)=" + bounded);
 
+            if (autoFloor
+                    && bounded != currentFloor
+                    && !autoFloorSwitchGate.shouldApply(
+                    bounded,
+                    currentFloor,
+                    SystemClock.elapsedRealtime(),
+                    AUTO_FLOOR_STABLE_MS
+            )) {
+                return;
+            }
+
             if (bounded == currentFloor && isIndoorMapSet) {
+                autoFloorSwitchGate.reset();
                 Log.d(TAG, "NOOP map_shapes: same floor");
                 return;
             }
 
             currentFloor = bounded;
+            if (autoFloor) {
+                autoFloorSwitchGate.markApplied();
+            } else {
+                autoFloorSwitchGate.reset();
+            }
 
             // 关键：触发重新绘制当前 floorKey 的 shapes（不要 renderCurrentFloor）
             loadFloorplanForVenue(selected);
@@ -322,12 +413,29 @@ public class IndoorMapManager {
         int bounded = snapToNearestFloor(newFloor, getAvailableImageFloors(selected));
         Log.d(TAG, "bounded(absFloor)=" + bounded);
 
+        if (autoFloor
+                && bounded != currentFloor
+                && !autoFloorSwitchGate.shouldApply(
+                bounded,
+                currentFloor,
+                SystemClock.elapsedRealtime(),
+                AUTO_FLOOR_STABLE_MS
+        )) {
+            return;
+        }
+
         if (bounded == currentFloor && isIndoorMapSet) {
+            autoFloorSwitchGate.reset();
             Log.d(TAG, "NOOP: bounded == currentFloor and map set, return");
             return;
         }
 
         currentFloor = bounded;
+        if (autoFloor) {
+            autoFloorSwitchGate.markApplied();
+        } else {
+            autoFloorSwitchGate.reset();
+        }
         renderCurrentFloor();
     }
 
@@ -378,6 +486,7 @@ public class IndoorMapManager {
         currentFloor = snapToNearestFloor(currentFloor, getAvailableImageFloors(selected));
         if (hasVectorMapShapes) {
             MapConstraintRepository.setActiveFloor(currentFloor);
+            SensorFusion.getInstance().onMapMatchingConstraintsUpdated();
         }
         FloorModel floor = findFloorModelForAbsoluteFloor(selected, currentFloor);
         if (floor == null) {
@@ -386,7 +495,7 @@ public class IndoorMapManager {
         }
         BitmapDescriptor cached = floorImageCache.get(floor.imageUrl);
         if (cached != null) {
-            setGroundOverlay(cached, floor.bounds);
+            setGroundOverlay(floor.imageUrl, cached, floor.bounds);
             return;
         }
 
@@ -437,7 +546,7 @@ public class IndoorMapManager {
                         if (!floor.imageUrl.equals(current.imageUrl)) {
                             return;
                         }
-                        setGroundOverlay(descriptor, current.bounds);
+                        setGroundOverlay(current.imageUrl, descriptor, current.bounds);
                     });
                 }
             }
@@ -445,7 +554,6 @@ public class IndoorMapManager {
     }
 
     private void loadFloorplanForVenue(@NonNull VenueModel venue) {
-        clearFloorShapeOverlays();
         boolean hasImageFloors = !venue.floors.isEmpty();
         if (hasImageFloors) {
             currentFloor = snapToNearestFloor(currentFloor, getAvailableImageFloors(venue));
@@ -455,6 +563,8 @@ public class IndoorMapManager {
         if (TextUtils.isEmpty(venue.mapShapesPayload)) {
             hasVectorMapShapes = false;
             MapConstraintRepository.clear();
+            clearFloorShapeOverlays();
+            resetRenderedFloorShapeState();
             if (hasImageFloors) {
                 renderCurrentFloor();
             } else {
@@ -471,6 +581,8 @@ public class IndoorMapManager {
         if (keys.isEmpty()) {
             hasVectorMapShapes = false;
             MapConstraintRepository.clear();
+            clearFloorShapeOverlays();
+            resetRenderedFloorShapeState();
             if (hasImageFloors) {
                 renderCurrentFloor();
             } else {
@@ -489,16 +601,32 @@ public class IndoorMapManager {
             if (!hasImageFloors) {
                 hasVectorMapShapes = false;
                 MapConstraintRepository.clear();
+                clearFloorShapeOverlays();
+                resetRenderedFloorShapeState();
                 isIndoorMapSet = false;
                 return;
             }
+        }
+
+        int payloadHash = payload.hashCode();
+        boolean shouldRedrawFloorShapes = key != null
+                && !isSameRenderedFloorShapeState(venue.id, key, payloadHash);
+        if (shouldRedrawFloorShapes) {
+            clearFloorShapeOverlays();
+        } else if (key == null) {
+            clearFloorShapeOverlays();
+            resetRenderedFloorShapeState();
         }
 
         MapConstraintRepository.replaceVenueConstraints(venue.id, venue.outline);
         List<List<LatLng>> currentFloorWallPolygons = Collections.emptyList();
         List<List<LatLng>> currentFloorTransitionPolygons = Collections.emptyList();
         for (String floorKey : keys) {
-            int floorIndex = parseFloorNameToAbsoluteFloor(floorKey);
+            Integer floorIndex = parseFloorNameToAbsoluteFloor(floorKey);
+            if (floorIndex == null) {
+                logSkippedInvalidFloorKey("load_constraints", floorKey);
+                continue;
+            }
             List<List<LatLng>> wallPolygons = extractWallPolygonsForKey(payload, floorKey);
             TransitionPolygonSet transitionPolygons = extractTransitionPolygonsForKey(payload, floorKey);
             List<List<LatLng>> allTransitionPolygons = transitionPolygons.getAllPolygons();
@@ -516,6 +644,7 @@ public class IndoorMapManager {
             }
         }
         MapConstraintRepository.setActiveFloor(currentFloor);
+        SensorFusion.getInstance().onMapMatchingConstraintsUpdated();
         if (com.openpositioning.PositionMe.sensors.SensorFusion.DEBUG_FUSION_TRACE) {
             Log.d(TAG, "MAP_DBG ts=" + System.currentTimeMillis()
                     + " source=MAP_CONSTRAINT"
@@ -529,7 +658,13 @@ public class IndoorMapManager {
 
         int[] counts = new int[]{0, 0};
         if (key != null) {
-            drawMapShapesForKey(payload, key, counts);
+            if (shouldRedrawFloorShapes) {
+                drawMapShapesForKey(payload, key, counts);
+                markRenderedFloorShapeState(venue.id, key, payloadHash);
+            } else {
+                counts[0] = floorShapePolylines.size();
+                counts[1] = floorShapePolygons.size();
+            }
         }
 
         isIndoorMapSet = counts[0] > 0 || counts[1] > 0;
@@ -858,6 +993,33 @@ public class IndoorMapManager {
         floorShapePolygons.clear();
     }
 
+    private boolean isSameRenderedFloorShapeState(
+            @Nullable String venueId,
+            @Nullable String floorKey,
+            int payloadHash
+    ) {
+        return TextUtils.equals(renderedShapeVenueId, venueId)
+                && TextUtils.equals(renderedShapeFloorKey, floorKey)
+                && renderedShapePayloadHash == payloadHash
+                && (!floorShapePolylines.isEmpty() || !floorShapePolygons.isEmpty());
+    }
+
+    private void markRenderedFloorShapeState(
+            @Nullable String venueId,
+            @Nullable String floorKey,
+            int payloadHash
+    ) {
+        renderedShapeVenueId = venueId;
+        renderedShapeFloorKey = floorKey;
+        renderedShapePayloadHash = payloadHash;
+    }
+
+    private void resetRenderedFloorShapeState() {
+        renderedShapeVenueId = null;
+        renderedShapeFloorKey = null;
+        renderedShapePayloadHash = 0;
+    }
+
     @NonNull
     private List<String> getShapeFloorKeys(@NonNull VenueModel venue) {
         List<String> cached = shapeFloorKeysCache.get(venue.id);
@@ -880,10 +1042,16 @@ public class IndoorMapManager {
 
         // 可选：排序，让 UI 顺序稳定（B1,G,1,2... 你也可以自定义排序规则）
         Collections.sort(keys, (left, right) -> {
-            int leftFloor = parseFloorNameToAbsoluteFloor(left);
-            int rightFloor = parseFloorNameToAbsoluteFloor(right);
-            if (leftFloor != rightFloor) {
+            Integer leftFloor = parseFloorNameToAbsoluteFloor(left);
+            Integer rightFloor = parseFloorNameToAbsoluteFloor(right);
+            if (leftFloor != null && rightFloor != null && !leftFloor.equals(rightFloor)) {
                 return Integer.compare(leftFloor, rightFloor);
+            }
+            if (leftFloor != null && rightFloor == null) {
+                return -1;
+            }
+            if (leftFloor == null && rightFloor != null) {
+                return 1;
             }
             return left.compareToIgnoreCase(right);
         });
@@ -892,45 +1060,132 @@ public class IndoorMapManager {
         return keys;
     }
 
-    private static int parseFloorNameToAbsoluteFloor(@Nullable String floorName) {
-        if (TextUtils.isEmpty(floorName)) {
-            Log.e(TAG, "Failed to parse floor key: empty, fallback=0");
-            return 0;
-        }
+    @Nullable
+    static Integer parseFloorNameToAbsoluteFloor(@Nullable String floorName) {
+        return IndoorFloorKeyResolver.tryParseAbsoluteFloor(floorName);
+    }
 
-        String normalized = floorName.trim();
-        if (normalized.isEmpty()) {
-            Log.e(TAG, "Failed to parse floor key: blank, fallback=0");
-            return 0;
-        }
-
-        String upper = normalized.toUpperCase(Locale.US).trim();
-        try {
-            if ("GF".equals(upper) || "G".equals(upper) || "GROUND".equals(upper)) {
-                return 0;
+    static int resolveFloorIndex(@NonNull JSONObject floorObject, int fallbackIndex) {
+        String[] candidateKeys = new String[]{"floor", "index", "level", "floor_index"};
+        for (String key : candidateKeys) {
+            if (!floorObject.has(key)) {
+                continue;
             }
-            if (upper.startsWith("B")) {
-                String basementDigits = upper.substring(1).replaceAll("[^\\d]", "");
-                if (!basementDigits.isEmpty()) {
-                    return -Integer.parseInt(basementDigits);
+            Integer parsedFloor = FloorKeyParser.parseRawFloorValue(floorObject.opt(key));
+            if (parsedFloor != null) {
+                return parsedFloor;
+            }
+        }
+
+        Integer parsedLabelFloor = FloorKeyParser.tryParseFloorNameToAbsoluteFloor(
+                firstNonEmpty(floorObject, "name", "label", "title")
+        );
+        return parsedLabelFloor != null ? parsedLabelFloor : fallbackIndex;
+    }
+
+    private void cacheFloorDisplayLabels(@NonNull VenueModel venue) {
+        Map<Integer, String> labels = new LinkedHashMap<>();
+        List<Integer> availableFloors = new ArrayList<>();
+        for (FloorModel floor : venue.floors) {
+            if (!availableFloors.contains(floor.floorIndex)) {
+                availableFloors.add(floor.floorIndex);
+            }
+            String displayLabel = sanitizeFloorDisplayLabel(floor.floorName, floor.floorIndex);
+            if (!TextUtils.isEmpty(displayLabel)) {
+                labels.put(floor.floorIndex, displayLabel);
+            }
+        }
+        if (!TextUtils.isEmpty(venue.mapShapesPayload)) {
+            for (String floorKey : getShapeFloorKeys(venue)) {
+                Integer absoluteFloor = parseFloorNameToAbsoluteFloor(floorKey);
+                if (absoluteFloor == null) {
+                    logSkippedInvalidFloorKey("cache_labels", floorKey);
+                    continue;
+                }
+                if (!availableFloors.contains(absoluteFloor)) {
+                    availableFloors.add(absoluteFloor);
+                }
+                if (labels.containsKey(absoluteFloor)) {
+                    continue;
+                }
+                String displayLabel = sanitizeFloorDisplayLabel(floorKey, absoluteFloor);
+                if (!TextUtils.isEmpty(displayLabel)) {
+                    labels.put(absoluteFloor, displayLabel);
                 }
             }
-            if (upper.startsWith("F") || upper.startsWith("L")) {
-                String floorDigits = upper.substring(1).replaceAll("[^\\d]", "");
-                if (!floorDigits.isEmpty()) {
-                    return Integer.parseInt(floorDigits);
-                }
-            }
-            if (upper.matches("-?\\d+")) {
-                return Integer.parseInt(upper);
-            }
-        } catch (RuntimeException e) {
-            Log.e(TAG, "Failed to parse floor key=\"" + floorName + "\", fallback=0", e);
-            return 0;
         }
+        cacheFloorDisplayLabelsForVenueId(venue.id, labels);
+        cacheFloorBoundsForVenueId(venue.id, availableFloors);
+    }
 
-        Log.e(TAG, "Failed to parse floor key=\"" + floorName + "\", fallback=0");
-        return 0;
+    private static synchronized void cacheFloorDisplayLabelsForVenueId(
+            @Nullable String venueId,
+            @NonNull Map<Integer, String> labels
+    ) {
+        if (TextUtils.isEmpty(venueId)) {
+            return;
+        }
+        Map<Integer, String> copy = new LinkedHashMap<>(labels);
+        floorDisplayLabelsByVenueId.put(venueId, copy);
+
+        String normalizedVenueId = normalizeVenueIdKey(venueId);
+        if (!TextUtils.isEmpty(normalizedVenueId)) {
+            floorDisplayLabelsByVenueId.put(normalizedVenueId, new LinkedHashMap<>(copy));
+        }
+    }
+
+    private static synchronized void cacheFloorBoundsForVenueId(
+            @Nullable String venueId,
+            @NonNull List<Integer> availableFloors
+    ) {
+        if (TextUtils.isEmpty(venueId) || availableFloors.isEmpty()) {
+            return;
+        }
+        int minFloor = availableFloors.get(0);
+        int maxFloor = availableFloors.get(0);
+        for (int floor : availableFloors) {
+            if (floor < minFloor) {
+                minFloor = floor;
+            }
+            if (floor > maxFloor) {
+                maxFloor = floor;
+            }
+        }
+        FloorBounds bounds = new FloorBounds(minFloor, maxFloor);
+        floorBoundsByVenueId.put(venueId, bounds);
+
+        String normalizedVenueId = normalizeVenueIdKey(venueId);
+        if (!TextUtils.isEmpty(normalizedVenueId)) {
+            floorBoundsByVenueId.put(normalizedVenueId, bounds);
+        }
+    }
+
+    @Nullable
+    private static String sanitizeFloorDisplayLabel(@Nullable String rawLabel, int absoluteFloor) {
+        if (TextUtils.isEmpty(rawLabel)) {
+            return null;
+        }
+        String trimmed = rawLabel.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        String syntheticDefault = String.format(Locale.US, "Floor %d", absoluteFloor);
+        if (trimmed.equalsIgnoreCase(syntheticDefault)) {
+            return null;
+        }
+        return trimmed;
+    }
+
+    @NonNull
+    private static String normalizeVenueIdKey(@Nullable String venueId) {
+        if (venueId == null) {
+            return "";
+        }
+        return venueId.trim().toLowerCase(Locale.US)
+                .replaceAll("[^a-z0-9]+", "_")
+                .replaceAll("_+", "_")
+                .replaceAll("^_", "")
+                .replaceAll("_$", "");
     }
 
     @NonNull
@@ -939,12 +1194,11 @@ public class IndoorMapManager {
     }
 
     @NonNull
-    private List<Integer> getAvailableShapeFloors(@NonNull List<String> floorKeys) {
-        List<Integer> floors = new ArrayList<>(floorKeys.size());
+    static List<Integer> getAvailableShapeFloors(@NonNull List<String> floorKeys) {
+        List<Integer> floors = IndoorFloorKeyResolver.collectAvailableFloors(floorKeys);
         for (String floorKey : floorKeys) {
-            int floor = parseFloorNameToAbsoluteFloor(floorKey);
-            if (!floors.contains(floor)) {
-                floors.add(floor);
+            if (parseFloorNameToAbsoluteFloor(floorKey) == null) {
+                logSkippedInvalidFloorKey("available_floor_set", floorKey);
             }
         }
         return floors;
@@ -961,20 +1215,8 @@ public class IndoorMapManager {
         return floors;
     }
 
-    private int snapToNearestFloor(int requestedFloor, @NonNull List<Integer> availableFloors) {
-        if (availableFloors.isEmpty()) {
-            return requestedFloor;
-        }
-        int bestFloor = availableFloors.get(0);
-        int bestDistance = Math.abs(bestFloor - requestedFloor);
-        for (int floor : availableFloors) {
-            int distance = Math.abs(floor - requestedFloor);
-            if (distance < bestDistance || (distance == bestDistance && floor < bestFloor)) {
-                bestFloor = floor;
-                bestDistance = distance;
-            }
-        }
-        return bestFloor;
+    static int snapToNearestFloor(int requestedFloor, @NonNull List<Integer> availableFloors) {
+        return IndoorFloorKeyResolver.snapToNearestFloor(requestedFloor, availableFloors);
     }
 
     @Nullable
@@ -1005,11 +1247,20 @@ public class IndoorMapManager {
             int absoluteFloor
     ) {
         for (String floorKey : floorKeys) {
-            if (parseFloorNameToAbsoluteFloor(floorKey) == absoluteFloor) {
+            Integer parsedFloor = parseFloorNameToAbsoluteFloor(floorKey);
+            if (parsedFloor == null) {
+                logSkippedInvalidFloorKey("find_floor_key", floorKey);
+                continue;
+            }
+            if (parsedFloor == absoluteFloor) {
                 return floorKey;
             }
         }
         return null;
+    }
+
+    private static void logSkippedInvalidFloorKey(@NonNull String context, @Nullable String floorKey) {
+        Log.w(TAG, "Skipping invalid floor key context=" + context + " key=" + floorKey);
     }
 
     @Nullable
@@ -1176,12 +1427,24 @@ public class IndoorMapManager {
         counts[0]++;
     }
 
-    private void setGroundOverlay(@NonNull BitmapDescriptor descriptor, @NonNull LatLngBounds bounds) {
+    private void setGroundOverlay(
+            @NonNull String imageUrl,
+            @NonNull BitmapDescriptor descriptor,
+            @NonNull LatLngBounds bounds
+    ) {
+        if (groundOverlay != null
+                && imageUrl.equals(renderedGroundOverlayImageUrl)
+                && sameBounds(renderedGroundOverlayBounds, bounds)) {
+            isIndoorMapSet = true;
+            return;
+        }
         removeGroundOverlay();
         groundOverlay = gMap.addGroundOverlay(new GroundOverlayOptions()
                 .image(descriptor)
                 .positionFromBounds(bounds)
                 .zIndex(10f));
+        renderedGroundOverlayImageUrl = imageUrl;
+        renderedGroundOverlayBounds = bounds;
         if (BuildConfig.DEBUG) {
             Log.d(TAG, "FLOOR_DRAW: addGroundOverlay");
         }
@@ -1193,20 +1456,84 @@ public class IndoorMapManager {
             groundOverlay.remove();
             groundOverlay = null;
         }
+        renderedGroundOverlayImageUrl = null;
+        renderedGroundOverlayBounds = null;
         isIndoorMapSet = false;
     }
 
+    private boolean sameBounds(@Nullable LatLngBounds first, @Nullable LatLngBounds second) {
+        if (first == second) {
+            return true;
+        }
+        if (first == null || second == null) {
+            return false;
+        }
+        return Math.abs(first.southwest.latitude - second.southwest.latitude) < 1e-9
+                && Math.abs(first.southwest.longitude - second.southwest.longitude) < 1e-9
+                && Math.abs(first.northeast.latitude - second.northeast.latitude) < 1e-9
+                && Math.abs(first.northeast.longitude - second.northeast.longitude) < 1e-9;
+    }
+
+    @NonNull
+    private String buildNearbyVenueFingerprint(@NonNull List<VenueModel> venues) {
+        List<VenueModel> sortedVenues = new ArrayList<>(venues);
+        Collections.sort(sortedVenues, (left, right) -> left.id.compareToIgnoreCase(right.id));
+        StringBuilder fingerprint = new StringBuilder();
+        for (VenueModel venue : sortedVenues) {
+            fingerprint.append(venue.id)
+                    .append('|')
+                    .append(venue.outline.hashCode())
+                    .append('|')
+                    .append(buildFloorFingerprint(venue.floors))
+                    .append('|')
+                    .append(venue.floorHeight)
+                    .append('|')
+                    .append(venue.mapShapesPayload == null ? 0 : venue.mapShapesPayload.hashCode())
+                    .append(';');
+        }
+        return fingerprint.toString();
+    }
+
+    @NonNull
+    private String buildFloorFingerprint(@NonNull List<FloorModel> floors) {
+        StringBuilder fingerprint = new StringBuilder();
+        for (FloorModel floor : floors) {
+            fingerprint.append(floor.floorIndex)
+                    .append(':')
+                    .append(floor.floorName)
+                    .append(':')
+                    .append(floor.imageUrl)
+                    .append(':')
+                    .append(floor.bounds == null ? 0 : floor.bounds.hashCode())
+                    .append(',');
+        }
+        return fingerprint.toString();
+    }
+
     private void applyNearbyVenues(@NonNull List<VenueModel> venues) {
+        String venueFingerprint = buildNearbyVenueFingerprint(venues);
         venuesById.clear();
         for (VenueModel venue : venues) {
             venuesById.put(venue.id, venue);
+            cacheFloorDisplayLabels(venue);
         }
+        if (venueFingerprint.equals(lastNearbyVenueFingerprint) && !polygonsByVenueId.isEmpty()) {
+            if (!TextUtils.isEmpty(selectedVenueId) && venuesById.containsKey(selectedVenueId)) {
+                VenueModel selected = venuesById.get(selectedVenueId);
+                if (selected != null) {
+                    floorHeight = selected.floorHeight;
+                }
+            }
+            return;
+        }
+        lastNearbyVenueFingerprint = venueFingerprint;
 
         for (Polygon polygon : polygonsByVenueId.values()) {
             polygon.remove();
         }
         polygonsByVenueId.clear();
         clearFloorShapeOverlays();
+        resetRenderedFloorShapeState();
 
         for (VenueModel venue : venues) {
             if (venue.outline.size() < 3) {
@@ -1238,6 +1565,7 @@ public class IndoorMapManager {
             currentFloor = 0;
             floorHeight = DEFAULT_FLOOR_HEIGHT_M;
             hasVectorMapShapes = false;
+            autoFloorSwitchGate.reset();
             removeGroundOverlay();
             if (venueSelectionListener != null) {
                 venueSelectionListener.onVenueSelected(null, null);
@@ -1434,8 +1762,12 @@ public class IndoorMapManager {
                 Log.d(TAG, "FLOOR_NET: floor imageUrl=" + imageUrl);
             }
 
-            int idx = (int) optDouble(f, i, "floor", "index", "level", "floor_index");
+            // Modified: honour semantic keys like LG / UG instead of silently falling back to array order.
+            int idx = resolveFloorIndex(f, i);
             String floorName = firstNonEmpty(f, "name", "label", "title");
+            if (TextUtils.isEmpty(floorName)) {
+                floorName = firstNonEmpty(f, "floor", "index", "level", "floor_index");
+            }
             if (TextUtils.isEmpty(floorName)) {
                 floorName = String.format(Locale.US, "Floor %d", idx);
             }
@@ -1757,7 +2089,7 @@ public class IndoorMapManager {
     }
 
     @Nullable
-    private String firstNonEmpty(@NonNull JSONObject obj, @NonNull String... keys) {
+    private static String firstNonEmpty(@NonNull JSONObject obj, @NonNull String... keys) {
         for (String key : keys) {
             String value = obj.optString(key, null);
             if (!TextUtils.isEmpty(value) && !"null".equalsIgnoreCase(value)) {

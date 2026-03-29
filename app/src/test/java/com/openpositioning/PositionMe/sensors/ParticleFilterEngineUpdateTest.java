@@ -9,6 +9,8 @@ import java.util.List;
 import java.util.Random;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class ParticleFilterEngineUpdateTest {
@@ -62,6 +64,125 @@ public class ParticleFilterEngineUpdateTest {
             assertEquals(1, particle.getFloor());
             assertEquals(0.5, particle.getWeight(), 1e-6);
         }
+    }
+
+    @Test
+    public void constrainedInvalidAbsoluteFixKeepsExistingCloud() {
+        ParticleInitializer.SpawnValidator rejectingValidator = (x, y, floor) -> false;
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                rejectingValidator,
+                new ZeroRandom()
+        );
+        engine.setParticlesForTesting(Arrays.asList(
+                new Particle(0.0, 0.0, 0, 0.5, 0.0),
+                new Particle(0.0, 0.0, 0, 0.5, 0.0)
+        ), 1000L);
+
+        engine.updateWithAbsoluteFix(100.0, 20.0, 0, 1100L, 4.0);
+
+        assertFalse(engine.wasLastAbsoluteFixReanchored());
+        assertTrue(engine.wasLastAbsoluteFixRejectedByConstraints());
+        List<Particle> particles = engine.snapshotParticlesForTesting();
+        assertEquals(2, particles.size());
+        for (Particle particle : particles) {
+            assertEquals(0.0, particle.getX(), 1e-6);
+            assertEquals(0.0, particle.getY(), 1e-6);
+            assertEquals(0, particle.getFloor());
+            assertEquals(0.5, particle.getWeight(), 1e-6);
+        }
+    }
+
+    @Test
+    public void initialIllegalAbsoluteFixIsRejectedInsteadOfSilentlyReanchoring() {
+        ParticleInitializer.SpawnValidator validator = (x, y, floor) -> x < 0.5 || x > 1.0;
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                validator,
+                new ZeroRandom()
+        );
+
+        engine.updateWithAbsoluteFix(0.75, 0.0, 0, 1100L, 1.0);
+
+        assertTrue(engine.wasLastAbsoluteFixRejectedByConstraints());
+        assertTrue(engine.snapshotParticlesForTesting().isEmpty());
+        assertNull(engine.estimatePose());
+    }
+
+    @Test
+    public void motionIncompatibleAbsoluteFixDoesNotReanchorCloud() {
+        ParticleInitializer.SpawnValidator rejectingMotionValidator = new ParticleInitializer.SpawnValidator() {
+            @Override
+            public boolean isValid(double x, double y, int floor) {
+                return true;
+            }
+
+            @Override
+            public boolean isValidMotion(
+                    double previousX,
+                    double previousY,
+                    double predictedX,
+                    double predictedY,
+                    int previousFloor,
+                    int predictedFloor
+            ) {
+                return false;
+            }
+        };
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                rejectingMotionValidator,
+                new ZeroRandom()
+        );
+        engine.setParticlesForTesting(Arrays.asList(
+                new Particle(0.0, 0.0, 0, 0.5, 0.0),
+                new Particle(0.0, 0.0, 0, 0.5, 0.0)
+        ), 1000L);
+
+        engine.updateWithAbsoluteFix(100.0, 20.0, 0, 1100L, 8.0);
+
+        assertFalse(engine.wasLastAbsoluteFixReanchored());
+        assertTrue(engine.wasLastAbsoluteFixRejectedByConstraints());
+        assertParticlesStayAtX(engine.snapshotParticlesForTesting(), 0.0);
+    }
+
+    @Test
+    public void credibleMotionIncompatibleAbsoluteFixCanReanchorDriftedCloud() {
+        ParticleInitializer.SpawnValidator rejectingMotionValidator = new ParticleInitializer.SpawnValidator() {
+            @Override
+            public boolean isValid(double x, double y, int floor) {
+                return true;
+            }
+
+            @Override
+            public boolean isValidMotion(
+                    double previousX,
+                    double previousY,
+                    double predictedX,
+                    double predictedY,
+                    int previousFloor,
+                    int predictedFloor
+            ) {
+                return false;
+            }
+        };
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                rejectingMotionValidator,
+                new ZeroRandom()
+        );
+        engine.setParticlesForTesting(Arrays.asList(
+                new Particle(0.0, 0.0, 0, 0.5, 0.0),
+                new Particle(0.0, 0.0, 0, 0.5, 0.0)
+        ), 1000L);
+
+        engine.updateWithAbsoluteFix(100.0, 20.0, 0, 1100L, 4.0);
+
+        assertTrue(engine.wasLastAbsoluteFixReanchored());
+        FusedPose pose = engine.estimatePose();
+        assertEquals(100.0, pose.getX(), 1e-6);
+        assertEquals(20.0, pose.getY(), 1e-6);
+        assertEquals(0, pose.getFloor());
     }
 
     @Test
@@ -183,6 +304,74 @@ public class ParticleFilterEngineUpdateTest {
         assertEquals(0.0, pose.getY(), 1e-6);
     }
 
+    @Test
+    public void estimatePoseFallsBackToLegalParticleWhenWeightedMeanIsIllegal() {
+        ParticleInitializer.SpawnValidator validator = (x, y, floor) -> x < 0.5 || x > 1.0;
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                validator,
+                new ZeroRandom()
+        );
+        engine.setParticlesForTesting(Arrays.asList(
+                new Particle(0.0, 0.0, 0, 0.75, 0.0),
+                new Particle(3.0, 0.0, 0, 0.25, 0.0)
+        ), 1000L);
+
+        FusedPose pose = engine.estimatePose();
+
+        assertEquals(0.0, pose.getX(), 1e-6);
+        assertEquals(0.0, pose.getY(), 1e-6);
+        assertEquals(0, pose.getFloor());
+    }
+
+    @Test
+    public void reanchorDoesNotSeedIllegalParticlesWhenNoMotionValidSamplesExist() {
+        ParticleInitializer.SpawnValidator validator = new ParticleInitializer.SpawnValidator() {
+            @Override
+            public boolean isValid(double x, double y, int floor) {
+                return x <= 0.0 || x >= 0.5;
+            }
+
+            @Override
+            public boolean isValidMotion(
+                    double previousX,
+                    double previousY,
+                    double predictedX,
+                    double predictedY,
+                    int previousFloor,
+                    int predictedFloor
+            ) {
+                return predictedX <= 0.0 || previousX >= 0.5;
+            }
+        };
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new SequenceRandom(
+                        1.0, 0.0,
+                        1.0, 0.0,
+                        1.0, 0.0,
+                        1.0, 0.0,
+                        1.0, 0.0,
+                        1.0, 0.0,
+                        1.0, 0.0,
+                        1.0, 0.0,
+                        1.0, 0.0,
+                        1.0, 0.0
+                )),
+                validator,
+                new ZeroRandom()
+        );
+        engine.setParticlesForTesting(Arrays.asList(
+                new Particle(-20.0, 0.0, 0, 0.5, 0.0),
+                new Particle(-20.0, 0.0, 0, 0.5, 0.0)
+        ), 1000L);
+
+        engine.updateWithAbsoluteFix(0.0, 0.0, 0, 1100L, 1.0);
+
+        assertFalse(engine.wasLastAbsoluteFixReanchored());
+        assertTrue(engine.wasLastAbsoluteFixRejectedByConstraints());
+        assertParticlesStayAtX(engine.snapshotParticlesForTesting(), -20.0);
+    }
+
     private ParticleFilterEngine createDeterministicEngine() {
         return new ParticleFilterEngine(
                 new ParticleInitializer(new ZeroRandom()),
@@ -204,6 +393,28 @@ public class ParticleFilterEngineUpdateTest {
         @Override
         public double nextGaussian() {
             return 0.0;
+        }
+
+        @Override
+        public double nextDouble() {
+            return 0.5;
+        }
+    }
+
+    private static final class SequenceRandom extends Random {
+        private final double[] sequence;
+        private int index;
+
+        SequenceRandom(double... sequence) {
+            this.sequence = sequence == null ? new double[0] : sequence;
+        }
+
+        @Override
+        public double nextGaussian() {
+            if (index < sequence.length) {
+                return sequence[index++];
+            }
+            return 1.0;
         }
 
         @Override

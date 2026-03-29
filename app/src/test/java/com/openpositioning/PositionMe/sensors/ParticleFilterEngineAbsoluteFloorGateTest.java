@@ -41,6 +41,44 @@ public class ParticleFilterEngineAbsoluteFloorGateTest {
         assertEquals(2, engine.estimatePose().getFloor());
     }
 
+    @Test
+    public void reanchorRecoveryCanUseRequestedFloorWhenCurrentFloorLockIsWrong() {
+        ParticleInitializer.SpawnValidator floorAwareValidator = new ParticleInitializer.SpawnValidator() {
+            @Override
+            public boolean isValid(double x, double y, int floor) {
+                return floor == 2;
+            }
+
+            @Override
+            public boolean isValidMotion(
+                    double previousX,
+                    double previousY,
+                    double predictedX,
+                    double predictedY,
+                    int previousFloor,
+                    int predictedFloor
+            ) {
+                return false;
+            }
+        };
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                floorAwareValidator,
+                rejectingGate(),
+                new ZeroRandom()
+        );
+
+        engine.setParticlesForTesting(java.util.List.of(
+                new Particle(0.0, 0.0, 0, 0.5, 0.0),
+                new Particle(0.0, 0.0, 0, 0.5, 0.0)
+        ), 1000L);
+        engine.updateWithAbsoluteFix(30.0, 0.0, Integer.valueOf(2), 1100L, 4.0);
+
+        assertTrue(engine.wasLastAbsoluteFixReanchored());
+        assertEquals(2, engine.estimatePose().getFloor());
+        assertEquals(30.0, engine.estimatePose().getX(), 1e-6);
+    }
+
     private FloorTransitionGate rejectingGate() {
         return (previousX, previousY, predictedX, predictedY, previousFloor, predictedFloor) ->
                 previousFloor == predictedFloor;

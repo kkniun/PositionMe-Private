@@ -91,6 +91,10 @@ public final class MapConstraintRepository {
         activeFloorIndex = floorIndex;
     }
 
+    public static synchronized int getActiveFloor() {
+        return activeFloorIndex;
+    }
+
     public static synchronized void updateCurrentFloorConstraints(
             @Nullable String venueId,
             @Nullable String floorKey,
@@ -129,6 +133,16 @@ public final class MapConstraintRepository {
         return false;
     }
 
+    public static synchronized boolean isPointLegal(@NonNull LatLng point, int floorIndex) {
+        if (hasWallConstraints(floorIndex) && isPointInsideWall(point, floorIndex)) {
+            return false;
+        }
+        if (hasVenueOutline() && !isPointInsideVenueOutline(point)) {
+            return false;
+        }
+        return true;
+    }
+
     public static synchronized boolean doesPathIntersectWall(
             @NonNull LatLng start,
             @NonNull LatLng end,
@@ -146,6 +160,47 @@ public final class MapConstraintRepository {
             return true;
         }
         return pointInPolygon(point, venueOutline);
+    }
+
+    public static synchronized boolean doesPathExitVenueOutline(
+            @NonNull LatLng start,
+            @NonNull LatLng end
+    ) {
+        if (venueOutline.size() < 3) {
+            return false;
+        }
+        if (!pointInPolygon(start, venueOutline) || !pointInPolygon(end, venueOutline)) {
+            return true;
+        }
+        return segmentCrossesPolygonBoundary(start, end, venueOutline);
+    }
+
+    public static synchronized boolean isPathLegal(
+            @NonNull LatLng start,
+            @NonNull LatLng end,
+            int floorIndex
+    ) {
+        return isPathLegal(start, end, floorIndex, floorIndex);
+    }
+
+    public static synchronized boolean isPathLegal(
+            @NonNull LatLng start,
+            @NonNull LatLng end,
+            int startFloorIndex,
+            int endFloorIndex
+    ) {
+        if (!isPointLegal(start, startFloorIndex) || !isPointLegal(end, endFloorIndex)) {
+            return false;
+        }
+        if (hasVenueOutline() && doesPathExitVenueOutline(start, end)) {
+            return false;
+        }
+        if (hasWallConstraints(startFloorIndex) && doesPathIntersectWall(start, end, startFloorIndex)) {
+            return false;
+        }
+        return startFloorIndex == endFloorIndex
+                || !hasWallConstraints(endFloorIndex)
+                || !doesPathIntersectWall(start, end, endFloorIndex);
     }
 
     /**
@@ -166,6 +221,24 @@ public final class MapConstraintRepository {
                 || !transitionsByFloor.isEmpty();
     }
 
+    public static synchronized boolean hasKnownFloor(int floorIndex) {
+        return floorKeysByIndex.containsKey(floorIndex)
+                || wallsByFloor.containsKey(floorIndex)
+                || stairsByFloor.containsKey(floorIndex)
+                || liftsByFloor.containsKey(floorIndex)
+                || transitionsByFloor.containsKey(floorIndex);
+    }
+
+    public static synchronized boolean hasUsableFloorTransitionConstraints(
+            int previousFloorIndex,
+            int nextFloorIndex
+    ) {
+        if (!hasKnownFloor(previousFloorIndex) || !hasKnownFloor(nextFloorIndex)) {
+            return false;
+        }
+        return hasTransitionConstraints(previousFloorIndex) || hasTransitionConstraints(nextFloorIndex);
+    }
+
     /**
      * True if the point lies inside any stairs/lift/elevator polygon for the current map floor.
      */
@@ -180,6 +253,18 @@ public final class MapConstraintRepository {
             }
         }
         return false;
+    }
+
+    public static synchronized boolean isPointInsideOrNearTransitionZone(
+            @NonNull LatLng point,
+            int floorIndex,
+            double toleranceMeters
+    ) {
+        return isPointInsideOrNearAnyPolygon(
+                point,
+                getStoredPolygons(transitionsByFloor, floorIndex),
+                toleranceMeters
+        );
     }
 
     public static synchronized boolean doesPathIntersectTransitionZone(
@@ -199,12 +284,28 @@ public final class MapConstraintRepository {
         return false;
     }
 
+    public static synchronized boolean isPointInsideOrNearStairs(
+            @NonNull LatLng point,
+            int floorIndex,
+            double toleranceMeters
+    ) {
+        return isPointInsideOrNearAnyPolygon(
+                point,
+                getStoredPolygons(stairsByFloor, floorIndex),
+                toleranceMeters
+        );
+    }
+
     public static synchronized boolean doesPathIntersectStairs(
             @NonNull LatLng start,
             @NonNull LatLng end,
             int floorIndex
     ) {
         return pathIntersectsAnyPolygon(start, end, getStoredPolygons(stairsByFloor, floorIndex));
+    }
+
+    public static synchronized boolean hasStairsConstraints(int floorIndex) {
+        return !getStoredPolygons(stairsByFloor, floorIndex).isEmpty();
     }
 
     public static synchronized boolean isPointInsideLift(@NonNull LatLng point, int floorIndex) {
@@ -216,12 +317,28 @@ public final class MapConstraintRepository {
         return false;
     }
 
+    public static synchronized boolean isPointInsideOrNearLift(
+            @NonNull LatLng point,
+            int floorIndex,
+            double toleranceMeters
+    ) {
+        return isPointInsideOrNearAnyPolygon(
+                point,
+                getStoredPolygons(liftsByFloor, floorIndex),
+                toleranceMeters
+        );
+    }
+
     public static synchronized boolean doesPathIntersectLift(
             @NonNull LatLng start,
             @NonNull LatLng end,
             int floorIndex
     ) {
         return pathIntersectsAnyPolygon(start, end, getStoredPolygons(liftsByFloor, floorIndex));
+    }
+
+    public static synchronized boolean hasLiftConstraints(int floorIndex) {
+        return !getStoredPolygons(liftsByFloor, floorIndex).isEmpty();
     }
 
     @NonNull
@@ -376,6 +493,108 @@ public final class MapConstraintRepository {
             if (segmentIntersectsPolygon(start, end, polygon)) {
                 return true;
             }
+        }
+        return false;
+    }
+
+    private static boolean isPointInsideOrNearAnyPolygon(
+            @NonNull LatLng point,
+            @NonNull List<List<LatLng>> polygons,
+            double toleranceMeters
+    ) {
+        if (polygons.isEmpty()) {
+            return false;
+        }
+        double safeToleranceMeters = Math.max(0.0, toleranceMeters);
+        return minDistanceToAnyPolygonMeters(point, polygons) <= safeToleranceMeters;
+    }
+
+    private static double minDistanceToAnyPolygonMeters(
+            @NonNull LatLng point,
+            @NonNull List<List<LatLng>> polygons
+    ) {
+        double minDistanceMeters = Double.POSITIVE_INFINITY;
+        for (List<LatLng> polygon : polygons) {
+            minDistanceMeters = Math.min(
+                    minDistanceMeters,
+                    pointToPolygonDistanceMeters(point, polygon)
+            );
+            if (minDistanceMeters <= 0.0) {
+                return 0.0;
+            }
+        }
+        return minDistanceMeters;
+    }
+
+    private static double pointToPolygonDistanceMeters(
+            @NonNull LatLng point,
+            @NonNull List<LatLng> polygon
+    ) {
+        if (polygon.size() < 3) {
+            return Double.POSITIVE_INFINITY;
+        }
+        if (pointInPolygon(point, polygon)) {
+            return 0.0;
+        }
+        double minDistanceMeters = Double.POSITIVE_INFINITY;
+        for (int i = 0; i < polygon.size(); i++) {
+            LatLng a = polygon.get(i);
+            LatLng b = polygon.get((i + 1) % polygon.size());
+            minDistanceMeters = Math.min(
+                    minDistanceMeters,
+                    pointToSegmentDistanceMeters(point, a, b)
+            );
+        }
+        return minDistanceMeters;
+    }
+
+    private static double pointToSegmentDistanceMeters(
+            @NonNull LatLng point,
+            @NonNull LatLng segmentStart,
+            @NonNull LatLng segmentEnd
+    ) {
+        double referenceLatitude = (point.latitude + segmentStart.latitude + segmentEnd.latitude) / 3.0;
+        double startX = UtilFunctions.degreesToMetersLng(
+                segmentStart.longitude - point.longitude,
+                referenceLatitude
+        );
+        double startY = UtilFunctions.degreesToMetersLat(segmentStart.latitude - point.latitude);
+        double endX = UtilFunctions.degreesToMetersLng(
+                segmentEnd.longitude - point.longitude,
+                referenceLatitude
+        );
+        double endY = UtilFunctions.degreesToMetersLat(segmentEnd.latitude - point.latitude);
+        double deltaX = endX - startX;
+        double deltaY = endY - startY;
+        double segmentLengthSquared = deltaX * deltaX + deltaY * deltaY;
+        if (segmentLengthSquared <= 1e-9) {
+            return Math.hypot(startX, startY);
+        }
+        double projection = -(startX * deltaX + startY * deltaY) / segmentLengthSquared;
+        double clampedProjection = Math.max(0.0, Math.min(1.0, projection));
+        double closestX = startX + clampedProjection * deltaX;
+        double closestY = startY + clampedProjection * deltaY;
+        return Math.hypot(closestX, closestY);
+    }
+
+    private static boolean segmentCrossesPolygonBoundary(
+            @NonNull LatLng start,
+            @NonNull LatLng end,
+            @NonNull List<LatLng> polygon
+    ) {
+        if (polygon.size() < 3) {
+            return false;
+        }
+        for (int i = 0; i < polygon.size(); i++) {
+            LatLng a = polygon.get(i);
+            LatLng b = polygon.get((i + 1) % polygon.size());
+            if (!segmentsIntersect(start, end, a, b)) {
+                continue;
+            }
+            if (isPointOnSegment(start, a, b) || isPointOnSegment(end, a, b)) {
+                continue;
+            }
+            return true;
         }
         return false;
     }

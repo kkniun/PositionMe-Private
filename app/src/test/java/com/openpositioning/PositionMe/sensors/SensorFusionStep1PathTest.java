@@ -2,18 +2,28 @@ package com.openpositioning.PositionMe.sensors;
 
 import com.google.android.gms.maps.model.LatLng;
 import com.openpositioning.PositionMe.utils.CoordinateConverter;
+import com.openpositioning.PositionMe.utils.MapConstraintRepository;
 
+import org.junit.After;
 import org.junit.Test;
 
+import java.util.Collections;
+import java.util.List;
 import java.util.Random;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 public class SensorFusionStep1PathTest {
 
     private static final double ORIGIN_LAT = 55.9444;
     private static final double ORIGIN_LON = -3.1878;
+
+    @After
+    public void tearDown() {
+        MapConstraintRepository.clear();
+    }
 
     @Test
     public void gnssAbsoluteFixThroughSensorFusionInitializesFusedPoseInLocalFrame() {
@@ -162,11 +172,55 @@ public class SensorFusionStep1PathTest {
         assertEquals(0, pose.getFloor());
     }
 
+    @Test
+    public void clampCandidateToLegalSegmentPrefixShortensWallCrossingStep() {
+        CoordinateConverter converter = new CoordinateConverter(ORIGIN_LAT, ORIGIN_LON);
+        MapConstraintRepository.replaceVenueConstraints("venue", Collections.emptyList());
+        MapConstraintRepository.setConstraintsForFloor(
+                0,
+                Collections.singletonList(localRectangle(converter, -0.5, -1.0, 1.0, 2.0)),
+                null
+        );
+
+        FusedPose previousPose = new FusedPose(-2.0, 0.0, 0, 0.8, 1000L);
+        FusedPose candidatePose = new FusedPose(2.0, 0.0, 0, 0.8, 1100L);
+
+        FusedPose clampedPose = SensorFusion.clampCandidateToLegalSegmentPrefix(
+                previousPose,
+                candidatePose,
+                converter
+        );
+
+        assertNotNull(clampedPose);
+        assertTrue(clampedPose.getX() > previousPose.getX());
+        assertTrue(clampedPose.getX() < candidatePose.getX());
+        assertTrue(MapConstraintRepository.isPathLegal(
+                converter.toLatLng(previousPose.getX(), previousPose.getY()),
+                converter.toLatLng(clampedPose.getX(), clampedPose.getY()),
+                previousPose.getFloor()
+        ));
+    }
+
     private ParticleFilterEngine createDeterministicEngine() {
         return new ParticleFilterEngine(
                 new ParticleInitializer(new ZeroRandom()),
                 ParticleInitializer.allowAll(),
                 new ZeroRandom()
+        );
+    }
+
+    private List<LatLng> localRectangle(
+            CoordinateConverter converter,
+            double westXMeters,
+            double southYMeters,
+            double widthMeters,
+            double heightMeters
+    ) {
+        return List.of(
+                converter.toLatLng(westXMeters, southYMeters),
+                converter.toLatLng(westXMeters + widthMeters, southYMeters),
+                converter.toLatLng(westXMeters + widthMeters, southYMeters + heightMeters),
+                converter.toLatLng(westXMeters, southYMeters + heightMeters)
         );
     }
 

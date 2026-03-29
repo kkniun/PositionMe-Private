@@ -130,7 +130,7 @@
     <string name="floor_up_button">Floor Up button</string>
     <string name="choose_map">Choose Map</string>
     <string name="auto_floor">❇️ Auto Floor </string>
-    <string name="gnss_error">GNSS/fused offset:</string>
+    <string name="gnss_error">Device/fused offset:</string>
     <string name="waiting_for_absolute_fix">Waiting for first absolute fix...</string>
     <string name="satellite">Satellite</string>
     <string name="normal">Normal</string>
@@ -160,6 +160,7 @@
     <string name="venue_selected_format">Venue: %1$s (floor %2$d/%3$d)</string>
     <string name="floor_status">Floor: 0</string>
     <string name="floor_status_value">Floor: %1$d</string>
+    <string name="floor_status_display_value">Floor: %1$s</string>
     <string name="floor_status_unknown">Floor: --</string>
     <string name="floor_status_relative_value">Floor: relative %1$d</string>
     <string name="system_status_default">Status: Waiting for first absolute fix</string>
@@ -185,24 +186,23 @@
     <string name="elevator_inactive">Off</string>
     <string name="map_waiting_state">Waiting for first absolute fix\nMove to a mapped venue to start indoor tracking</string>
     <string name="map_constraints_pending_state">Map constraints loading\nFusion is active, but motion is not yet constrained</string>
+    <string name="map_constraints_display_only_state">Display-only venue map\nFusion continues without map constraints</string>
     <string name="map_constraints_unavailable_state">No mapped venue nearby\nFusion continues without map constraints</string>
     <string name="map_constraints_waiting_hint">Map matching will start after the first GNSS/WiFi fix.</string>
     <string name="map_constraints_pending_hint">Map constraints are loading. Current motion is not yet constrained.</string>
+    <string name="map_constraints_display_only_hint">Venue map loaded, but no vector constraints are available. Running display-only fusion.</string>
     <string name="map_constraints_unavailable_hint">No mapped venue nearby. Running unconstrained fusion.</string>
-    <string name="map_constraints_active_hint">Map constraints active.</string>
-    <string name="map_constraints_active_smoothing_hint">Map constraints active. Display smoothing is visual only.</string>
-    <string name="map_constraints_active_low_confidence_hint">Map constraints active, but fused confidence is low.</string>
-    <string name="map_constraints_active_low_confidence_smoothing_hint">Map constraints active, but fused confidence is low. Display smoothing is visual only.</string>
     <string name="layer_fused">Fused</string>
-    <string name="layer_gnss">GNSS</string>
+    <string name="layer_gnss">Device Fix</string>
     <string name="layer_wifi">WiFi</string>
     <string name="layer_pdr">PDR</string>
     <string name="display_smoothing">Smooth display</string>
     <string name="legend_title">Legend</string>
     <string name="legend_fused">● Fused best position</string>
-    <string name="legend_gnss">● GNSS recent points</string>
+    <string name="legend_gnss">● Device recent fixes</string>
     <string name="legend_wifi">● WiFi recent points</string>
     <string name="legend_pdr">● PDR recent points</string>
+    <string name="map_display_only_toast">Display-only indoor map. Fusion continues without map constraints.</string>
     <string name="recenter">Recenter</string>
     <string name="recenter_map">Recenter map on current fused position</string>
 

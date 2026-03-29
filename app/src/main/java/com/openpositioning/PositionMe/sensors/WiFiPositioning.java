@@ -1,4 +1,6 @@
 package com.openpositioning.PositionMe.sensors;
+import androidx.annotation.Nullable;
+
 import android.content.Context;
 import android.util.Log;
 
@@ -47,12 +49,14 @@ public class WiFiPositioning {
      * Getter for the  WiFi positioning floor obtained using openpositioning API
      * @return the user's location based on openpositioning API
      */
-    public int getFloor() {
+    @Nullable
+    public Integer getFloor() {
         return floor;
     }
 
-    // Store current floor of user, default value 0 (ground floor)
-    private int floor=0;
+    // Store current floor of user when the backend returns an explicit floor value.
+    @Nullable
+    private Integer floor = null;
 
 
     /**
@@ -88,7 +92,7 @@ public class WiFiPositioning {
                 response -> {
                     try {
                             wifiLocation = new LatLng(response.getDouble("lat"),response.getDouble("lon"));
-                            floor = response.getInt("floor");
+                            floor = parseResponseFloor(response);
                     } catch (JSONException e) {
                         // Error log to keep record of errors (for secure programming and maintainability)
                         Log.e("jsonErrors","Error parsing response: "+e.getMessage()+" "+ response);
@@ -139,7 +143,7 @@ public class WiFiPositioning {
                     try {
                         Log.d("jsonObject",response.toString());
                         wifiLocation = new LatLng(response.getDouble("lat"),response.getDouble("lon"));
-                        floor = response.getInt("floor");
+                        floor = parseResponseFloor(response);
                         callback.onSuccess(wifiLocation,floor);
                     } catch (JSONException e) {
                         Log.e("jsonErrors","Error parsing response: "+e.getMessage()+" "+ response);
@@ -170,11 +174,39 @@ public class WiFiPositioning {
         requestQueue.add(jsonObjectRequest);
     }
 
+    @Nullable
+    static Integer parseResponseFloor(@Nullable JSONObject response) {
+        if (response == null || !response.has("floor") || response.isNull("floor")) {
+            return null;
+        }
+        try {
+            return parseFloorValue(response.get("floor"));
+        } catch (JSONException | NumberFormatException e) {
+            Log.w("WiFiPositioning", "Ignoring WiFi floor value: " + e.getMessage());
+        }
+        return null;
+    }
+
+    @Nullable
+    static Integer parseFloorValue(@Nullable Object rawFloor) {
+        if (rawFloor instanceof Number) {
+            return (int) Math.round(((Number) rawFloor).doubleValue());
+        }
+        if (rawFloor instanceof String) {
+            String normalized = ((String) rawFloor).trim();
+            if (normalized.isEmpty()) {
+                return null;
+            }
+            return Integer.parseInt(normalized);
+        }
+        return null;
+    }
+
     /**
      * Interface defined for the callback to access response obtained after POST request
      */
     public interface VolleyCallback {
-        void onSuccess(LatLng location, int floor);
+        void onSuccess(LatLng location, @Nullable Integer floor);
         void onError(String message);
     }
 

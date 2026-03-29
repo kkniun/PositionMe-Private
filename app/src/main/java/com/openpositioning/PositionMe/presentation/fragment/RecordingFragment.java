@@ -9,6 +9,7 @@ import android.os.Bundle;
 import android.os.CountDownTimer;
 import android.os.Handler;
 import android.os.SystemClock;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -36,6 +37,7 @@ import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
 import com.openpositioning.PositionMe.sensors.FusedPose;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.sensors.SensorTypes;
+import com.openpositioning.PositionMe.utils.IndoorMapManager;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
 import com.google.android.gms.maps.model.LatLng;
 
@@ -70,13 +72,17 @@ import java.util.Locale;
 
 public class RecordingFragment extends Fragment {
     private static final String ARROW_DBG_TAG = "ARROW_DBG";
+    private static final String FLOOR_DIAG_TAG = "FloorDiag";
+    private static final String POSE_DIAG_TAG = "POSE_DIAG";
     private static final long ARROW_DBG_INTERVAL_MS = 500L;
+    private static final long UI_REFRESH_INTERVAL_MS = 50L;
+    private static final float ORIENTATION_UPDATE_THRESHOLD_DEG = 1.0f;
 
     // UI elements
     private MaterialButton completeButton, cancelButton, addMarkerButton;
     private ImageView recIcon;
     private ProgressBar timeRemaining;
-    private TextView elevation, distanceTravelled, gnssError, floorStatus, elevatorStatus,
+    private TextView elevation, distanceTravelled, gnssError, floorStatus,
             systemStatus, lastUpdateTime, trackingConfidence, trackingContextHint;
 
     // Marker data  elements
@@ -107,6 +113,14 @@ public class RecordingFragment extends Fragment {
     private long headingDbgUiLastLogMs = 0;
     // 地图箭头链路最小日志节流。
     private long arrowDbgUiLastLogMs = 0;
+    private long lastRenderedFusedPoseTimestampMs = Long.MIN_VALUE;
+    private float lastForwardedOrientationDeg = Float.NaN;
+    private long lastObservedHeadingSampleTimestampMs = Long.MIN_VALUE;
+    private String lastUiPoseDiagnosticState = "";
+
+    static int resolveMapUpdateFloor(@NonNull FusedPose fusedPose) {
+        return fusedPose.getFloor();
+    }
 
     // Distance tracking
     private float distance = 0f;
@@ -122,7 +136,7 @@ public class RecordingFragment extends Fragment {
         public void run() {
             updateUIandPosition();
             // Loop again
-            refreshDataHandler.postDelayed(refreshDataTask, 200);
+            refreshDataHandler.postDelayed(refreshDataTask, UI_REFRESH_INTERVAL_MS);
         }
     };
 
@@ -176,25 +190,19 @@ public class RecordingFragment extends Fragment {
         distanceTravelled = view.findViewById(R.id.currentDistanceTraveled);
         gnssError = view.findViewById(R.id.gnssError);
         floorStatus = view.findViewById(R.id.currentFloorStatus);
-        elevatorStatus = view.findViewById(R.id.elevatorStatus);
         systemStatus = view.findViewById(R.id.systemStatus);
         lastUpdateTime = view.findViewById(R.id.lastUpdateTime);
         trackingConfidence = view.findViewById(R.id.trackingConfidence);
         trackingContextHint = view.findViewById(R.id.trackingContextHint);
 
-        // Marker button and data
-        markerPoints.clear();
-        markerIndex = 0;
-        // Marker button and data (new recording session)
-        markerPoints.clear();
-        markerIndex = 0;
-        recordingStartElapsedMs = SystemClock.elapsedRealtime();
+        resetRecordingSessionState();
 
         addMarkerButton = view.findViewById(R.id.addMarkerButton);
         addMarkerButton.setEnabled(true);
 
 // 同步清空地图上的 TP marker（如果地图已经起来）
         if (trajectoryMapFragment != null) {
+            trajectoryMapFragment.clearMapAndReset();
             trajectoryMapFragment.clearTestPointMarkers();
         }
 
@@ -211,7 +219,6 @@ public class RecordingFragment extends Fragment {
         distanceTravelled.setText(getString(R.string.travelled_distance_value, "0"));
         distanceTravelled.setVisibility(View.GONE);
         floorStatus.setText(getString(R.string.floor_status_unknown));
-        elevatorStatus.setText(getString(R.string.elevator_status_unknown));
         systemStatus.setText(getString(R.string.system_status_default));
         lastUpdateTime.setText(getString(R.string.last_update_default));
         trackingConfidence.setText(getString(R.string.tracking_confidence_unknown));
@@ -314,7 +321,6 @@ public class RecordingFragment extends Fragment {
                 @Override
                 public void onTick(long millisUntilFinished) {
                     timeRemaining.incrementProgressBy(1);
-                    updateUIandPosition();
                 }
 
                 @Override
@@ -324,10 +330,8 @@ public class RecordingFragment extends Fragment {
                     ((RecordingActivity) requireActivity()).showCorrectionScreen();
                 }
             }.start();
-        } else {
-            // No set time limit, just keep refreshing
-            refreshDataHandler.post(refreshDataTask);
         }
+        scheduleRefreshLoop();
     }
 
     /**
@@ -338,12 +342,12 @@ public class RecordingFragment extends Fragment {
         if (trajectoryMapFragment != null) {
             trajectoryMapFragment.primeIndoorMapContext(mapAnchor);
         }
+        SensorFusion.MotionDebugSnapshot motionDebug = sensorFusion.getMotionDebugSnapshot();
 
         FusedPose fusedPose = sensorFusion.getLatestFusedPose();
         updateTrackingConfidence(fusedPose);
         if (fusedPose == null) {
             floorStatus.setText(getString(R.string.floor_status_unknown));
-            elevatorStatus.setText(getString(R.string.elevator_status_unknown));
             systemStatus.setText(getString(
                     R.string.system_status_value,
                     getString(sensorFusion.isWaitingForAbsoluteFix()
@@ -360,23 +364,49 @@ public class RecordingFragment extends Fragment {
             } else {
                 gnssError.setVisibility(View.GONE);
             }
+            logUiPoseDiagnostic(
+                    sensorFusion.isWaitingForAbsoluteFix()
+                            ? "no_fused_pose_waiting_first_absolute_fix"
+                            : "no_fused_pose_available",
+                    motionDebug,
+                    null
+            );
             return;
         }
         sensorFusion.recordLatestFusedPoseIfNeeded();
+        boolean hasFreshFusedPose = fusedPose.getTimestampMs() != lastRenderedFusedPoseTimestampMs;
+        int bestKnownFloor = sensorFusion.getUserVisibleFloor();
+        boolean floorCalibrated = sensorFusion.isFloorCalibrated();
+        Integer trustedFloor = FloorDisplayGate.resolveTrustedFloorForDisplay(
+                floorCalibrated,
+                bestKnownFloor
+        );
+        double fusedDisplacementMeters = Math.hypot(
+                fusedPose.getX() - previousLocalX,
+                fusedPose.getY() - previousLocalY
+        );
+        boolean shouldSuppressDistanceIncrement = sensorFusion.isStationary()
+                && fusedDisplacementMeters < MapPointerDisplayFilter.STATIONARY_VISUAL_POSITION_DEADBAND_M;
 
         // Distance
-        distance += Math.sqrt(
-                Math.pow(fusedPose.getX() - previousLocalX, 2)
-                        + Math.pow(fusedPose.getY() - previousLocalY, 2)
-        );
+        if (hasFreshFusedPose && !shouldSuppressDistanceIncrement) {
+            distance += fusedDisplacementMeters;
+        }
         distanceTravelled.setText(getString(R.string.travelled_distance_value, String.format("%.2f", distance)));
         distanceTravelled.setVisibility(shouldShowTrackedPath() ? View.VISIBLE : View.GONE);
 
         // Elevation
         float elevationVal = sensorFusion.getElevation();
         elevation.setText(getString(R.string.elevation, String.format("%.1f", elevationVal)));
-        floorStatus.setText(resolveFloorStatusText(fusedPose.getFloor()));
-        elevatorStatus.setText(resolveElevatorStatusText());
+        String floorStatusText = resolveFloorStatusText(bestKnownFloor, floorCalibrated);
+        logFloorDiag(
+                "event=recording_floor_render"
+                        + " floorCalibrated=" + floorCalibrated
+                        + " rawFloor=" + bestKnownFloor
+                        + " gateResult=" + trustedFloor
+                        + " displayedText=" + floorStatusText
+        );
+        floorStatus.setText(floorStatusText);
         systemStatus.setText(getString(
                 R.string.system_status_value,
                 resolveSystemStatusLabel()
@@ -388,28 +418,65 @@ public class RecordingFragment extends Fragment {
         updateTrackingContextHint(fusedPose);
 
         LatLng newLocation = sensorFusion.getLatLngForFusedPose(fusedPose);
+        TrajectoryMapFragment.DisplayDebugSnapshot displayDebug = trajectoryMapFragment == null
+                ? null
+                : trajectoryMapFragment.getDisplayDebugSnapshot();
         if (newLocation != null) {
+            long headingSampleTimestampMs = sensorFusion.getDisplayOrientationTimestampMs();
+            boolean hasFreshHeadingSample = headingSampleTimestampMs > 0L
+                    && headingSampleTimestampMs != lastObservedHeadingSampleTimestampMs;
             float orientationDeg = (float) Math.toDegrees(sensorFusion.passDisplayOrientation());
             orientationDeg = (orientationDeg % 360f + 360f) % 360f;
-            logArrowUiTrace(orientationDeg, !sensorFusion.isWaitingForAbsoluteFix());
-            if (SensorFusion.DEBUG_HEADING) {
-                long now = SystemClock.elapsedRealtime();
-                if (now - headingDbgUiLastLogMs >= 1000) {
-                    Log.d("HeadingDbg", "UI tick orientation(deg)=" + orientationDeg);
-                    headingDbgUiLastLogMs = now;
+            boolean hasFreshHeading = hasFreshHeadingSample && shouldForwardOrientation(orientationDeg);
+            if (hasFreshHeading) {
+                logArrowUiTrace(orientationDeg, !sensorFusion.isWaitingForAbsoluteFix());
+                if (SensorFusion.DEBUG_HEADING) {
+                    long now = SystemClock.elapsedRealtime();
+                    if (now - headingDbgUiLastLogMs >= 1000) {
+                        Log.d("HeadingDbg", "UI tick orientation(deg)=" + orientationDeg);
+                        headingDbgUiLastLogMs = now;
+                    }
                 }
             }
 
             if (trajectoryMapFragment != null) {
-                trajectoryMapFragment.updateUserLocation(
-                        newLocation,
-                        orientationDeg,
-                        fusedPose.getTimestampMs()
-                );
-                if (trajectoryMapFragment.isAutoFloorEnabled()) {
-                    trajectoryMapFragment.syncDisplayedFloor(fusedPose.getFloor());
+                if (hasFreshFusedPose) {
+                    trajectoryMapFragment.updateUserLocation(
+                            newLocation,
+                            orientationDeg,
+                            resolveMapUpdateFloor(fusedPose),
+                            fusedPose.getTimestampMs()
+                    );
+                } else if (hasFreshHeading) {
+                    trajectoryMapFragment.updateUserHeading(orientationDeg);
                 }
+                displayDebug = trajectoryMapFragment.getDisplayDebugSnapshot();
+                motionDebug = sensorFusion.getMotionDebugSnapshot();
             }
+            if (hasFreshHeading) {
+                lastForwardedOrientationDeg = orientationDeg;
+            }
+            if (hasFreshHeadingSample) {
+                lastObservedHeadingSampleTimestampMs = headingSampleTimestampMs;
+            }
+            if (!hasFreshFusedPose) {
+                logUiPoseDiagnostic("no_new_pose_arrived", motionDebug, displayDebug);
+            } else if (displayDebug != null && displayDebug.poseTimestampMs == fusedPose.getTimestampMs()) {
+                logUiPoseDiagnostic(
+                        displayDebug.markerMoved
+                                ? "displayed_marker_moved"
+                                : "pose_arrived_but_marker_did_not_move",
+                        motionDebug,
+                        displayDebug
+                );
+            } else if (hasFreshFusedPose) {
+                logUiPoseDiagnostic("pose_arrived_display_status_missing", motionDebug, displayDebug);
+            }
+        } else if (hasFreshFusedPose) {
+            logUiPoseDiagnostic("fresh_pose_has_no_renderable_latlng", motionDebug, displayDebug);
+        }
+        if (hasFreshFusedPose) {
+            lastRenderedFusedPoseTimestampMs = fusedPose.getTimestampMs();
         }
 
         LatLng gnssLocation = sensorFusion.getCurrentGnssLatLng();
@@ -426,8 +493,10 @@ public class RecordingFragment extends Fragment {
         updateObservationMarkers();
 
         // Update previous
-        previousLocalX = fusedPose.getX();
-        previousLocalY = fusedPose.getY();
+        if (hasFreshFusedPose) {
+            previousLocalX = fusedPose.getX();
+            previousLocalY = fusedPose.getY();
+        }
     }
 
     // 记录传给地图前的最终角度，以及当前是否已经拿到 first absolute fix。
@@ -455,6 +524,111 @@ public class RecordingFragment extends Fragment {
         return normalized < 0.0 ? normalized + 360.0 : normalized;
     }
 
+    private boolean shouldForwardOrientation(float orientationDeg) {
+        if (!Float.isFinite(lastForwardedOrientationDeg)) {
+            return true;
+        }
+        return absoluteShortestAngularDifferenceDeg(orientationDeg, lastForwardedOrientationDeg)
+                >= ORIENTATION_UPDATE_THRESHOLD_DEG;
+    }
+
+    private void scheduleRefreshLoop() {
+        refreshDataHandler.removeCallbacks(refreshDataTask);
+        refreshDataHandler.postDelayed(refreshDataTask, UI_REFRESH_INTERVAL_MS);
+    }
+
+    private void resetRecordingSessionState() {
+        markerPoints.clear();
+        markerIndex = 0;
+        recordingStartElapsedMs = SystemClock.elapsedRealtime();
+        lastRenderedFusedPoseTimestampMs = Long.MIN_VALUE;
+        lastForwardedOrientationDeg = Float.NaN;
+        lastObservedHeadingSampleTimestampMs = Long.MIN_VALUE;
+        lastUiPoseDiagnosticState = "";
+        distance = 0f;
+        previousLocalX = 0.0;
+        previousLocalY = 0.0;
+    }
+
+    private void logUiPoseDiagnostic(
+            @NonNull String state,
+            @NonNull SensorFusion.MotionDebugSnapshot motionDebug,
+            @Nullable TrajectoryMapFragment.DisplayDebugSnapshot displayDebug
+    ) {
+        if (!BuildConfig.DEBUG) {
+            return;
+        }
+        String diagnosticState = state
+                + "|poseTs=" + motionDebug.lastFusedPoseTimestampMs
+                + "|displayTs=" + (displayDebug == null ? Long.MIN_VALUE : displayDebug.poseTimestampMs)
+                + "|block=" + motionDebug.lastBlockReason
+                + "|reject=" + resolveDebugRejectReason(motionDebug, displayDebug);
+        if (diagnosticState.equals(lastUiPoseDiagnosticState)) {
+            return;
+        }
+        lastUiPoseDiagnosticState = diagnosticState;
+        Log.d(
+                POSE_DIAG_TAG,
+                "ui_pose state=" + state
+                        + " stationary=" + motionDebug.stationary
+                        + " motionResumeActive=" + motionDebug.motionResumeActive
+                        + " floorConsensus=" + motionDebug.floorConsensus
+                        + " floorSource=" + motionDebug.floorSource
+                        + " elevatorGate=" + motionDebug.elevatorGate
+                        + " currentAbsFloor=" + motionDebug.currentAbsoluteFloor
+                        + " currentRelFloor=" + motionDebug.currentRelativeFloor
+                        + " lastStepDecision=" + motionDebug.lastStepDecision
+                        + " lastAcceptedStepTs=" + motionDebug.lastAcceptedStepTimestampMs
+                        + " lastAbsDecision=" + motionDebug.lastAbsoluteFixDecision
+                        + " lastAcceptedAbsTs=" + motionDebug.lastAcceptedAbsoluteFixTimestampMs
+                        + " lastReject=" + resolveDebugRejectReason(motionDebug, displayDebug)
+                        + " lastBlock=" + motionDebug.lastBlockReason
+                        + " poseSource=" + motionDebug.lastPoseAdvanceSource
+                        + " poseTs=" + motionDebug.lastFusedPoseTimestampMs
+                        + " displayedTs=" + motionDebug.lastDisplayedFusedMarkerTimestampMs
+                        + " displayDecision=" + (displayDebug == null ? "--" : displayDebug.lastDecision)
+                        + " displayReject=" + (displayDebug == null ? "--" : displayDebug.lastRejectReason)
+                        + " headingSource=" + (displayDebug == null ? "--" : displayDebug.headingSource)
+                        + " headingMotionDeg=" + (displayDebug == null ? Float.NaN : displayDebug.headingMotionDeg)
+                        + " headingDeviceDeg=" + (displayDebug == null ? Float.NaN : displayDebug.headingDeviceDeg)
+                        + " markerHold=" + (displayDebug != null && displayDebug.markerHoldActive)
+                        + " markerHoldReason=" + (displayDebug == null ? "--" : displayDebug.markerHoldReason)
+                        + " markerHoldAgeMs=" + (displayDebug == null ? Long.MIN_VALUE : displayDebug.markerHoldAgeMs)
+                        + " displayMoved=" + (displayDebug != null && displayDebug.markerMoved)
+        );
+    }
+
+    @NonNull
+    private String resolveDebugRejectReason(
+            @NonNull SensorFusion.MotionDebugSnapshot motionDebug,
+            @Nullable TrajectoryMapFragment.DisplayDebugSnapshot displayDebug
+    ) {
+        if (displayDebug != null && !TextUtils.isEmpty(displayDebug.lastRejectReason)
+                && !"none".equals(displayDebug.lastRejectReason)) {
+            return displayDebug.lastRejectReason;
+        }
+        if (!TextUtils.isEmpty(motionDebug.lastBlockReason)
+                && !"none".equals(motionDebug.lastBlockReason)) {
+            return motionDebug.lastBlockReason;
+        }
+        return motionDebug.lastRejectReason;
+    }
+
+    private float absoluteShortestAngularDifferenceDeg(float fromDeg, float toDeg) {
+        return Math.abs(shortestAngularDifferenceDeg(fromDeg, toDeg));
+    }
+
+    private float shortestAngularDifferenceDeg(float fromDeg, float toDeg) {
+        return (fromDeg - toDeg + 180f + 360f) % 360f - 180f;
+    }
+
+    private void logFloorDiag(@NonNull String message) {
+        try {
+            Log.d(FLOOR_DIAG_TAG, message);
+        } catch (RuntimeException ignored) {
+        }
+    }
+
     private String resolveSystemStatusLabel() {
         boolean hasGnss = sensorFusion.getCurrentGnssLatLng() != null;
         boolean hasWifi = sensorFusion.getLatLngWifiPositioning() != null;
@@ -474,21 +648,22 @@ public class RecordingFragment extends Fragment {
         return trajectoryMapFragment != null && trajectoryMapFragment.isMappedVenueActive();
     }
 
-    private String resolveFloorStatusText(int floor) {
+    private String resolveFloorStatusText(int floor, boolean floorCalibrated) {
+        if (!FloorDisplayGate.shouldAllowUserVisibleFloor(floorCalibrated, floor)) {
+            return getString(R.string.floor_status_unknown);
+        }
         if (trajectoryMapFragment != null && !trajectoryMapFragment.isMappedVenueActive()) {
             return getString(R.string.floor_status_relative_value, floor);
         }
-        return getString(R.string.floor_status_value, floor);
-    }
-
-    private String resolveElevatorStatusText() {
-        if (trajectoryMapFragment != null && !trajectoryMapFragment.isMappedVenueActive()) {
-            return getString(R.string.elevator_status_unknown);
-        }
-        return getString(
-                R.string.elevator_status_value,
-                getString(sensorFusion.getElevator() ? R.string.elevator_active : R.string.elevator_inactive)
+        String floorDisplayLabel = IndoorMapManager.resolveFloorDisplayLabel(
+                sensorFusion.getCollectionVenue(),
+                floor
         );
+        if (TextUtils.isEmpty(floorDisplayLabel)) {
+            // Modified: fall back to the absolute floor number when a venue label is unavailable.
+            return getString(R.string.floor_status_value, floor);
+        }
+        return getString(R.string.floor_status_display_value, floorDisplayLabel);
     }
 
     private void updateTrackingConfidence(@Nullable FusedPose fusedPose) {
@@ -516,13 +691,9 @@ public class RecordingFragment extends Fragment {
         if (trackingContextHint == null) {
             return;
         }
-        TrajectoryMapFragment.MapMatchingUiState mapState = trajectoryMapFragment == null
+        MapMatchingStateResolver.MapMatchingUiState mapState = trajectoryMapFragment == null
                 ? inferMapStateWithoutFragment()
                 : trajectoryMapFragment.getMapMatchingUiState();
-        boolean smoothingEnabled = trajectoryMapFragment != null
-                && trajectoryMapFragment.isDisplaySmoothingEnabled();
-        boolean lowConfidence = fusedPose != null && fusedPose.getConfidence() < 0.40;
-
         int hintRes;
         switch (mapState) {
             case WAITING_FOR_ABSOLUTE_FIX:
@@ -531,32 +702,28 @@ public class RecordingFragment extends Fragment {
             case PENDING:
                 hintRes = R.string.map_constraints_pending_hint;
                 break;
+            case DISPLAY_ONLY:
+                hintRes = R.string.map_constraints_display_only_hint;
+                break;
             case UNAVAILABLE:
                 hintRes = R.string.map_constraints_unavailable_hint;
                 break;
             case ACTIVE:
             default:
-                if (lowConfidence && smoothingEnabled) {
-                    hintRes = R.string.map_constraints_active_low_confidence_smoothing_hint;
-                } else if (lowConfidence) {
-                    hintRes = R.string.map_constraints_active_low_confidence_hint;
-                } else if (smoothingEnabled) {
-                    hintRes = R.string.map_constraints_active_smoothing_hint;
-                } else {
-                    hintRes = R.string.map_constraints_active_hint;
-                }
-                break;
+                trackingContextHint.setText(null);
+                trackingContextHint.setVisibility(View.GONE);
+                return;
         }
         trackingContextHint.setVisibility(View.VISIBLE);
         trackingContextHint.setText(getString(hintRes));
     }
 
     @NonNull
-    private TrajectoryMapFragment.MapMatchingUiState inferMapStateWithoutFragment() {
+    private MapMatchingStateResolver.MapMatchingUiState inferMapStateWithoutFragment() {
         if (getBestAvailableAbsoluteAnchor() == null) {
-            return TrajectoryMapFragment.MapMatchingUiState.WAITING_FOR_ABSOLUTE_FIX;
+            return MapMatchingStateResolver.MapMatchingUiState.WAITING_FOR_ABSOLUTE_FIX;
         }
-        return TrajectoryMapFragment.MapMatchingUiState.PENDING;
+        return MapMatchingStateResolver.MapMatchingUiState.PENDING;
     }
 
     private int resolveConfidenceLabel(double confidence) {
@@ -641,9 +808,7 @@ public class RecordingFragment extends Fragment {
     public void onResume() {
         super.onResume();
         sensorFusion.resumeListening();
-        if(!this.settings.getBoolean("split_trajectory", false)) {
-            refreshDataHandler.postDelayed(refreshDataTask, 500);
-        }
+        scheduleRefreshLoop();
     }
 
 

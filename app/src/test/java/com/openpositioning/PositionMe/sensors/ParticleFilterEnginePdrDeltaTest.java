@@ -41,7 +41,7 @@ public class ParticleFilterEnginePdrDeltaTest {
     }
 
     @Test
-    public void predictKeepsExistingFloorWhenVerticalEvidenceIsWeak() {
+    public void predictFollowsExternalFloorWithoutSingleStepHeightThreshold() {
         ParticleFilterEngine engine = new ParticleFilterEngine(
                 new ParticleInitializer(new ZeroRandom()),
                 ParticleInitializer.allowAll(),
@@ -52,13 +52,13 @@ public class ParticleFilterEnginePdrDeltaTest {
         engine.predict(new PdrDelta(1.0f, 0.0f, 0.2f), 1, 1100L);
 
         FusedPose pose = engine.estimatePose();
-        assertEquals(0, pose.getFloor());
+        assertEquals(1, pose.getFloor());
         assertEquals(0.0, pose.getX(), 1e-6);
         assertEquals(1.0, pose.getY(), 1e-6);
     }
 
     @Test
-    public void predictAllowsFloorChangeWhenVerticalEvidenceIsStrong() {
+    public void predictDoesNotChangeFloorWhenExternalFloorIsUnchanged() {
         ParticleFilterEngine engine = new ParticleFilterEngine(
                 new ParticleInitializer(new ZeroRandom()),
                 ParticleInitializer.allowAll(),
@@ -66,10 +66,10 @@ public class ParticleFilterEnginePdrDeltaTest {
         );
 
         engine.initialize(0.0, 0.0, 0, 1000L, 0.0, 1, 0.0);
-        engine.predict(new PdrDelta(1.0f, 0.0f, 2.0f), 1, 1100L);
+        engine.predict(new PdrDelta(1.0f, 0.0f, 2.0f), 0, 1100L);
 
         FusedPose pose = engine.estimatePose();
-        assertEquals(1, pose.getFloor());
+        assertEquals(0, pose.getFloor());
         assertEquals(0.0, pose.getX(), 1e-6);
         assertEquals(1.0, pose.getY(), 1e-6);
     }

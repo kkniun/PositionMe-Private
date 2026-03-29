@@ -46,6 +46,7 @@ import java.util.List;
 public class ReplayFragment extends Fragment {
 
     private static final String TAG = "ReplayFragment";
+    private static final String FLOOR_DIAG_TAG = "FloorDiag";
 
     private String filePath = "";
     private int lastIndex = -1;
@@ -160,6 +161,12 @@ public class ReplayFragment extends Fragment {
         playbackSeekBar = view.findViewById(R.id.playbackSeekBar);
         replayFloorStatus = view.findViewById(R.id.replayFloorStatus);
         replayElevatorStatus = view.findViewById(R.id.replayElevatorStatus);
+        logFloorDiag(
+                "event=replay_default_floor_label"
+                        + " floor=0"
+                        + " trustedState=not_applicable"
+                        + " source=default_ui_text"
+        );
         replayFloorStatus.setText(getString(R.string.floor_status_value, 0));
         replayElevatorStatus.setText(getString(
                 R.string.elevator_status_value,
@@ -305,7 +312,7 @@ public class ReplayFragment extends Fragment {
             for (int i = 0; i <= newIndex; i++) {
                 TrajParser.ReplayPoint p = replayData.get(i);
                 trajectoryMapFragment.updateUserLocation(p.trackLocation, p.orientation);
-                trajectoryMapFragment.syncDisplayedFloor(p.floor);
+                trajectoryMapFragment.syncReplayDisplayedFloor(p.floor);
                 if (p.gnssLocation != null) {
                     trajectoryMapFragment.updateGNSS(p.gnssLocation);
                 }
@@ -314,7 +321,7 @@ public class ReplayFragment extends Fragment {
             // Normal sequential forward step: add just the new point
             TrajParser.ReplayPoint p = replayData.get(newIndex);
             trajectoryMapFragment.updateUserLocation(p.trackLocation, p.orientation);
-            trajectoryMapFragment.syncDisplayedFloor(p.floor);
+            trajectoryMapFragment.syncReplayDisplayedFloor(p.floor);
             if (p.gnssLocation != null) {
                 trajectoryMapFragment.updateGNSS(p.gnssLocation);
             }
@@ -354,5 +361,12 @@ public class ReplayFragment extends Fragment {
     public void onDestroyView() {
         super.onDestroyView();
         playbackHandler.removeCallbacks(playbackRunnable);
+    }
+
+    private void logFloorDiag(@NonNull String message) {
+        try {
+            Log.d(FLOOR_DIAG_TAG, message);
+        } catch (RuntimeException ignored) {
+        }
     }
 }

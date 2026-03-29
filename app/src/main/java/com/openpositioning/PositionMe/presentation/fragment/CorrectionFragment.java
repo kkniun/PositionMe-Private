@@ -1,5 +1,6 @@
 package com.openpositioning.PositionMe.presentation.fragment;
 
+import android.graphics.Color;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -19,38 +20,45 @@ import androidx.fragment.app.Fragment;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.presentation.activity.RecordingActivity;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
-import com.openpositioning.PositionMe.utils.PathView;
 import com.google.android.gms.maps.CameraUpdateFactory;
 import com.google.android.gms.maps.GoogleMap;
-import com.google.android.gms.maps.OnMapReadyCallback;
 import com.google.android.gms.maps.SupportMapFragment;
 import com.google.android.gms.maps.model.LatLng;
+import com.google.android.gms.maps.model.LatLngBounds;
+import com.google.android.gms.maps.model.Marker;
 import com.google.android.gms.maps.model.MarkerOptions;
+import com.google.android.gms.maps.model.Polyline;
+import com.google.android.gms.maps.model.PolylineOptions;
 
 import androidx.lifecycle.ViewModelProvider;
 import com.openpositioning.PositionMe.viewmodels.MapViewModel;
+
+import java.util.List;
 
 /**
  * A simple {@link Fragment} subclass. Corrections Fragment is displayed after a recording session
  * is finished to enable manual adjustments to the PDR. The adjustments are not saved as of now.
  */
 public class CorrectionFragment extends Fragment {
+    private static final String START_MARKER_TITLE = "Start Position";
+    private static final float SINGLE_POINT_ZOOM = 19f;
+    private static final float TRAJECTORY_POLYLINE_WIDTH_PX = 10f;
+    private static final int TRAJECTORY_CAMERA_PADDING_PX = 160;
 
     //Map variable
     public GoogleMap mMap;
     //Button to go to next
     private Button button;
     //Singleton SensorFusion class
-    private SensorFusion sensorFusion = SensorFusion.getInstance();
+    private final SensorFusion sensorFusion = SensorFusion.getInstance();
     private TextView averageStepLengthText;
     private EditText stepLengthInput;
     private float averageStepLength;
-    private float newStepLength;
-    private int secondPass = 0;
+    private float recordedAverageStepLength;
     private CharSequence changedText;
-    private static float scalingRatio = 0f;
-    private static LatLng start;
-    private PathView pathView;
+    private float trajectoryScaleFactor = 1f;
+    private Marker startMarker;
+    private Polyline trajectoryPolyline;
     private MapViewModel mapViewModel;
 
     public CorrectionFragment() {
@@ -81,34 +89,7 @@ public class CorrectionFragment extends Fragment {
         // Send trajectory data to the cloud
         sensorFusion.sendTrajectoryToCloud();
 
-
-        //Obtain start position
-        float[] startPosition = sensorFusion.getGNSSLatitude(true);
-
-        // Initialize map fragment
-        SupportMapFragment supportMapFragment=(SupportMapFragment)
-                getChildFragmentManager().findFragmentById(R.id.map);
-
-        supportMapFragment.getMapAsync(new OnMapReadyCallback() {
-            @Override
-            public void onMapReady(GoogleMap map) {
-                mMap = map;
-                mMap.setMapType(GoogleMap.MAP_TYPE_HYBRID);
-                mMap.getUiSettings().setCompassEnabled(true);
-                mMap.getUiSettings().setTiltGesturesEnabled(true);
-                mMap.getUiSettings().setRotateGesturesEnabled(true);
-                mMap.getUiSettings().setScrollGesturesEnabled(true);
-
-                // Add a marker at the start position
-                start = new LatLng(startPosition[0], startPosition[1]);
-                mMap.addMarker(new MarkerOptions().position(start).title("Start Position"));
-
-                // Calculate zoom for demonstration
-                double zoom = Math.log(156543.03392f * Math.cos(startPosition[0] * Math.PI / 180)
-                        * scalingRatio) / Math.log(2);
-                mMap.moveCamera(CameraUpdateFactory.newLatLngZoom(start, (float) zoom));
-            }
-        });
+        initializeMapFragment();
 
         return rootView;
     }
@@ -119,27 +100,16 @@ public class CorrectionFragment extends Fragment {
 
         this.averageStepLengthText = view.findViewById(R.id.averageStepView);
         this.stepLengthInput = view.findViewById(R.id.inputStepLength);
-        this.pathView = view.findViewById(R.id.pathView1);
 
         averageStepLength = sensorFusion.passAverageStepLength();
-        averageStepLengthText.setText(getString(R.string.averageStepLgn) + ": "
-                + String.format("%.2f", averageStepLength));
+        recordedAverageStepLength = averageStepLength;
+        updateAverageStepLengthText(averageStepLength);
 
         // Listen for ENTER key
         this.stepLengthInput.setOnKeyListener((v, keyCode, event) -> {
-            if (keyCode == KeyEvent.KEYCODE_ENTER) {
-                newStepLength = Float.parseFloat(changedText.toString());
-                // Rescale path
-                sensorFusion.redrawPath(newStepLength / averageStepLength);
-                averageStepLengthText.setText(getString(R.string.averageStepLgn)
-                        + ": " + String.format("%.2f", newStepLength));
-                pathView.invalidate();
-
-                secondPass++;
-                if (secondPass == 2) {
-                    averageStepLength = newStepLength;
-                    secondPass = 0;
-                }
+            if (keyCode == KeyEvent.KEYCODE_ENTER && event != null && event.getAction() == KeyEvent.ACTION_UP) {
+                applyStepLengthCorrection();
+                return true;
             }
             return false;
         });
@@ -165,7 +135,171 @@ public class CorrectionFragment extends Fragment {
         });
     }
 
-    public void setScalingRatio(float scalingRatio) {
-        this.scalingRatio = scalingRatio;
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        button = null;
+        averageStepLengthText = null ;
+        stepLengthInput = null;
+        startMarker = null;
+        trajectoryPolyline = null;
+        mMap = null;
+    }
+
+    private void initializeMapFragment() {
+        SupportMapFragment supportMapFragment = (SupportMapFragment)
+                getChildFragmentManager().findFragmentById(R.id.map);
+        if (supportMapFragment == null) {
+            return;
+        }
+        supportMapFragment.getMapAsync(map -> {
+            mMap = map;
+            configureMapUi(map);
+            renderRecordedTrajectory(true);
+        });
+    }
+
+    private void configureMapUi(@NonNull GoogleMap map) {
+        map.setMapType(GoogleMap.MAP_TYPE_HYBRID);
+        map.getUiSettings().setCompassEnabled(true);
+        map.getUiSettings().setTiltGesturesEnabled(true);
+        map.getUiSettings().setRotateGesturesEnabled(true);
+        map.getUiSettings().setScrollGesturesEnabled(true);
+    }
+
+    private void applyStepLengthCorrection() {
+        if (changedText == null) {
+            return;
+        }
+        String candidateStepLength = changedText.toString().trim();
+        if (candidateStepLength.isEmpty()) {
+            return;
+        }
+        float parsedStepLength;
+        try {
+            parsedStepLength = Float.parseFloat(candidateStepLength);
+        } catch (NumberFormatException ignored) {
+            return;
+        }
+        if (parsedStepLength <= 0f) {
+            return;
+        }
+
+        trajectoryScaleFactor = recordedAverageStepLength > 0f
+                ? parsedStepLength / recordedAverageStepLength
+                : 1f;
+        averageStepLength = parsedStepLength;
+        updateAverageStepLengthText(parsedStepLength);
+        renderRecordedTrajectory(true);
+    }
+
+    private void updateAverageStepLengthText(float stepLengthMeters) {
+        if (averageStepLengthText == null) {
+            return;
+        }
+        averageStepLengthText.setText(getString(R.string.averageStepLgn) + ": "
+                + String.format("%.2f", stepLengthMeters));
+    }
+
+    private void renderRecordedTrajectory(boolean fitCamera) {
+        if (mMap == null) {
+            return;
+        }
+
+        List<LatLng> trajectoryPoints = sensorFusion.getRecordedTrajectoryLatLngs(trajectoryScaleFactor);
+        LatLng origin = sensorFusion.getRecordedTrajectoryOriginLatLng();
+        LatLng startPoint = origin != null
+                ? origin
+                : (trajectoryPoints.isEmpty() ? null : trajectoryPoints.get(0));
+
+        updateStartMarker(startPoint);
+        updateTrajectoryPolyline(trajectoryPoints);
+
+        if (fitCamera) {
+            fitCameraToTrajectory(trajectoryPoints, startPoint);
+        }
+    }
+
+    private void updateStartMarker(@Nullable LatLng startPoint) {
+        if (mMap == null) {
+            return;
+        }
+        if (startPoint == null) {
+            if (startMarker != null) {
+                startMarker.remove();
+                startMarker = null;
+            }
+            return;
+        }
+        if (startMarker == null) {
+            startMarker = mMap.addMarker(new MarkerOptions().position(startPoint).title(START_MARKER_TITLE));
+            return;
+        }
+        startMarker.setPosition(startPoint);
+        startMarker.setTitle(START_MARKER_TITLE);
+    }
+
+    private void updateTrajectoryPolyline(@NonNull List<LatLng> trajectoryPoints) {
+        if (mMap == null) {
+            return;
+        }
+        if (trajectoryPoints.size() < 2) {
+            if (trajectoryPolyline != null) {
+                trajectoryPolyline.remove();
+                trajectoryPolyline = null;
+            }
+            return;
+        }
+        if (trajectoryPolyline == null) {
+            trajectoryPolyline = mMap.addPolyline(new PolylineOptions()
+                    .color(Color.BLUE)
+                    .width(TRAJECTORY_POLYLINE_WIDTH_PX));
+        }
+        trajectoryPolyline.setPoints(trajectoryPoints);
+    }
+
+    private void fitCameraToTrajectory(@NonNull List<LatLng> trajectoryPoints, @Nullable LatLng fallbackPoint) {
+        if (mMap == null) {
+            return;
+        }
+        if (trajectoryPoints.isEmpty()) {
+            if (fallbackPoint != null) {
+                mMap.moveCamera(CameraUpdateFactory.newLatLngZoom(fallbackPoint, SINGLE_POINT_ZOOM));
+            }
+            return;
+        }
+
+        LatLngBounds.Builder boundsBuilder = LatLngBounds.builder();
+        int pointCount = 0;
+        if (fallbackPoint != null) {
+            boundsBuilder.include(fallbackPoint);
+            pointCount++;
+        }
+        for (LatLng point : trajectoryPoints) {
+            boundsBuilder.include(point);
+            pointCount++;
+        }
+
+        if (pointCount <= 1) {
+            LatLng cameraTarget = fallbackPoint != null ? fallbackPoint : trajectoryPoints.get(0);
+            mMap.moveCamera(CameraUpdateFactory.newLatLngZoom(cameraTarget, SINGLE_POINT_ZOOM));
+            return;
+        }
+
+        LatLngBounds bounds = boundsBuilder.build();
+        View fragmentView = getView();
+        Runnable fitCameraTask = () -> {
+            if (mMap != null) {
+                mMap.animateCamera(CameraUpdateFactory.newLatLngBounds(
+                        bounds,
+                        TRAJECTORY_CAMERA_PADDING_PX
+                ));
+            }
+        };
+        if (fragmentView != null) {
+            fragmentView.post(fitCameraTask);
+        } else {
+            fitCameraTask.run();
+        }
     }
 }

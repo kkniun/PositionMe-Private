@@ -28,6 +28,17 @@ public class ParticleInitializer {
         ) {
             return isValid(predictedX, predictedY, predictedFloor);
         }
+
+        default boolean isValidSpawnFromFix(
+                double fixX,
+                double fixY,
+                double sampleX,
+                double sampleY,
+                int floor
+        ) {
+            return isValid(sampleX, sampleY, floor)
+                    && isValidMotion(fixX, fixY, sampleX, sampleY, floor, floor);
+        }
     }
 
     public ParticleInitializer() {
@@ -74,31 +85,55 @@ public class ParticleInitializer {
         SpawnValidator effectiveValidator = validator == null ? allowAll() : validator;
         double safeStd = positionStdMeters > 0 ? positionStdMeters : DEFAULT_POSITION_STD_M;
         double initialWeight = 1.0 / particleCount;
+        List<double[]> acceptedSamples = new ArrayList<>(particleCount);
 
         for (int i = 0; i < particleCount; i++) {
-            double sampleX = fixX;
-            double sampleY = fixY;
-            boolean accepted = false;
-
-            // 当前仓库还没有轻量 BuildingMap 接口，这里先预留可注入校验回调。
-            // 后续接 map matching / 楼层约束时，可在这里替换为更严格的合法性判定。
-            for (int attempt = 0; attempt < MAX_ATTEMPTS_PER_PARTICLE; attempt++) {
-                sampleX = fixX + random.nextGaussian() * safeStd;
-                sampleY = fixY + random.nextGaussian() * safeStd;
-                if (effectiveValidator.isValid(sampleX, sampleY, floor)) {
-                    accepted = true;
-                    break;
+            double[] acceptedSample = findValidSample(
+                    fixX,
+                    fixY,
+                    floor,
+                    safeStd,
+                    effectiveValidator,
+                    acceptedSamples.isEmpty() ? MAX_ATTEMPTS_PER_PARTICLE * 4 : MAX_ATTEMPTS_PER_PARTICLE
+            );
+            if (acceptedSample == null) {
+                if (acceptedSamples.isEmpty()) {
+                    // When constraints are active, do not silently seed the cloud into illegal
+                    // geometry. Let the caller reject/defer the absolute fix instead.
+                    return new ArrayList<>();
                 }
+                acceptedSample = acceptedSamples.get(random.nextInt(acceptedSamples.size()));
+            } else {
+                acceptedSamples.add(acceptedSample);
             }
 
-            if (!accepted) {
-                sampleX = fixX;
-                sampleY = fixY;
-            }
-
-            particles.add(new Particle(sampleX, sampleY, floor, initialWeight, headingRad));
+            particles.add(new Particle(
+                    acceptedSample[0],
+                    acceptedSample[1],
+                    floor,
+                    initialWeight,
+                    headingRad
+            ));
         }
 
         return particles;
+    }
+
+    private double[] findValidSample(
+            double fixX,
+            double fixY,
+            int floor,
+            double positionStdMeters,
+            SpawnValidator validator,
+            int maxAttempts
+    ) {
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            double sampleX = fixX + random.nextGaussian() * positionStdMeters;
+            double sampleY = fixY + random.nextGaussian() * positionStdMeters;
+            if (validator.isValidSpawnFromFix(fixX, fixY, sampleX, sampleY, floor)) {
+                return new double[]{sampleX, sampleY};
+            }
+        }
+        return null;
     }
 }

@@ -8,7 +8,6 @@ import android.graphics.Path;
 import android.util.AttributeSet;
 import android.view.View;
 
-import com.openpositioning.PositionMe.presentation.fragment.CorrectionFragment;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 
 import java.util.ArrayList;
@@ -19,8 +18,7 @@ import java.util.Collections;
  * A path of straight lines is drawn based on PDR coordinates. The coordinates are passed to
  * PathView by calling method {@link PathView#drawTrajectory(float[])} in {@link SensorFusion}.
  * The coordinates are scaled and centered in {@link PathView#scaleTrajectory()} to fill the
- * device's screen. The scaling ratio is passed to the {@link CorrectionFragment} for calculating
- * the Google Maps zoom ratio.
+ * device's screen.
  *
  * @author Michal Dvorak
  * @author Virginia Cangelosi
@@ -37,8 +35,6 @@ public class PathView extends View {
     private static ArrayList<Float> yCoords = new ArrayList<Float>();
     // Scaling ratio for multiplying PDR coordinates to fill the screen size
     private static float scalingRatio;
-    // Instantiate correction fragment for passing it the scaling ratio
-    private CorrectionFragment correctionFragment = new CorrectionFragment();
     // Boolean flag to avoid rescaling trajectory when view is redrawn
     private static boolean firstTimeOnDraw = true;
     //Variable to only draw when the variable is true
@@ -204,9 +200,6 @@ public class PathView extends View {
         }
         System.out.println("Adjusted scaling ratio: " + scalingRatio);
 
-        // Set the scaling ratio for the correction fragment for setting Google Maps zoom
-        correctionFragment.setScalingRatio(scalingRatio);
-
         // Iterate over all coordinates, shifting to the center and scaling
         for (int i = 0; i < xCoords.size(); i++) {
             float newXCoord = xCoords.get(i) * scalingRatio + centerX;
@@ -232,8 +225,8 @@ public class PathView extends View {
 
     /**
      * Redraw trajectory to rescale the path.
-     * Called by {@link CorrectionFragment} through {@link SensorFusion} to reset the scaling ratio
-     * which will resize the path. It enables the redraw flag so new path is drawn.
+     * Called through {@link SensorFusion} to reset the scaling ratio which resizes the path.
+     * It enables the redraw flag so new path is drawn.
      *
      * @param newScale
      */

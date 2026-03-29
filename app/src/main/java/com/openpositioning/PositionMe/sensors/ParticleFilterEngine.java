@@ -1,5 +1,6 @@
 package com.openpositioning.PositionMe.sensors;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.openpositioning.PositionMe.utils.PdrProcessing;
@@ -27,7 +28,7 @@ public class ParticleFilterEngine {
     private static final double RECOVERY_DISTANCE_STD_MULTIPLIER = 6.0;
     private static final double MIN_RECOVERY_DISTANCE_M = 8.0;
     private static final double MIN_SUPPORT_WEIGHT_RATIO = 0.2;
-    private static final double MIN_HEIGHT_DELTA_FOR_FLOOR_CHANGE_M = 1.5;
+    private static final double MAX_CREDIBLE_RECOVERY_ACCURACY_M = 6.0;
 
     private final ParticleInitializer particleInitializer;
     private final ParticleInitializer.SpawnValidator spawnValidator;
@@ -41,6 +42,35 @@ public class ParticleFilterEngine {
     private int lastPredictWallRejectCount;
     private int lastPredictFloorConstraintRejectCount;
     private boolean lastAbsoluteFixReanchored;
+    private boolean lastAbsoluteFixRejectedByConstraints;
+
+    static final class StateSnapshot {
+        private final List<Particle> particles;
+        private final long lastTimestampMs;
+        private final int lastPredictWallRejectCount;
+        private final int lastPredictFloorConstraintRejectCount;
+        private final boolean lastAbsoluteFixReanchored;
+        private final boolean lastAbsoluteFixRejectedByConstraints;
+
+        StateSnapshot(
+                @NonNull List<Particle> particles,
+                long lastTimestampMs,
+                int lastPredictWallRejectCount,
+                int lastPredictFloorConstraintRejectCount,
+                boolean lastAbsoluteFixReanchored,
+                boolean lastAbsoluteFixRejectedByConstraints
+        ) {
+            this.particles = new ArrayList<>(particles.size());
+            for (Particle particle : particles) {
+                this.particles.add(new Particle(particle));
+            }
+            this.lastTimestampMs = lastTimestampMs;
+            this.lastPredictWallRejectCount = lastPredictWallRejectCount;
+            this.lastPredictFloorConstraintRejectCount = lastPredictFloorConstraintRejectCount;
+            this.lastAbsoluteFixReanchored = lastAbsoluteFixReanchored;
+            this.lastAbsoluteFixRejectedByConstraints = lastAbsoluteFixRejectedByConstraints;
+        }
+    }
 
     public ParticleFilterEngine() {
         this(new ParticleInitializer(), ParticleInitializer.allowAll(), null, new Random());
@@ -119,6 +149,7 @@ public class ParticleFilterEngine {
             int particleCount,
             double positionStdMeters
     ) {
+        resetLastAbsoluteFixOutcomeFlags();
         particles.clear();
         particles.addAll(particleInitializer.initialize(
                 fixX,
@@ -142,7 +173,6 @@ public class ParticleFilterEngine {
         lastPredictFloorConstraintRejectCount = 0;
         double stepLengthMeters = delta.getStepLengthMeters();
         double deltaHeadingRad = delta.getDeltaHeadingRad();
-        double heightDeltaMeters = delta.getHeightDeltaMeters();
         for (Particle particle : particles) {
             double previousX = particle.getX();
             double previousY = particle.getY();
@@ -161,7 +191,7 @@ public class ParticleFilterEngine {
             double predictedY = previousY
                     + localStep[1]
                     + random.nextGaussian() * DEFAULT_PREDICTION_NOISE_STD_M;
-            int predictedFloor = resolvePredictedFloor(previousFloor, floor, heightDeltaMeters);
+            int predictedFloor = resolvePredictedFloor(previousFloor, floor);
 
             if (predictedFloor != previousFloor
                     && floorTransitionGate != null
@@ -187,10 +217,17 @@ public class ParticleFilterEngine {
                     predictedFloor
             )) {
                 lastPredictWallRejectCount++;
-                predictedX = previousX;
-                predictedY = previousY;
-                predictedFloor = previousFloor;
-                predictedHeadingRad = previousHeadingRad;
+                resetParticleAfterInvalidPrediction(
+                        particle,
+                        previousX,
+                        previousY,
+                        previousFloor,
+                        previousHeadingRad
+                );
+                predictedX = particle.getX();
+                predictedY = particle.getY();
+                predictedFloor = particle.getFloor();
+                predictedHeadingRad = particle.getHeadingRad();
             }
 
             particle.setX(predictedX);
@@ -200,6 +237,23 @@ public class ParticleFilterEngine {
         }
 
         lastTimestampMs = timestampMs;
+        normalizeWeights();
+        resampleIfNeeded();
+    }
+
+    public boolean forceFloor(int floor, long timestampMs) {
+        if (particles.isEmpty()) {
+            lastTimestampMs = timestampMs;
+            return false;
+        }
+        if (!canForceFloor(floor)) {
+            return false;
+        }
+        for (Particle particle : particles) {
+            particle.setFloor(floor);
+        }
+        lastTimestampMs = timestampMs;
+        return true;
     }
 
     public void updateWithAbsoluteFix(double fixX, double fixY, int floor, long timestampMs) {
@@ -223,30 +277,74 @@ public class ParticleFilterEngine {
             long timestampMs,
             double accuracyMeters
     ) {
-        Integer acceptedFloorPrior = sanitizeAbsoluteFloorPrior(fixX, fixY, floorPrior);
+        double measurementStdMeters = sanitizeAccuracyMeters(accuracyMeters);
+        boolean reanchorRequired = !particles.isEmpty()
+                && shouldReanchorToAbsoluteFix(fixX, fixY, measurementStdMeters);
+        Integer acceptedFloorPrior = sanitizeAbsoluteFloorPrior(fixX, fixY, floorPrior, reanchorRequired);
+        int validationFloor = resolveAbsoluteFixValidationFloor(fixX, fixY, acceptedFloorPrior, floorPrior);
         lastAbsoluteFixReanchored = false;
+        lastAbsoluteFixRejectedByConstraints = false;
+        if (isAbsoluteFixInvalidUnderConstraints(fixX, fixY, validationFloor)) {
+            lastAbsoluteFixRejectedByConstraints = true;
+            return;
+        }
         if (particles.isEmpty()) {
-            initialize(
+            List<Particle> initializedParticles = particleInitializer.initialize(
                     fixX,
                     fixY,
                     resolveInitializationFloor(acceptedFloorPrior),
-                    timestampMs,
-                    0.0,
                     DEFAULT_PARTICLE_COUNT,
-                    sanitizeAccuracyMeters(accuracyMeters)
+                    sanitizeAccuracyMeters(accuracyMeters),
+                    0.0,
+                    spawnValidator
+            );
+            if (initializedParticles.isEmpty()) {
+                lastAbsoluteFixRejectedByConstraints = true;
+                return;
+            }
+            particles.clear();
+            particles.addAll(initializedParticles);
+            lastTimestampMs = timestampMs;
+            normalizeWeights();
+            return;
+        }
+
+        if (reanchorRequired) {
+            boolean hasMotionSupport = hasMotionCompatibleSupportForAbsoluteFix(
+                    fixX,
+                    fixY,
+                    validationFloor,
+                    MIN_SUPPORT_WEIGHT_RATIO
+            );
+            boolean useCredibleRecoveryReanchor = !hasMotionSupport
+                    && isCredibleRecoveryReanchor(fixX, fixY, validationFloor, measurementStdMeters);
+            if (!hasMotionSupport && !useCredibleRecoveryReanchor) {
+                lastAbsoluteFixRejectedByConstraints = true;
+                return;
+            }
+            lastAbsoluteFixReanchored = true;
+            reanchorToAbsoluteFix(
+                    fixX,
+                    fixY,
+                    acceptedFloorPrior,
+                    timestampMs,
+                    measurementStdMeters,
+                    useCredibleRecoveryReanchor
             );
             return;
         }
 
-        double measurementStdMeters = sanitizeAccuracyMeters(accuracyMeters);
-        if (shouldReanchorToAbsoluteFix(fixX, fixY, measurementStdMeters)) {
-            lastAbsoluteFixReanchored = true;
-            reanchorToAbsoluteFix(fixX, fixY, acceptedFloorPrior, timestampMs, measurementStdMeters);
+        if (!hasMotionCompatibleSupportForAbsoluteFix(fixX, fixY, validationFloor, Double.MIN_VALUE)) {
+            lastAbsoluteFixRejectedByConstraints = true;
             return;
         }
 
         double variance = measurementStdMeters * measurementStdMeters;
         for (Particle particle : particles) {
+            if (!isParticleMotionCompatibleWithAbsoluteFix(particle, fixX, fixY, validationFloor)) {
+                particle.setWeight(MIN_WEIGHT);
+                continue;
+            }
             double dx = particle.getX() - fixX;
             double dy = particle.getY() - fixY;
             double distanceSq = dx * dx + dy * dy;
@@ -393,7 +491,49 @@ public class ParticleFilterEngine {
         double confidence = 1.0 / (1.0 + spread);
         long timestamp = lastTimestampMs > 0 ? lastTimestampMs : System.currentTimeMillis();
 
+        Particle legalRepresentative = selectLegalRepresentative(meanX, meanY, estimatedFloor);
+        if (legalRepresentative != null) {
+            meanX = legalRepresentative.getX();
+            meanY = legalRepresentative.getY();
+            estimatedFloor = legalRepresentative.getFloor();
+        }
+
         return new FusedPose(meanX, meanY, estimatedFloor, confidence, timestamp);
+    }
+
+    int revalidateParticlesAgainstConstraints() {
+        if (particles.isEmpty()) {
+            return 0;
+        }
+
+        List<Particle> legalParticles = new ArrayList<>(particles.size());
+        int rejectedParticleCount = 0;
+        for (Particle particle : particles) {
+            if (spawnValidator.isValid(particle.getX(), particle.getY(), particle.getFloor())) {
+                legalParticles.add(particle);
+                continue;
+            }
+            rejectedParticleCount++;
+        }
+        if (rejectedParticleCount == 0) {
+            return 0;
+        }
+
+        particles.clear();
+        particles.addAll(legalParticles);
+        normalizeWeights();
+        return rejectedParticleCount;
+    }
+
+    void clearParticles(long timestampMs) {
+        particles.clear();
+        lastTimestampMs = timestampMs;
+        resetLastAbsoluteFixOutcomeFlags();
+    }
+
+    private void resetLastAbsoluteFixOutcomeFlags() {
+        lastAbsoluteFixReanchored = false;
+        lastAbsoluteFixRejectedByConstraints = false;
     }
 
     private double sanitizeAccuracyMeters(double accuracyMeters) {
@@ -435,27 +575,132 @@ public class ParticleFilterEngine {
             double fixY,
             @Nullable Integer floorPrior,
             long timestampMs,
-            double measurementStdMeters
+            double measurementStdMeters,
+            boolean useEndpointLockedRecovery
     ) {
         int particleCount = particles.isEmpty() ? DEFAULT_PARTICLE_COUNT : particles.size();
         double headingRad = estimateCircularMeanHeading();
         int reanchorFloor = resolveInitializationFloor(floorPrior);
+        List<Particle> reanchoredParticles = useEndpointLockedRecovery
+                ? createEndpointLockedRecoveryParticles(fixX, fixY, reanchorFloor, particleCount, headingRad)
+                : particleInitializer.initialize(
+                        fixX,
+                        fixY,
+                        reanchorFloor,
+                        particleCount,
+                        measurementStdMeters,
+                        headingRad,
+                        spawnValidator
+                );
+        if (reanchoredParticles.isEmpty()) {
+            lastAbsoluteFixReanchored = false;
+            lastAbsoluteFixRejectedByConstraints = true;
+            return;
+        }
         particles.clear();
-        particles.addAll(particleInitializer.initialize(
-                fixX,
-                fixY,
-                reanchorFloor,
-                particleCount,
-                measurementStdMeters,
-                headingRad,
-                spawnValidator
-        ));
+        particles.addAll(reanchoredParticles);
         lastTimestampMs = timestampMs;
         normalizeWeights();
     }
 
+    private boolean isAbsoluteFixInvalidUnderConstraints(double fixX, double fixY, int validationFloor) {
+        return !spawnValidator.isValid(fixX, fixY, validationFloor);
+    }
+
+    private void resetParticleAfterInvalidPrediction(
+            @NonNull Particle particle,
+            double previousX,
+            double previousY,
+            int previousFloor,
+            double previousHeadingRad
+    ) {
+        particle.setX(previousX);
+        particle.setY(previousY);
+        particle.setFloor(previousFloor);
+        particle.setHeadingRad(previousHeadingRad);
+        // Hard wall constraint: once a predicted segment crosses a blocking wall, keep the
+        // particle on the last legal pose and effectively kill it for the next normalization.
+        particle.setWeight(MIN_WEIGHT);
+    }
+
+    private boolean hasMotionCompatibleSupportForAbsoluteFix(
+            double fixX,
+            double fixY,
+            int validationFloor,
+            double minimumSupportRatio
+    ) {
+        double totalWeight = 0.0;
+        double motionCompatibleWeight = 0.0;
+        for (Particle particle : particles) {
+            double weight = sanitizeWeight(particle.getWeight());
+            totalWeight += weight;
+            if (weight <= 0.0) {
+                continue;
+            }
+            if (isParticleMotionCompatibleWithAbsoluteFix(particle, fixX, fixY, validationFloor)) {
+                motionCompatibleWeight += weight;
+            }
+        }
+        if (totalWeight <= 0.0 || Double.isNaN(totalWeight) || Double.isInfinite(totalWeight)) {
+            return false;
+        }
+        return (motionCompatibleWeight / totalWeight) >= minimumSupportRatio;
+    }
+
+    private boolean isParticleMotionCompatibleWithAbsoluteFix(
+            @NonNull Particle particle,
+            double fixX,
+            double fixY,
+            int validationFloor
+    ) {
+        return spawnValidator.isValidMotion(
+                particle.getX(),
+                particle.getY(),
+                fixX,
+                fixY,
+                particle.getFloor(),
+                validationFloor
+        );
+    }
+
     @Nullable
-    private Integer sanitizeAbsoluteFloorPrior(double fixX, double fixY, @Nullable Integer floorPrior) {
+    private Particle selectLegalRepresentative(double meanX, double meanY, int estimatedFloor) {
+        if (spawnValidator.isValid(meanX, meanY, estimatedFloor)) {
+            return null;
+        }
+
+        Particle bestParticle = null;
+        double bestDistanceSq = Double.POSITIVE_INFINITY;
+        double bestWeight = -1.0;
+        for (Particle particle : particles) {
+            if (particle.getFloor() != estimatedFloor || !spawnValidator.isValid(
+                    particle.getX(),
+                    particle.getY(),
+                    particle.getFloor()
+            )) {
+                continue;
+            }
+            double dx = particle.getX() - meanX;
+            double dy = particle.getY() - meanY;
+            double distanceSq = dx * dx + dy * dy;
+            double weight = sanitizeWeight(particle.getWeight());
+            if (distanceSq < bestDistanceSq
+                    || (Math.abs(distanceSq - bestDistanceSq) <= 1e-9 && weight > bestWeight)) {
+                bestParticle = particle;
+                bestDistanceSq = distanceSq;
+                bestWeight = weight;
+            }
+        }
+        return bestParticle;
+    }
+
+    @Nullable
+    private Integer sanitizeAbsoluteFloorPrior(
+            double fixX,
+            double fixY,
+            @Nullable Integer floorPrior,
+            boolean allowRecoveryOverride
+    ) {
         if (floorPrior == null || particles.isEmpty() || floorTransitionGate == null) {
             return floorPrior;
         }
@@ -467,14 +712,82 @@ public class ParticleFilterEngine {
         if (currentPose == null) {
             return null;
         }
-        return floorTransitionGate.allowsFloorChange(
+        boolean floorChangeAllowed = floorTransitionGate.allowsFloorChange(
                 currentPose.getX(),
                 currentPose.getY(),
                 fixX,
                 fixY,
                 currentFloor,
                 floorPrior
-        ) ? floorPrior : null;
+        );
+        if (floorChangeAllowed) {
+            return floorPrior;
+        }
+        if (allowRecoveryOverride
+                && !spawnValidator.isValid(fixX, fixY, currentFloor)
+                && spawnValidator.isValid(fixX, fixY, floorPrior)) {
+            return floorPrior;
+        }
+        return null;
+    }
+
+    private int resolveAbsoluteFixValidationFloor(
+            double fixX,
+            double fixY,
+            @Nullable Integer acceptedFloorPrior,
+            @Nullable Integer requestedFloorPrior
+    ) {
+        if (acceptedFloorPrior != null) {
+            return acceptedFloorPrior;
+        }
+        int dominantFloor = resolveDominantFloor();
+        if (spawnValidator.isValid(fixX, fixY, dominantFloor)) {
+            return dominantFloor;
+        }
+        if (requestedFloorPrior != null && spawnValidator.isValid(fixX, fixY, requestedFloorPrior)) {
+            return requestedFloorPrior;
+        }
+        return dominantFloor;
+    }
+
+    private boolean isCredibleRecoveryReanchor(
+            double fixX,
+            double fixY,
+            int validationFloor,
+            double measurementStdMeters
+    ) {
+        if (measurementStdMeters > MAX_CREDIBLE_RECOVERY_ACCURACY_M) {
+            return false;
+        }
+        if (!spawnValidator.isValid(fixX, fixY, validationFloor)) {
+            return false;
+        }
+        List<Particle> recoveryParticles = createEndpointLockedRecoveryParticles(
+                fixX,
+                fixY,
+                validationFloor,
+                Math.min(Math.max(particles.size(), 1), 8),
+                estimateCircularMeanHeading()
+        );
+        return !recoveryParticles.isEmpty();
+    }
+
+    private List<Particle> createEndpointLockedRecoveryParticles(
+            double fixX,
+            double fixY,
+            int floor,
+            int particleCount,
+            double headingRad
+    ) {
+        if (particleCount <= 0 || !spawnValidator.isValid(fixX, fixY, floor)) {
+            return Collections.emptyList();
+        }
+        double initialWeight = 1.0 / particleCount;
+        List<Particle> recoveryParticles = new ArrayList<>(particleCount);
+        for (int i = 0; i < particleCount; i++) {
+            recoveryParticles.add(new Particle(fixX, fixY, floor, initialWeight, headingRad));
+        }
+        return recoveryParticles;
     }
 
     private double estimateCircularMeanHeading() {
@@ -503,13 +816,10 @@ public class ParticleFilterEngine {
         return weight;
     }
 
-    private int resolvePredictedFloor(int previousFloor, int externalFloor, double heightDeltaMeters) {
-        // Step 1 keeps barometer/PDR floor as a conservative prior. A tiny vertical delta should
-        // not snap the whole cloud onto a new floor during normal planar tracking.
+    private int resolvePredictedFloor(int previousFloor, int externalFloor) {
+        // Modified: the external floor already comes from smoothed barometer/PDR state, so do not
+        // require an impossible single-step vertical jump before allowing a floor transition.
         if (externalFloor == previousFloor) {
-            return previousFloor;
-        }
-        if (Math.abs(heightDeltaMeters) < MIN_HEIGHT_DELTA_FOR_FLOOR_CHANGE_M) {
             return previousFloor;
         }
         return externalFloor;
@@ -567,6 +877,8 @@ public class ParticleFilterEngine {
             }
         }
         lastTimestampMs = timestampMs;
+        lastAbsoluteFixReanchored = false;
+        lastAbsoluteFixRejectedByConstraints = false;
     }
 
     List<Particle> snapshotParticlesForTesting() {
@@ -580,6 +892,44 @@ public class ParticleFilterEngine {
         return snapshot;
     }
 
+    @NonNull
+    StateSnapshot captureStateSnapshot() {
+        return new StateSnapshot(
+                particles,
+                lastTimestampMs,
+                lastPredictWallRejectCount,
+                lastPredictFloorConstraintRejectCount,
+                lastAbsoluteFixReanchored,
+                lastAbsoluteFixRejectedByConstraints
+        );
+    }
+
+    void restoreStateSnapshot(@NonNull StateSnapshot snapshot) {
+        particles.clear();
+        particles.addAll(snapshot.particles);
+        lastTimestampMs = snapshot.lastTimestampMs;
+        lastPredictWallRejectCount = snapshot.lastPredictWallRejectCount;
+        lastPredictFloorConstraintRejectCount = snapshot.lastPredictFloorConstraintRejectCount;
+        lastAbsoluteFixReanchored = snapshot.lastAbsoluteFixReanchored;
+        lastAbsoluteFixRejectedByConstraints = snapshot.lastAbsoluteFixRejectedByConstraints;
+    }
+
+    boolean hasParticles() {
+        return !particles.isEmpty();
+    }
+
+    boolean canForceFloor(int floor) {
+        if (particles.isEmpty()) {
+            return false;
+        }
+        for (Particle particle : particles) {
+            if (!spawnValidator.isValid(particle.getX(), particle.getY(), floor)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     int getLastPredictWallRejectCount() {
         return lastPredictWallRejectCount;
     }
@@ -590,5 +940,9 @@ public class ParticleFilterEngine {
 
     boolean wasLastAbsoluteFixReanchored() {
         return lastAbsoluteFixReanchored;
+    }
+
+    boolean wasLastAbsoluteFixRejectedByConstraints() {
+        return lastAbsoluteFixRejectedByConstraints;
     }
 }

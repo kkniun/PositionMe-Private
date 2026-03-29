@@ -33,11 +33,11 @@ public class PdrProcessing {
     // Number of samples (seconds) to keep as memory for elevation calculation
     private static final int elevationSeconds = 4;
     // Number of samples (0.01 seconds)
-    private static final int accelSamples = 100;
+    private static final int accelSamples = 48;
     // Threshold used to detect significant movement
-    private static final float movementThreshold = 0.3f; // m/s^2
+    private static final float movementThreshold = 0.12f; // m/s^2
     // Threshold under which movement is considered non-existent
-    private static final float epsilon = 0.18f;
+    private static final float epsilon = 0.30f;
     private static final int MIN_REQUIRED_SAMPLES = 2;
     //endregion
 
@@ -242,6 +242,10 @@ public class PdrProcessing {
         this.floorHeight = settings.getInt("floor_height", 4);
     }
 
+    public float getFloorHeightMeters() {
+        return this.floorHeight;
+    }
+
     /**
      * Uses the Weiberg Stride Length formula to calculate step length from accelerometer values.
      *
@@ -365,14 +369,23 @@ public class PdrProcessing {
             //System.err.println("LIFT: Horizontal: " + horizontalAvg);
 
             if(this.settings.getBoolean("overwrite_constants", false)) {
-                float eps = Float.parseFloat(settings.getString("epsilon", "0.18"));
-                return horizontalAvg < eps && verticalAvg > movementThreshold;
+                float eps = Float.parseFloat(settings.getString("epsilon", "0.30"));
+                return isElevatorLikeMotion(horizontalAvg, verticalAvg, eps, movementThreshold);
             }
             // Check if there is minimal horizontal and significant vertical movement
-            return horizontalAvg < epsilon && verticalAvg > movementThreshold;
+            return isElevatorLikeMotion(horizontalAvg, verticalAvg, epsilon, movementThreshold);
         }
         return false;
 
+    }
+
+    static boolean isElevatorLikeMotion(
+            float horizontalAvg,
+            float verticalAvg,
+            float horizontalThreshold,
+            float verticalThreshold
+    ) {
+        return horizontalAvg <= horizontalThreshold && verticalAvg >= verticalThreshold;
     }
 
     /**
