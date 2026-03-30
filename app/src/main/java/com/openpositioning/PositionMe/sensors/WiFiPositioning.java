@@ -57,6 +57,8 @@ public class WiFiPositioning {
     // Store current floor of user when the backend returns an explicit floor value.
     @Nullable
     private Integer floor = null;
+    @Nullable
+    private Float accuracyMeters = null;
 
 
     /**
@@ -93,6 +95,7 @@ public class WiFiPositioning {
                     try {
                             wifiLocation = new LatLng(response.getDouble("lat"),response.getDouble("lon"));
                             floor = parseResponseFloor(response);
+                            accuracyMeters = parseResponseAccuracyMeters(response);
                     } catch (JSONException e) {
                         // Error log to keep record of errors (for secure programming and maintainability)
                         Log.e("jsonErrors","Error parsing response: "+e.getMessage()+" "+ response);
@@ -144,7 +147,8 @@ public class WiFiPositioning {
                         Log.d("jsonObject",response.toString());
                         wifiLocation = new LatLng(response.getDouble("lat"),response.getDouble("lon"));
                         floor = parseResponseFloor(response);
-                        callback.onSuccess(wifiLocation,floor);
+                        accuracyMeters = parseResponseAccuracyMeters(response);
+                        callback.onSuccess(wifiLocation, floor, accuracyMeters);
                     } catch (JSONException e) {
                         Log.e("jsonErrors","Error parsing response: "+e.getMessage()+" "+ response);
                         callback.onError("Error parsing response: " + e.getMessage());
@@ -188,6 +192,52 @@ public class WiFiPositioning {
     }
 
     @Nullable
+    static Float parseResponseAccuracyMeters(@Nullable JSONObject response) {
+        if (response == null) {
+            return null;
+        }
+        String[] candidateKeys = new String[]{
+                "accuracy", "accuracy_m", "accuracyMeters", "horizontal_accuracy", "radius", "std"
+        };
+        for (String key : candidateKeys) {
+            if (!response.has(key) || response.isNull(key)) {
+                continue;
+            }
+            try {
+                Float parsedAccuracy = parseAccuracyValue(response.get(key));
+                if (parsedAccuracy != null) {
+                    return parsedAccuracy;
+                }
+            } catch (JSONException ignored) {
+                // 这里保持最小行为：继续尝试其他候选字段。
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    static Float parseAccuracyValue(@Nullable Object rawAccuracy) {
+        if (rawAccuracy instanceof Number) {
+            float accuracy = ((Number) rawAccuracy).floatValue();
+            if (Float.isFinite(accuracy) && accuracy > 0f) {
+                return accuracy;
+            }
+            return null;
+        }
+        if (rawAccuracy instanceof String) {
+            String normalized = ((String) rawAccuracy).trim();
+            if (normalized.isEmpty()) {
+                return null;
+            }
+            float accuracy = Float.parseFloat(normalized);
+            if (Float.isFinite(accuracy) && accuracy > 0f) {
+                return accuracy;
+            }
+        }
+        return null;
+    }
+
+    @Nullable
     static Integer parseFloorValue(@Nullable Object rawFloor) {
         if (rawFloor instanceof Number) {
             return (int) Math.round(((Number) rawFloor).doubleValue());
@@ -206,7 +256,7 @@ public class WiFiPositioning {
      * Interface defined for the callback to access response obtained after POST request
      */
     public interface VolleyCallback {
-        void onSuccess(LatLng location, @Nullable Integer floor);
+        void onSuccess(LatLng location, @Nullable Integer floor, @Nullable Float accuracyMeters);
         void onError(String message);
     }
 

@@ -29,6 +29,13 @@ public class ParticleFilterEngine {
     private static final double MIN_RECOVERY_DISTANCE_M = 8.0;
     private static final double MIN_SUPPORT_WEIGHT_RATIO = 0.2;
     private static final double MAX_CREDIBLE_RECOVERY_ACCURACY_M = 6.0;
+    private static final double MAX_CONSERVATIVE_RECOVERY_DISTANCE_M = 18.0;
+    private static final double MAX_SOFT_RECOVERY_ACCURACY_M = 4.5;
+    private static final double MIN_SOFT_RECOVERY_DISTANCE_M = 6.0;
+    private static final double MIN_WRONG_FLOOR_SOFT_RECOVERY_DISTANCE_M = 4.0;
+    private static final double SOFT_RECOVERY_SEEDED_RATIO = 0.45;
+    private static final double SOFT_RECOVERY_WRONG_FLOOR_SEEDED_RATIO = 0.75;
+    private static final double MAX_SOFT_RECOVERY_SEED_STD_M = 2.0;
 
     private final ParticleInitializer particleInitializer;
     private final ParticleInitializer.SpawnValidator spawnValidator;
@@ -43,6 +50,8 @@ public class ParticleFilterEngine {
     private int lastPredictFloorConstraintRejectCount;
     private boolean lastAbsoluteFixReanchored;
     private boolean lastAbsoluteFixRejectedByConstraints;
+    private boolean lastAbsoluteFixAcceptedWithLimitedSupport;
+    private boolean lastAbsoluteFixCloudRecovered;
 
     static final class StateSnapshot {
         private final List<Particle> particles;
@@ -51,6 +60,8 @@ public class ParticleFilterEngine {
         private final int lastPredictFloorConstraintRejectCount;
         private final boolean lastAbsoluteFixReanchored;
         private final boolean lastAbsoluteFixRejectedByConstraints;
+        private final boolean lastAbsoluteFixAcceptedWithLimitedSupport;
+        private final boolean lastAbsoluteFixCloudRecovered;
 
         StateSnapshot(
                 @NonNull List<Particle> particles,
@@ -58,7 +69,9 @@ public class ParticleFilterEngine {
                 int lastPredictWallRejectCount,
                 int lastPredictFloorConstraintRejectCount,
                 boolean lastAbsoluteFixReanchored,
-                boolean lastAbsoluteFixRejectedByConstraints
+                boolean lastAbsoluteFixRejectedByConstraints,
+                boolean lastAbsoluteFixAcceptedWithLimitedSupport,
+                boolean lastAbsoluteFixCloudRecovered
         ) {
             this.particles = new ArrayList<>(particles.size());
             for (Particle particle : particles) {
@@ -69,6 +82,8 @@ public class ParticleFilterEngine {
             this.lastPredictFloorConstraintRejectCount = lastPredictFloorConstraintRejectCount;
             this.lastAbsoluteFixReanchored = lastAbsoluteFixReanchored;
             this.lastAbsoluteFixRejectedByConstraints = lastAbsoluteFixRejectedByConstraints;
+            this.lastAbsoluteFixAcceptedWithLimitedSupport = lastAbsoluteFixAcceptedWithLimitedSupport;
+            this.lastAbsoluteFixCloudRecovered = lastAbsoluteFixCloudRecovered;
         }
     }
 
@@ -278,12 +293,18 @@ public class ParticleFilterEngine {
             double accuracyMeters
     ) {
         double measurementStdMeters = sanitizeAccuracyMeters(accuracyMeters);
-        boolean reanchorRequired = !particles.isEmpty()
-                && shouldReanchorToAbsoluteFix(fixX, fixY, measurementStdMeters);
+        double recoveryDecisionAccuracyMeters = measurementStdMeters;
+        double supportRatio = particles.isEmpty()
+                ? 1.0
+                : computeSupportRatioForAbsoluteFix(fixX, fixY, recoveryDecisionAccuracyMeters);
+        boolean reanchorRequired = !particles.isEmpty() && supportRatio < MIN_SUPPORT_WEIGHT_RATIO;
         Integer acceptedFloorPrior = sanitizeAbsoluteFloorPrior(fixX, fixY, floorPrior, reanchorRequired);
         int validationFloor = resolveAbsoluteFixValidationFloor(fixX, fixY, acceptedFloorPrior, floorPrior);
+        boolean preferWrongFloorRecovery = shouldPreferWrongFloorRecovery(acceptedFloorPrior);
         lastAbsoluteFixReanchored = false;
         lastAbsoluteFixRejectedByConstraints = false;
+        lastAbsoluteFixAcceptedWithLimitedSupport = false;
+        lastAbsoluteFixCloudRecovered = false;
         if (isAbsoluteFixInvalidUnderConstraints(fixX, fixY, validationFloor)) {
             lastAbsoluteFixRejectedByConstraints = true;
             return;
@@ -316,25 +337,103 @@ public class ParticleFilterEngine {
                     validationFloor,
                     MIN_SUPPORT_WEIGHT_RATIO
             );
+            boolean useSoftRecovery = shouldUseSoftCloudRecovery(
+                    fixX,
+                    fixY,
+                    validationFloor,
+                    recoveryDecisionAccuracyMeters,
+                    preferWrongFloorRecovery
+            );
             boolean useCredibleRecoveryReanchor = !hasMotionSupport
-                    && isCredibleRecoveryReanchor(fixX, fixY, validationFloor, measurementStdMeters);
-            if (!hasMotionSupport && !useCredibleRecoveryReanchor) {
+                    && !useSoftRecovery
+                    && isCredibleRecoveryReanchor(
+                    fixX,
+                    fixY,
+                    validationFloor,
+                    recoveryDecisionAccuracyMeters
+            );
+            boolean useConservativeRecoveryReanchor = !hasMotionSupport
+                    && !useSoftRecovery
+                    && !useCredibleRecoveryReanchor
+                    && isConservativeLegalRecoveryReanchor(
+                    fixX,
+                    fixY,
+                    validationFloor,
+                    recoveryDecisionAccuracyMeters
+            );
+            if (!hasMotionSupport
+                    && !useSoftRecovery
+                    && !useCredibleRecoveryReanchor
+                    && !useConservativeRecoveryReanchor) {
                 lastAbsoluteFixRejectedByConstraints = true;
                 return;
             }
+            if (useSoftRecovery && trySoftRecoveryTowardAbsoluteFix(
+                    fixX,
+                    fixY,
+                    acceptedFloorPrior,
+                    validationFloor,
+                    timestampMs,
+                    measurementStdMeters,
+                    preferWrongFloorRecovery,
+                    supportRatio
+            )) {
+                lastAbsoluteFixAcceptedWithLimitedSupport = true;
+                lastAbsoluteFixCloudRecovered = true;
+                return;
+            }
             lastAbsoluteFixReanchored = true;
+            lastAbsoluteFixAcceptedWithLimitedSupport = useConservativeRecoveryReanchor;
             reanchorToAbsoluteFix(
                     fixX,
                     fixY,
                     acceptedFloorPrior,
                     timestampMs,
                     measurementStdMeters,
-                    useCredibleRecoveryReanchor
+                    useCredibleRecoveryReanchor || useConservativeRecoveryReanchor
             );
             return;
         }
 
         if (!hasMotionCompatibleSupportForAbsoluteFix(fixX, fixY, validationFloor, Double.MIN_VALUE)) {
+            if (shouldUseSoftCloudRecovery(
+                    fixX,
+                    fixY,
+                    validationFloor,
+                    recoveryDecisionAccuracyMeters,
+                    preferWrongFloorRecovery
+            ) && trySoftRecoveryTowardAbsoluteFix(
+                    fixX,
+                    fixY,
+                    acceptedFloorPrior,
+                    validationFloor,
+                    timestampMs,
+                    measurementStdMeters,
+                    preferWrongFloorRecovery,
+                    supportRatio
+            )) {
+                lastAbsoluteFixAcceptedWithLimitedSupport = true;
+                lastAbsoluteFixCloudRecovered = true;
+                return;
+            }
+            if (isConservativeLegalRecoveryReanchor(
+                    fixX,
+                    fixY,
+                    validationFloor,
+                    recoveryDecisionAccuracyMeters
+            )) {
+                lastAbsoluteFixReanchored = true;
+                lastAbsoluteFixAcceptedWithLimitedSupport = true;
+                reanchorToAbsoluteFix(
+                        fixX,
+                        fixY,
+                        acceptedFloorPrior,
+                        timestampMs,
+                        measurementStdMeters,
+                        true
+                );
+                return;
+            }
             lastAbsoluteFixRejectedByConstraints = true;
             return;
         }
@@ -534,6 +633,8 @@ public class ParticleFilterEngine {
     private void resetLastAbsoluteFixOutcomeFlags() {
         lastAbsoluteFixReanchored = false;
         lastAbsoluteFixRejectedByConstraints = false;
+        lastAbsoluteFixAcceptedWithLimitedSupport = false;
+        lastAbsoluteFixCloudRecovered = false;
     }
 
     private double sanitizeAccuracyMeters(double accuracyMeters) {
@@ -544,6 +645,15 @@ public class ParticleFilterEngine {
     }
 
     private boolean shouldReanchorToAbsoluteFix(double fixX, double fixY, double measurementStdMeters) {
+        return computeSupportRatioForAbsoluteFix(fixX, fixY, measurementStdMeters)
+                < MIN_SUPPORT_WEIGHT_RATIO;
+    }
+
+    private double computeSupportRatioForAbsoluteFix(
+            double fixX,
+            double fixY,
+            double measurementStdMeters
+    ) {
         double supportRadius = Math.max(
                 MIN_RECOVERY_DISTANCE_M,
                 measurementStdMeters * RECOVERY_DISTANCE_STD_MULTIPLIER
@@ -562,12 +672,64 @@ public class ParticleFilterEngine {
             }
         }
         if (totalWeight <= 0.0 || Double.isNaN(totalWeight) || Double.isInfinite(totalWeight)) {
-            return true;
+            return 0.0;
         }
-        // Re-anchor only when too little of the weighted cloud still supports the fix.
-        // This prevents one lucky particle from blocking recovery after the cloud drifts away.
-        double supportRatio = supportWeight / totalWeight;
-        return supportRatio < MIN_SUPPORT_WEIGHT_RATIO;
+        return supportWeight / totalWeight;
+    }
+
+    private boolean shouldUseSoftCloudRecovery(
+            double fixX,
+            double fixY,
+            int validationFloor,
+            double measurementStdMeters,
+            boolean preferWrongFloorRecovery
+    ) {
+        if (particles.isEmpty()
+                || measurementStdMeters > MAX_SOFT_RECOVERY_ACCURACY_M
+                || !spawnValidator.isValid(fixX, fixY, validationFloor)) {
+            return false;
+        }
+        FusedPose estimate = estimatePose();
+        if (estimate == null) {
+            return false;
+        }
+        double distanceMeters = Math.hypot(estimate.getX() - fixX, estimate.getY() - fixY);
+        double minimumDistanceMeters = preferWrongFloorRecovery
+                ? MIN_WRONG_FLOOR_SOFT_RECOVERY_DISTANCE_M
+                : MIN_SOFT_RECOVERY_DISTANCE_M;
+        return Double.isFinite(distanceMeters) && distanceMeters >= minimumDistanceMeters;
+    }
+
+    private boolean trySoftRecoveryTowardAbsoluteFix(
+            double fixX,
+            double fixY,
+            @Nullable Integer floorPrior,
+            int validationFloor,
+            long timestampMs,
+            double measurementStdMeters,
+            boolean preferWrongFloorRecovery,
+            double supportRatio
+    ) {
+        if (particles.isEmpty()) {
+            return false;
+        }
+        int recoveryFloor = floorPrior != null ? floorPrior : validationFloor;
+        List<Particle> recoveredParticles = createSoftRecoveryParticles(
+                fixX,
+                fixY,
+                recoveryFloor,
+                measurementStdMeters,
+                preferWrongFloorRecovery,
+                supportRatio
+        );
+        if (recoveredParticles.isEmpty()) {
+            return false;
+        }
+        particles.clear();
+        particles.addAll(recoveredParticles);
+        lastTimestampMs = timestampMs;
+        normalizeWeights();
+        return true;
     }
 
     private void reanchorToAbsoluteFix(
@@ -601,6 +763,128 @@ public class ParticleFilterEngine {
         particles.addAll(reanchoredParticles);
         lastTimestampMs = timestampMs;
         normalizeWeights();
+    }
+
+    @NonNull
+    private List<Particle> createSoftRecoveryParticles(
+            double fixX,
+            double fixY,
+            int floor,
+            double measurementStdMeters,
+            boolean preferWrongFloorRecovery,
+            double supportRatio
+    ) {
+        if (particles.isEmpty() || !spawnValidator.isValid(fixX, fixY, floor)) {
+            return Collections.emptyList();
+        }
+        FusedPose estimate = estimatePose();
+        if (estimate == null) {
+            return Collections.emptyList();
+        }
+        int particleCount = particles.size();
+        double translateDx = fixX - estimate.getX();
+        double translateDy = fixY - estimate.getY();
+        double headingRad = estimateCircularMeanHeading();
+        double seededRatio = preferWrongFloorRecovery
+                ? SOFT_RECOVERY_WRONG_FLOOR_SEEDED_RATIO
+                : Math.max(SOFT_RECOVERY_SEEDED_RATIO, 1.0 - supportRatio);
+        seededRatio = Math.min(0.9, Math.max(SOFT_RECOVERY_SEEDED_RATIO, seededRatio));
+        int desiredSeededCount = Math.min(
+                particleCount,
+                Math.max(1, (int) Math.round(particleCount * seededRatio))
+        );
+        int desiredTranslatedCount = Math.max(0, particleCount - desiredSeededCount);
+        List<Particle> recoveryParticles = new ArrayList<>(particleCount);
+        recoveryParticles.addAll(createTranslatedRecoveryParticles(
+                translateDx,
+                translateDy,
+                floor,
+                desiredTranslatedCount,
+                estimate.getX(),
+                estimate.getY()
+        ));
+        int remainingParticleCount = particleCount - recoveryParticles.size();
+        if (remainingParticleCount > 0) {
+            recoveryParticles.addAll(particleInitializer.initialize(
+                    fixX,
+                    fixY,
+                    floor,
+                    remainingParticleCount,
+                    resolveSoftRecoverySeedStd(measurementStdMeters, preferWrongFloorRecovery),
+                    headingRad,
+                    spawnValidator
+            ));
+        }
+        while (recoveryParticles.size() < particleCount && spawnValidator.isValid(fixX, fixY, floor)) {
+            recoveryParticles.add(new Particle(fixX, fixY, floor, 1.0, headingRad));
+        }
+        if (recoveryParticles.isEmpty()) {
+            return Collections.emptyList();
+        }
+        double equalWeight = 1.0 / recoveryParticles.size();
+        for (Particle particle : recoveryParticles) {
+            particle.setWeight(equalWeight);
+        }
+        return recoveryParticles;
+    }
+
+    @NonNull
+    private List<Particle> createTranslatedRecoveryParticles(
+            double translateDx,
+            double translateDy,
+            int floor,
+            int desiredParticleCount,
+            double estimateX,
+            double estimateY
+    ) {
+        if (desiredParticleCount <= 0) {
+            return Collections.emptyList();
+        }
+        List<Particle> rankedParticles = snapshotParticlesForTesting();
+        rankedParticles.sort((left, right) -> {
+            int byWeight = Double.compare(
+                    sanitizeWeight(right.getWeight()),
+                    sanitizeWeight(left.getWeight())
+            );
+            if (byWeight != 0) {
+                return byWeight;
+            }
+            double leftDistanceSq = distanceSq(left.getX(), left.getY(), estimateX, estimateY);
+            double rightDistanceSq = distanceSq(right.getX(), right.getY(), estimateX, estimateY);
+            return Double.compare(leftDistanceSq, rightDistanceSq);
+        });
+        List<Particle> translatedParticles = new ArrayList<>(desiredParticleCount);
+        for (Particle particle : rankedParticles) {
+            double translatedX = particle.getX() + translateDx;
+            double translatedY = particle.getY() + translateDy;
+            if (!spawnValidator.isValid(translatedX, translatedY, floor)) {
+                continue;
+            }
+            translatedParticles.add(new Particle(
+                    translatedX,
+                    translatedY,
+                    floor,
+                    1.0,
+                    particle.getHeadingRad()
+            ));
+            if (translatedParticles.size() >= desiredParticleCount) {
+                break;
+            }
+        }
+        return translatedParticles;
+    }
+
+    private double resolveSoftRecoverySeedStd(
+            double measurementStdMeters,
+            boolean preferWrongFloorRecovery
+    ) {
+        double boundedSeedStd = Math.max(
+                1.0,
+                Math.min(measurementStdMeters, MAX_SOFT_RECOVERY_SEED_STD_M)
+        );
+        return preferWrongFloorRecovery
+                ? Math.min(boundedSeedStd, 1.5)
+                : boundedSeedStd;
     }
 
     private boolean isAbsoluteFixInvalidUnderConstraints(double fixX, double fixY, int validationFloor) {
@@ -724,11 +1008,34 @@ public class ParticleFilterEngine {
             return floorPrior;
         }
         if (allowRecoveryOverride
-                && !spawnValidator.isValid(fixX, fixY, currentFloor)
-                && spawnValidator.isValid(fixX, fixY, floorPrior)) {
+                && spawnValidator.isValid(fixX, fixY, floorPrior)
+                && canFailSoftRecoverToRequestedFloor(currentPose, fixX, fixY, currentFloor, floorPrior)) {
             return floorPrior;
         }
         return null;
+    }
+
+    private boolean canFailSoftRecoverToRequestedFloor(
+            @Nullable FusedPose currentPose,
+            double fixX,
+            double fixY,
+            int currentFloor,
+            int requestedFloor
+    ) {
+        if (!spawnValidator.isValid(fixX, fixY, requestedFloor)) {
+            return false;
+        }
+        if (!spawnValidator.isValid(fixX, fixY, currentFloor)) {
+            return true;
+        }
+        if (currentPose == null) {
+            return true;
+        }
+        if (currentPose.getFloor() != requestedFloor) {
+            return true;
+        }
+        double distanceMeters = Math.hypot(currentPose.getX() - fixX, currentPose.getY() - fixY);
+        return Double.isFinite(distanceMeters) && distanceMeters >= MIN_SOFT_RECOVERY_DISTANCE_M;
     }
 
     private int resolveAbsoluteFixValidationFloor(
@@ -770,6 +1077,36 @@ public class ParticleFilterEngine {
                 estimateCircularMeanHeading()
         );
         return !recoveryParticles.isEmpty();
+    }
+
+    private boolean isConservativeLegalRecoveryReanchor(
+            double fixX,
+            double fixY,
+            int validationFloor,
+            double measurementStdMeters
+    ) {
+        if (measurementStdMeters > MAX_CREDIBLE_RECOVERY_ACCURACY_M) {
+            return false;
+        }
+        if (!spawnValidator.isValid(fixX, fixY, validationFloor)) {
+            return false;
+        }
+        FusedPose estimate = estimatePose();
+        if (estimate == null) {
+            return false;
+        }
+        double distanceMeters = Math.hypot(estimate.getX() - fixX, estimate.getY() - fixY);
+        if (!Double.isFinite(distanceMeters) || distanceMeters > MAX_CONSERVATIVE_RECOVERY_DISTANCE_M) {
+            return false;
+        }
+        return spawnValidator.isValidMotion(
+                estimate.getX(),
+                estimate.getY(),
+                fixX,
+                fixY,
+                estimate.getFloor(),
+                validationFloor
+        );
     }
 
     private List<Particle> createEndpointLockedRecoveryParticles(
@@ -853,6 +1190,10 @@ public class ParticleFilterEngine {
         return dominantFloor;
     }
 
+    private boolean shouldPreferWrongFloorRecovery(@Nullable Integer acceptedFloorPrior) {
+        return acceptedFloorPrior != null && acceptedFloorPrior != resolveDominantFloor();
+    }
+
     private double getFloorLikelihood(int particleFloor, @Nullable Integer floorPrior) {
         if (floorPrior == null) {
             return 1.0;
@@ -869,6 +1210,12 @@ public class ParticleFilterEngine {
         return normalized;
     }
 
+    private double distanceSq(double x1, double y1, double x2, double y2) {
+        double dx = x1 - x2;
+        double dy = y1 - y2;
+        return dx * dx + dy * dy;
+    }
+
     void setParticlesForTesting(List<Particle> seededParticles, long timestampMs) {
         particles.clear();
         if (seededParticles != null) {
@@ -879,6 +1226,8 @@ public class ParticleFilterEngine {
         lastTimestampMs = timestampMs;
         lastAbsoluteFixReanchored = false;
         lastAbsoluteFixRejectedByConstraints = false;
+        lastAbsoluteFixAcceptedWithLimitedSupport = false;
+        lastAbsoluteFixCloudRecovered = false;
     }
 
     List<Particle> snapshotParticlesForTesting() {
@@ -900,7 +1249,9 @@ public class ParticleFilterEngine {
                 lastPredictWallRejectCount,
                 lastPredictFloorConstraintRejectCount,
                 lastAbsoluteFixReanchored,
-                lastAbsoluteFixRejectedByConstraints
+                lastAbsoluteFixRejectedByConstraints,
+                lastAbsoluteFixAcceptedWithLimitedSupport,
+                lastAbsoluteFixCloudRecovered
         );
     }
 
@@ -912,6 +1263,8 @@ public class ParticleFilterEngine {
         lastPredictFloorConstraintRejectCount = snapshot.lastPredictFloorConstraintRejectCount;
         lastAbsoluteFixReanchored = snapshot.lastAbsoluteFixReanchored;
         lastAbsoluteFixRejectedByConstraints = snapshot.lastAbsoluteFixRejectedByConstraints;
+        lastAbsoluteFixAcceptedWithLimitedSupport = snapshot.lastAbsoluteFixAcceptedWithLimitedSupport;
+        lastAbsoluteFixCloudRecovered = snapshot.lastAbsoluteFixCloudRecovered;
     }
 
     boolean hasParticles() {
@@ -944,5 +1297,13 @@ public class ParticleFilterEngine {
 
     boolean wasLastAbsoluteFixRejectedByConstraints() {
         return lastAbsoluteFixRejectedByConstraints;
+    }
+
+    boolean wasLastAbsoluteFixAcceptedWithLimitedSupport() {
+        return lastAbsoluteFixAcceptedWithLimitedSupport;
+    }
+
+    boolean wasLastAbsoluteFixCloudRecovered() {
+        return lastAbsoluteFixCloudRecovered;
     }
 }

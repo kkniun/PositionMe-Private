@@ -129,6 +129,7 @@ public final class DisplayPoseFilter {
     private String lastHeadingSource = "device";
     @NonNull
     private String lastHeadingLogState = "";
+    private long fastFollowUntilTimestampMs = Long.MIN_VALUE;
 
     public DisplayPoseFilter(@NonNull Config config) {
         this.config = config;
@@ -144,6 +145,7 @@ public final class DisplayPoseFilter {
         lastRenderedHeadingDegrees = Float.NaN;
         lastHeadingSource = "device";
         lastHeadingLogState = "";
+        fastFollowUntilTimestampMs = Long.MIN_VALUE;
     }
 
     @NonNull
@@ -152,10 +154,20 @@ public final class DisplayPoseFilter {
             boolean stationaryHint,
             boolean bypassFilter
     ) {
+        return updatePosition(rawPosition, stationaryHint, bypassFilter, Long.MIN_VALUE);
+    }
+
+    @NonNull
+    public LatLng updatePosition(
+            @NonNull LatLng rawPosition,
+            boolean stationaryHint,
+            boolean bypassFilter,
+            long timestampMs
+    ) {
         if (!bypassFilter && filteredPosition != null) {
             noteMotionHeading(filteredPosition, rawPosition);
         }
-        if (bypassFilter || filteredPosition == null) {
+        if (bypassFilter || isFastFollowActive(timestampMs) || filteredPosition == null) {
             filteredPosition = rawPosition;
             return rawPosition;
         }
@@ -173,6 +185,19 @@ public final class DisplayPoseFilter {
         double alpha = resolvePositionAlpha(distanceMeters, stationaryHint);
         filteredPosition = interpolate(filteredPosition, rawPosition, alpha);
         return filteredPosition;
+    }
+
+    public void armFastFollowWindow(long timestampMs, long durationMs) {
+        long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
+        long safeDurationMs = Math.max(0L, durationMs);
+        fastFollowUntilTimestampMs = Math.max(
+                fastFollowUntilTimestampMs,
+                safeTimestampMs + safeDurationMs
+        );
+    }
+
+    public void clearFastFollowWindow() {
+        fastFollowUntilTimestampMs = Long.MIN_VALUE;
     }
 
     public float updateHeading(
@@ -314,6 +339,14 @@ public final class DisplayPoseFilter {
     private static double interpolateAlpha(double minAlpha, double maxAlpha, double fraction) {
         double clampedFraction = clamp(fraction, 0.0, 1.0);
         return minAlpha + ((maxAlpha - minAlpha) * clampedFraction);
+    }
+
+    private boolean isFastFollowActive(long timestampMs) {
+        if (fastFollowUntilTimestampMs == Long.MIN_VALUE) {
+            return false;
+        }
+        long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
+        return safeTimestampMs <= fastFollowUntilTimestampMs;
     }
 
     private void noteMotionHeading(@NonNull LatLng from, @NonNull LatLng to) {

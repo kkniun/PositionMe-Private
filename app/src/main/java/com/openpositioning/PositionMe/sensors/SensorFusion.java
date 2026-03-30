@@ -101,7 +101,7 @@ public class SensorFusion implements SensorEventListener, Observer {
     private static final int GROUND_FLOOR_WIFI_BOOTSTRAP_REQUIRED_CONFIRMATIONS = 5;
     private static final long GROUND_FLOOR_WIFI_BOOTSTRAP_REQUIRED_DURATION_MS = 6_000L;
     private static final int INITIAL_ABSOLUTE_FLOOR_LOCK_REQUIRED_CONFIRMATIONS = 3;
-    private static final long INITIAL_ABSOLUTE_FLOOR_LOCK_REQUIRED_DURATION_MS = 3_000L;
+    private static final long INITIAL_ABSOLUTE_FLOOR_LOCK_REQUIRED_DURATION_MS = 2_500L;
     private static final int FAST_INITIAL_ABSOLUTE_FLOOR_LOCK_REQUIRED_CONFIRMATIONS = 2;
     private static final long FAST_INITIAL_ABSOLUTE_FLOOR_LOCK_REQUIRED_DURATION_MS = 1_000L;
     private static final long MIN_STEP_EVENT_INTERVAL_MS = 160L;
@@ -124,13 +124,17 @@ public class SensorFusion implements SensorEventListener, Observer {
     private static final int ELEVATOR_STEP_SUPPRESSION_MIN_STEPS = 3;
     private static final double STRONG_BAROMETER_TRANSITION_TOLERANCE_M = 4.0;
     private static final double ELEVATOR_ABSOLUTE_FIX_REJECT_DISTANCE_M = 5.0;
-    private static final long ELEVATOR_ABSOLUTE_FIX_COOLDOWN_MS = 6_000L;
-    private static final long FLOOR_ONLY_RESYNC_WINDOW_MS = 8_000L;
-    private static final long DISPLAY_FLOOR_RESET_WINDOW_MS = 2_000L;
-    private static final float FLOOR_ONLY_RESYNC_ABSOLUTE_FIX_STD_M = 12.0f;
+    private static final double ELEVATOR_ABSOLUTE_FIX_COOLDOWN_REJECT_DISTANCE_M = 9.0;
+    private static final long ELEVATOR_ABSOLUTE_FIX_COOLDOWN_MS = 3_000L;
+    private static final long FLOOR_ONLY_RESYNC_WINDOW_MS = 4_000L;
+    private static final long DISPLAY_FLOOR_RESET_WINDOW_MS = 1_000L;
+    private static final long DISPLAY_FAST_FOLLOW_WINDOW_MS = 1_500L;
+    private static final float FLOOR_ONLY_RESYNC_ABSOLUTE_FIX_STD_M = 8.0f;
     private static final int ABSOLUTE_FLOOR_STABLE_CONSENSUS_REQUIRED_CONFIRMATIONS = 4;
     private static final long ABSOLUTE_FLOOR_STABLE_CONSENSUS_REQUIRED_DURATION_MS = 8_000L;
     private static final long ABSOLUTE_FLOOR_STABLE_CONSENSUS_MAX_GAP_MS = 3_500L;
+    private static final int WRONG_FLOOR_RECOVERY_REQUIRED_CONFIRMATIONS = 3;
+    private static final long WRONG_FLOOR_RECOVERY_REQUIRED_DURATION_MS = 4_000L;
     private static final float BAROMETER_ELEVATOR_SPEED_SMOOTHING_ALPHA = 0.35f;
     private static final int ELEVATOR_PANIC_EXIT_STEP_THRESHOLD = 5;
     private static final float ELEVATOR_PANIC_EXIT_STATIONARY_SPEED_THRESHOLD_MPS = 0.05f;
@@ -140,12 +144,12 @@ public class SensorFusion implements SensorEventListener, Observer {
     private static final float ELEVATOR_SESSION_MAX_VERTICAL_SPEED_MPS = 2.2f;
     private static final float ELEVATOR_SESSION_FLOOR_SNAP_BONUS_RATIO = 0.35f;
     private static final double ELEVATOR_NEAR_LIFT_TOLERANCE_M = 1.75;
-    private static final long WEAK_ELEVATOR_SUPPRESSION_WINDOW_MS = 20_000L;
+    private static final long WEAK_ELEVATOR_SUPPRESSION_WINDOW_MS = 10_000L;
     private static final int CONSISTENT_SUPPRESSED_WIFI_FLOOR_REQUIRED_CONFIRMATIONS = 3;
     private static final long CONSISTENT_SUPPRESSED_WIFI_FLOOR_MAX_GAP_MS = 5_000L;
     private static final long PENDING_ELEVATOR_SUPPRESSION_ESCAPE_WINDOW_MS = 6_000L;
     private static final double WRONG_LOCK_RECOVERY_MAX_CONFIDENCE = 0.45;
-    private static final long POST_LIFT_DESTINATION_FIX_WINDOW_MS = 12_000L;
+    private static final long POST_LIFT_DESTINATION_FIX_WINDOW_MS = 6_000L;
     private static final long BOOTSTRAP_ABSOLUTE_FIX_MAX_AGE_MS = 20_000L;
 
     enum TransitionPreference {
@@ -390,7 +394,6 @@ public class SensorFusion implements SensorEventListener, Observer {
     // String for creating WiFi fingerprint JSO N object
     private static final String WIFI_FINGERPRINT= "wf";
     private static final String DEFAULT_COLLECTION_VENUE = "traj";
-    private static final float DEFAULT_WIFI_ACCURACY_M = 8.0f;
     private static final double MIN_ABSOLUTE_FIX_START_STD_M = 1.0;
     private static final int STATIONARY_WINDOW_SIZE = 32;
     private static final double STATIONARY_MEAN_THRESHOLD_MPS2 = 0.10;
@@ -615,6 +618,9 @@ public class SensorFusion implements SensorEventListener, Observer {
     private int committedDisplayFloorAbsolute = Integer.MIN_VALUE;
     private int pendingCommittedDisplayFloorAbsolute = Integer.MIN_VALUE;
     private boolean floorSwitchPending;
+    private long displayFastFollowUntilMs = Long.MIN_VALUE;
+    @NonNull
+    private String lastDisplayFastFollowReason = "none";
     @NonNull
     private String lastFloorSwitchBlockReason = "none";
     @Nullable
@@ -1425,7 +1431,11 @@ public class SensorFusion implements SensorEventListener, Observer {
             }
             this.wiFiPositioning.request(wifiFingerPrint, new WiFiPositioning.VolleyCallback() {
                 @Override
-                public void onSuccess(LatLng wifiLocation, @Nullable Integer floor) {
+                public void onSuccess(
+                        LatLng wifiLocation,
+                        @Nullable Integer floor,
+                        @Nullable Float rawAccuracyMeters
+                ) {
                     if (wifiLocation == null) {
                         return;
                     }
@@ -1449,7 +1459,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                                     fixTimestampMs,
                                     wifiLocation.latitude,
                                     wifiLocation.longitude,
-                                    DEFAULT_WIFI_ACCURACY_M
+                                    rawAccuracyMeters == null ? Float.NaN : rawAccuracyMeters
                             ),
                             resolveStep1InitializationFloor(floor),
                             floor,
@@ -1512,7 +1522,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                 floor,
                 floor,
                 timestampMs,
-                DEFAULT_WIFI_ACCURACY_M,
+                Float.NaN,
                 "ABS",
                 -1L
         );
@@ -1547,21 +1557,47 @@ public class SensorFusion implements SensorEventListener, Observer {
             @NonNull String debugSource,
             long observationAgeMs
     ) {
+        float rawAccuracyMeters = accuracyMeters;
+        AbsoluteFixFusionPolicy.AccuracyResolution accuracyResolution =
+                AbsoluteFixFusionPolicy.resolveAccuracy(debugSource, rawAccuracyMeters);
+        AbsoluteFixFusionPolicy.AgeAdjustedAccuracy ageAdjustedAccuracy =
+                AbsoluteFixFusionPolicy.adjustForObservationAge(
+                        accuracyResolution.normalizedAccuracyMeters,
+                        observationAgeMs
+                );
         recordAbsoluteFixReceived(
                 debugSource,
                 timestampMs,
                 latitudeDeg,
                 longitudeDeg,
                 floorPrior,
-                accuracyMeters,
+                rawAccuracyMeters,
                 observationAgeMs
         );
+        if (ageAdjustedAccuracy.rejectObservation) {
+            recordAbsoluteFixDecision(debugSource, timestampMs, false, ageAdjustedAccuracy.reasonCode);
+            logAbsoluteFusionTrace(
+                    debugSource,
+                    timestampMs,
+                    observationAgeMs,
+                    latitudeDeg,
+                    longitudeDeg,
+                    null,
+                    floorPrior,
+                    rawAccuracyMeters,
+                    accuracyResolution.normalizedAccuracyMeters,
+                    ageAdjustedAccuracy.adjustedAccuracyMeters
+            );
+            return;
+        }
+        float normalizedAccuracyMeters = accuracyResolution.normalizedAccuracyMeters;
+        float fusionAccuracyMeters = ageAdjustedAccuracy.adjustedAccuracyMeters;
         expirePostLiftDestinationFixWindowIfNeeded(timestampMs);
         Integer sanitizedFloorPrior = sanitizeReportedAbsoluteFloorPrior(floorPrior, debugSource);
         FloorOnlyResyncPolicy floorOnlyResyncPolicy = resolveFloorOnlyResyncPolicy(
                 debugSource,
                 sanitizedFloorPrior,
-                accuracyMeters,
+                fusionAccuracyMeters,
                 timestampMs
         );
         if (floorOnlyResyncPolicy.rejectAbsoluteFix) {
@@ -1574,11 +1610,11 @@ public class SensorFusion implements SensorEventListener, Observer {
             return;
         }
         sanitizedFloorPrior = floorOnlyResyncPolicy.effectiveFloorPrior;
-        accuracyMeters = floorOnlyResyncPolicy.effectiveAccuracyMeters;
+        fusionAccuracyMeters = floorOnlyResyncPolicy.effectiveAccuracyMeters;
         Integer bootstrapReadyFloorPrior = resolveBootstrapReadyFloorPrior(
                 debugSource,
                 sanitizedFloorPrior,
-                accuracyMeters,
+                normalizedAccuracyMeters,
                 timestampMs
         );
         Integer effectiveInitializationFloor = resolveInitializationFloorForAbsoluteFix(
@@ -1589,7 +1625,12 @@ public class SensorFusion implements SensorEventListener, Observer {
             recordAbsoluteFixDecision(debugSource, timestampMs, false, "ignored_not_recording");
             return;
         }
-        if (shouldFreezeAbsoluteFix(debugSource, sanitizedFloorPrior)) {
+        if (shouldFreezeAbsoluteFix(
+                debugSource,
+                sanitizedFloorPrior,
+                fusionAccuracyMeters,
+                observationAgeMs
+        )) {
             recordAbsoluteFixDecision(debugSource, timestampMs, false, "suppressed_stationary_freeze");
             logStationaryAbsoluteFixSuppression(debugSource);
             return;
@@ -1656,7 +1697,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                 pfInitialized,
                 isFloorOffsetInitialized,
                 pendingWifiBootstrapCount,
-                accuracyMeters
+                normalizedAccuracyMeters
         );
         if (forceWifiFloorBootstrap) {
             absoluteFloorTransitionResolver.reset();
@@ -1698,7 +1739,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                     effectiveInitializationFloor,
                     sanitizedFloorPrior,
                     timestampMs,
-                    accuracyMeters,
+                    rawAccuracyMeters,
                     debugSource,
                     observationAgeMs
             );
@@ -1745,7 +1786,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                             "ABSOLUTE:init_deferred_invalid_fix"
                                     + " source=" + debugSource
                                     + " floorSeed="
-                                    + (effectiveInitializationFloor == null ? "n/a" : effectiveInitializationFloor)
+                    + (effectiveInitializationFloor == null ? "n/a" : effectiveInitializationFloor)
                                     + " acceptedFloor="
                                     + (acceptedFloorPrior == null ? "n/a" : acceptedFloorPrior)
                                     + " obsAgeMs=" + observationAgeMs
@@ -1802,7 +1843,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                     acceptedFloorPrior,
                     timestampMs,
                     getCurrentHeadingRad(),
-                    Math.max(MIN_ABSOLUTE_FIX_START_STD_M, accuracyMeters)
+                    Math.max(MIN_ABSOLUTE_FIX_START_STD_M, fusionAccuracyMeters)
             );
             bootstrapInitializedParticleCloud = true;
             if (!previousPfInitialized) {
@@ -1827,7 +1868,7 @@ public class SensorFusion implements SensorEventListener, Observer {
                     effectiveInitializationFloor,
                     acceptedFloorPrior,
                     timestampMs,
-                    accuracyMeters,
+                    fusionAccuracyMeters,
                     getCurrentHeadingRad()
             );
         }
@@ -1849,12 +1890,20 @@ public class SensorFusion implements SensorEventListener, Observer {
                 && particleFilterEngine.wasLastAbsoluteFixReanchored();
         boolean absoluteFixRejectedByParticleConstraints = particleFilterEngine != null
                 && particleFilterEngine.wasLastAbsoluteFixRejectedByConstraints();
+        boolean keepLimitedSupportCorrection = particleFilterEngine != null
+                && particleFilterEngine.wasLastAbsoluteFixAcceptedWithLimitedSupport();
+        boolean absoluteFixCloudRecovered = particleFilterEngine != null
+                && particleFilterEngine.wasLastAbsoluteFixCloudRecovered();
         boolean poseAdvanced = this.latestFusedPose != null
                 && this.latestFusedPose.getTimestampMs() == timestampMs;
         boolean shouldRollbackUnpublishedParticleChange =
-                ((absoluteFixReanchored && !absoluteFixRejectedByParticleConstraints)
-                        || bootstrapInitializedParticleCloud)
-                && !poseAdvanced;
+                AbsoluteFixFusionPolicy.shouldRollbackUnpublishedParticleChange(
+                        absoluteFixReanchored,
+                        absoluteFixRejectedByParticleConstraints,
+                        bootstrapInitializedParticleCloud,
+                        poseAdvanced,
+                        keepLimitedSupportCorrection
+                );
         if (shouldRollbackUnpublishedParticleChange) {
             restoreParticleCloudSnapshot(previousParticleSnapshot, timestampMs);
             particleCloudTrustedUnderConstraints = previousParticleCloudTrustedUnderConstraints;
@@ -1882,6 +1931,18 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.lastPredictHeadingRad = getCurrentHeadingRad();
         this.lastPredictElevation = this.elevation;
         if (poseAdvanced) {
+            if (shouldArmDisplayFastFollowForAbsoluteFix(
+                    previousPublishedPose,
+                    this.latestFusedPose,
+                    absoluteFixReanchored,
+                    absoluteFixCloudRecovered,
+                    keepLimitedSupportCorrection,
+                    fusionAccuracyMeters,
+                    observationAgeMs,
+                    debugSource
+            )) {
+                armDisplayFastFollowWindow(timestampMs, "absolute_fix_correction");
+            }
             String acceptedReason = "fused";
             if (!previousPfInitialized
                     && previousPublishedPose == null
@@ -1942,7 +2003,9 @@ public class SensorFusion implements SensorEventListener, Observer {
                 longitudeDeg,
                 localFix,
                 acceptedFloorPrior,
-                accuracyMeters
+                rawAccuracyMeters,
+                normalizedAccuracyMeters,
+                fusionAccuracyMeters
         );
         allowProvisionalFloorReconcileForCurrentFix = false;
         provisionalFloorReconcileTargetFloor = Integer.MIN_VALUE;
@@ -3098,18 +3161,20 @@ public class SensorFusion implements SensorEventListener, Observer {
                 previousFloor,
                 newFloor
         );
-        if (availability == TransitionConstraintAvailability.COMPLETE
-                || availability == TransitionConstraintAvailability.MAP_UNAVAILABLE
-                || availability == TransitionConstraintAvailability.FLOOR_DATA_UNAVAILABLE) {
+        if (availability == TransitionConstraintAvailability.COMPLETE) {
             return false;
         }
         if (!hasBarometerEvidenceForFloorTransitionFallback(previousFloor, newFloor)) {
             return false;
         }
+        if (availability == TransitionConstraintAvailability.MAP_UNAVAILABLE
+                || availability == TransitionConstraintAvailability.FLOOR_DATA_UNAVAILABLE) {
+            return true;
+        }
         long timestampMs = System.currentTimeMillis();
         LatLng contextLatLng = resolveLiftContextLatLng(timestampMs);
         if (contextLatLng == null) {
-            return false;
+            return true;
         }
         return isLiftTransitionSatisfiedWithTolerance(
                 contextLatLng,
@@ -3227,6 +3292,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         pendingDisplayFloorResetAnchorSource = anchorSource;
         pendingCommittedDisplayFloorAbsolute = boundedAbsoluteFloor;
         floorSwitchPending = true;
+        armDisplayFastFollowWindow(safeTimestampMs, "floor_transition_confirmed");
         lastFloorSwitchBlockReason = "awaiting_display_commit";
         absoluteFloorTransitionResolver.reset();
         resetStableAbsoluteFloorConsensus();
@@ -3300,7 +3366,24 @@ public class SensorFusion implements SensorEventListener, Observer {
         int expiredFloor = pendingDisplayFloorResetAbsoluteFloor;
         LatLng expiredLanding = pendingDisplayFloorResetLandingLatLng;
         String expiredAnchorSource = pendingDisplayFloorResetAnchorSource;
+        boolean keepPendingConfirmedFloor = pendingCommittedDisplayFloorAbsolute == expiredFloor
+                && isAlgorithmFloorConfirmedForDisplayLocked(expiredFloor, timestampMs);
         clearPendingDisplayFloorResetToken();
+        if (keepPendingConfirmedFloor) {
+            floorSwitchPending = true;
+            lastFloorSwitchBlockReason = "awaiting_display_sync";
+            logFloorSwitchTrace(
+                    "DISPLAY_RESET_TOKEN_ISSUED=false",
+                    expiredFloor,
+                    expiredAnchorSource,
+                    expiredLanding,
+                    expiredLanding != null && MapConstraintRepository.isPointLegal(expiredLanding, expiredFloor),
+                    false,
+                    false,
+                    "awaiting_display_sync"
+            );
+            return;
+        }
         floorSwitchPending = false;
         pendingCommittedDisplayFloorAbsolute = Integer.MIN_VALUE;
         lastFloorSwitchBlockReason = "display_reset_token_expired";
@@ -3336,17 +3419,47 @@ public class SensorFusion implements SensorEventListener, Observer {
             long timestampMs,
             @Nullable LatLng displayedLocation
     ) {
+        return commitDisplayFloorIfReady(absoluteFloor, timestampMs, displayedLocation);
+    }
+
+    public synchronized boolean isDisplayFloorChangeReady(int absoluteFloor, long timestampMs) {
+        long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
+        expirePendingDisplayFloorResetIfNeeded(safeTimestampMs);
+        int boundedAbsoluteFloor = clampAbsoluteFloorToVenue(absoluteFloor);
+        return hasPendingDisplayFloorReset(boundedAbsoluteFloor, safeTimestampMs)
+                || committedDisplayFloorAbsolute == boundedAbsoluteFloor
+                || (pendingCommittedDisplayFloorAbsolute == boundedAbsoluteFloor
+                && isAlgorithmFloorConfirmedForDisplayLocked(boundedAbsoluteFloor, safeTimestampMs));
+    }
+
+    public synchronized boolean commitDisplayFloorIfReady(
+            int absoluteFloor,
+            long timestampMs,
+            @Nullable LatLng displayedLocation
+    ) {
+        long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
+        expirePendingDisplayFloorResetIfNeeded(safeTimestampMs);
+        int boundedAbsoluteFloor = clampAbsoluteFloorToVenue(absoluteFloor);
         String anchorSource = pendingDisplayFloorResetAnchorSource;
-        boolean consumed = consumePendingDisplayFloorReset(absoluteFloor, timestampMs);
-        if (!consumed) {
+        boolean hadPendingToken = hasPendingDisplayFloorReset(boundedAbsoluteFloor, safeTimestampMs);
+        if (hadPendingToken
+                && !consumePendingDisplayFloorReset(boundedAbsoluteFloor, safeTimestampMs)) {
             return false;
         }
-        committedDisplayFloorAbsolute = clampAbsoluteFloorToVenue(absoluteFloor);
+        boolean confirmedPendingFloor = pendingCommittedDisplayFloorAbsolute == boundedAbsoluteFloor
+                && isAlgorithmFloorConfirmedForDisplayLocked(boundedAbsoluteFloor, safeTimestampMs);
+        if (!confirmedPendingFloor && committedDisplayFloorAbsolute != boundedAbsoluteFloor) {
+            return false;
+        }
+        committedDisplayFloorAbsolute = boundedAbsoluteFloor;
         floorSwitchPending = false;
         pendingCommittedDisplayFloorAbsolute = Integer.MIN_VALUE;
         lastFloorSwitchBlockReason = "none";
+        armDisplayFastFollowWindow(safeTimestampMs, "display_floor_committed");
         logFloorSwitchTrace(
-                "DISPLAY_RESET_TOKEN_CONSUMED=true",
+                hadPendingToken
+                        ? "DISPLAY_RESET_TOKEN_CONSUMED=true"
+                        : "DISPLAY_RESET_CONFIRMED_WITHOUT_TOKEN=true",
                 committedDisplayFloorAbsolute,
                 anchorSource,
                 displayedLocation,
@@ -3367,6 +3480,38 @@ public class SensorFusion implements SensorEventListener, Observer {
         }
         clearPendingDisplayFloorResetToken();
         return true;
+    }
+
+    public synchronized boolean shouldFastFollowDisplayedMarker(long timestampMs) {
+        long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
+        return displayFastFollowUntilMs != Long.MIN_VALUE
+                && safeTimestampMs <= displayFastFollowUntilMs;
+    }
+
+    private void armDisplayFastFollowWindow(long timestampMs, @NonNull String reason) {
+        long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
+        displayFastFollowUntilMs = Math.max(
+                displayFastFollowUntilMs,
+                safeTimestampMs + DISPLAY_FAST_FOLLOW_WINDOW_MS
+        );
+        lastDisplayFastFollowReason = reason;
+        logMotionDiagnostic(
+                "display_fast_follow armed reason=" + reason
+                        + " untilMs=" + displayFastFollowUntilMs
+        );
+    }
+
+    private boolean isAlgorithmFloorConfirmedForDisplayLocked(int absoluteFloor, long timestampMs) {
+        int boundedAbsoluteFloor = clampAbsoluteFloorToVenue(absoluteFloor);
+        if (latestFusedPose != null
+                && clampAbsoluteFloorToVenue(latestFusedPose.getFloor()) == boundedAbsoluteFloor) {
+            return true;
+        }
+        Integer activeResyncFloor = getActiveFloorOnlyResyncFloor(timestampMs);
+        if (activeResyncFloor != null && activeResyncFloor == boundedAbsoluteFloor) {
+            return true;
+        }
+        return isFloorOffsetInitialized && getAbsoluteCurrentFloor() == boundedAbsoluteFloor;
     }
 
     private void clampLatestFusedPoseFloorToVenueIfNeeded(long timestampMs) {
@@ -3982,8 +4127,8 @@ public class SensorFusion implements SensorEventListener, Observer {
         Integer recoveredFloor = resolvePendingAbsoluteFloorConsensus(
                 reportedFloor,
                 timestampMs,
-                ABSOLUTE_FLOOR_STABLE_CONSENSUS_REQUIRED_CONFIRMATIONS,
-                ABSOLUTE_FLOOR_STABLE_CONSENSUS_REQUIRED_DURATION_MS
+                WRONG_FLOOR_RECOVERY_REQUIRED_CONFIRMATIONS,
+                WRONG_FLOOR_RECOVERY_REQUIRED_DURATION_MS
         );
         if (recoveredFloor == null) {
             noteFloorConsensusDecision("initial_lock_pending", timestampMs);
@@ -4865,6 +5010,8 @@ public class SensorFusion implements SensorEventListener, Observer {
         committedDisplayFloorAbsolute = Integer.MIN_VALUE;
         pendingCommittedDisplayFloorAbsolute = Integer.MIN_VALUE;
         floorSwitchPending = false;
+        displayFastFollowUntilMs = Long.MIN_VALUE;
+        lastDisplayFastFollowReason = "none";
         lastFloorSwitchBlockReason = "none";
         lastFloorConsensus = "reset";
         lastFloorSource = "relative_only";
@@ -6085,10 +6232,15 @@ public class SensorFusion implements SensorEventListener, Observer {
 
     private boolean isElevatorAbsoluteFixSuppressionActive(long timestampMs) {
         long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
+        return isStrongElevatorAbsoluteFixSuppressionState(safeTimestampMs)
+                || safeTimestampMs <= elevatorAbsoluteFixRejectUntilMs;
+    }
+
+    private boolean isStrongElevatorAbsoluteFixSuppressionState(long timestampMs) {
+        long safeTimestampMs = timestampMs > 0L ? timestampMs : System.currentTimeMillis();
         return elevator
                 || elevatorFloorSessionActive
-                || isStrongBarometerElevatorMotionPresent(safeTimestampMs)
-                || safeTimestampMs <= elevatorAbsoluteFixRejectUntilMs;
+                || isStrongBarometerElevatorMotionPresent(safeTimestampMs);
     }
 
     private boolean shouldRejectAbsoluteFixDuringElevatorSuppression(
@@ -6111,7 +6263,10 @@ public class SensorFusion implements SensorEventListener, Observer {
         if (bootstrapOverrideElevatorSuppression) {
             return false;
         }
-        extendElevatorAbsoluteFixSuppression(timestampMs);
+        boolean strongSuppressionActive = isStrongElevatorAbsoluteFixSuppressionState(timestampMs);
+        if (strongSuppressionActive) {
+            extendElevatorAbsoluteFixSuppression(timestampMs);
+        }
         if ("WIFI".equals(debugSource)
                 && floorPrior != null
                 && shouldAllowConsistentSuppressedWifiFloorEscape(floorPrior, timestampMs)) {
@@ -6124,21 +6279,26 @@ public class SensorFusion implements SensorEventListener, Observer {
             return false;
         }
         int validationFloor = floorPrior != null ? floorPrior : getAbsoluteCurrentFloor();
-        boolean postLiftBypass = isPostLiftDestinationFixWindowActive(timestampMs)
+        boolean destinationWindowActive = isPostLiftDestinationFixWindowActive(timestampMs);
+        boolean postLiftBypass = destinationWindowActive
                 && postLiftExpectedAbsoluteFloor == validationFloor;
-        if (isPostLiftDestinationFixWindowActive(timestampMs) && !postLiftBypass) {
-            lastPostLiftState = "rejected_old_floor_state";
+        if (destinationWindowActive && !postLiftBypass) {
+            lastPostLiftState = "awaiting_destination_fix_assist";
         }
         if (!postLiftBypass && latestFusedPose != null) {
             double distanceMeters = Math.hypot(
                     latestFusedPose.getX() - localFix[0],
                     latestFusedPose.getY() - localFix[1]
             );
-            if (distanceMeters > ELEVATOR_ABSOLUTE_FIX_REJECT_DISTANCE_M) {
+            double rejectDistanceMeters = strongSuppressionActive
+                    ? ELEVATOR_ABSOLUTE_FIX_REJECT_DISTANCE_M
+                    : ELEVATOR_ABSOLUTE_FIX_COOLDOWN_REJECT_DISTANCE_M;
+            if (distanceMeters > rejectDistanceMeters) {
                 logMotionDiagnostic(
                         "absolute_fix suppressed_during_elevator source=" + debugSource
                                 + " distanceM=" + formatDebugDouble(distanceMeters)
-                                + " thresholdM=" + ELEVATOR_ABSOLUTE_FIX_REJECT_DISTANCE_M
+                                + " thresholdM=" + formatDebugDouble(rejectDistanceMeters)
+                                + " strongSuppression=" + strongSuppressionActive
                 );
                 return true;
             }
@@ -6336,6 +6496,8 @@ public class SensorFusion implements SensorEventListener, Observer {
         lastBlockReason = "none";
         lastPoseAdvanceSource = "none";
         lastPoseAdvanceTimestampMs = Long.MIN_VALUE;
+        displayFastFollowUntilMs = Long.MIN_VALUE;
+        lastDisplayFastFollowReason = "none";
         resetStableAbsoluteFloorConsensus();
         lastFloorConsensus = "reset";
         lastFloorSource = "relative_only";
@@ -6531,7 +6693,12 @@ public class SensorFusion implements SensorEventListener, Observer {
         lastStationaryStepLogMs = currentTimeMs;
     }
 
-    private boolean shouldFreezeAbsoluteFix(@NonNull String debugSource, @Nullable Integer floorPrior) {
+    private boolean shouldFreezeAbsoluteFix(
+            @NonNull String debugSource,
+            @Nullable Integer floorPrior,
+            float adjustedAccuracyMeters,
+            long observationAgeMs
+    ) {
         if (!pfInitialized) {
             return false;
         }
@@ -6546,6 +6713,13 @@ public class SensorFusion implements SensorEventListener, Observer {
                 floorPrior,
                 getAbsoluteCurrentFloor(),
                 isFloorOffsetInitialized
+        )) {
+            return false;
+        }
+        if (AbsoluteFixFusionPolicy.shouldAllowStationaryCorrection(
+                debugSource,
+                adjustedAccuracyMeters,
+                observationAgeMs
         )) {
             return false;
         }
@@ -6592,6 +6766,38 @@ public class SensorFusion implements SensorEventListener, Observer {
                         + " spikes=" + lastStationaryWindowSpikeCount
         );
         lastStationaryAbsoluteFixLogMs = now;
+    }
+
+    private boolean shouldArmDisplayFastFollowForAbsoluteFix(
+            @Nullable FusedPose previousPublishedPose,
+            @Nullable FusedPose updatedPose,
+            boolean absoluteFixReanchored,
+            boolean absoluteFixCloudRecovered,
+            boolean keepLimitedSupportCorrection,
+            float fusionAccuracyMeters,
+            long observationAgeMs,
+            @NonNull String debugSource
+    ) {
+        if (!"WIFI".equals(debugSource) && !"GNSS".equals(debugSource) && !"ABS".equals(debugSource)) {
+            return false;
+        }
+        if (absoluteFixReanchored || absoluteFixCloudRecovered || keepLimitedSupportCorrection) {
+            return true;
+        }
+        if (updatedPose == null
+                || fusionAccuracyMeters > AbsoluteFixFusionPolicy.GENERIC_ABSOLUTE_FALLBACK_ACCURACY_M
+                || (observationAgeMs >= 0L
+                && observationAgeMs > AbsoluteFixFusionPolicy.FRESH_OBSERVATION_MAX_AGE_MS)) {
+            return false;
+        }
+        if (previousPublishedPose == null) {
+            return true;
+        }
+        double correctionDistanceMeters = Math.hypot(
+                updatedPose.getX() - previousPublishedPose.getX(),
+                updatedPose.getY() - previousPublishedPose.getY()
+        );
+        return Double.isFinite(correctionDistanceMeters) && correctionDistanceMeters >= 3.0;
     }
 
     private void ensureGeomagneticDeclination() {
@@ -6780,6 +6986,16 @@ public class SensorFusion implements SensorEventListener, Observer {
     }
 
     public synchronized int getUserVisibleFloor() {
+        long floorConfirmationTimestampMs = latestFusedPose != null
+                ? latestFusedPose.getTimestampMs()
+                : Long.MIN_VALUE;
+        if (pendingCommittedDisplayFloorAbsolute != Integer.MIN_VALUE
+                && isAlgorithmFloorConfirmedForDisplayLocked(
+                pendingCommittedDisplayFloorAbsolute,
+                floorConfirmationTimestampMs
+        )) {
+            return clampAbsoluteFloorToVenue(pendingCommittedDisplayFloorAbsolute);
+        }
         if (committedDisplayFloorAbsolute != Integer.MIN_VALUE) {
             return committedDisplayFloorAbsolute;
         }
@@ -7250,6 +7466,8 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.committedDisplayFloorAbsolute = Integer.MIN_VALUE;
         this.pendingCommittedDisplayFloorAbsolute = Integer.MIN_VALUE;
         this.floorSwitchPending = false;
+        this.displayFastFollowUntilMs = Long.MIN_VALUE;
+        this.lastDisplayFastFollowReason = "none";
         this.lastFloorSwitchBlockReason = "none";
         this.pendingDisplayFloorResetLandingLatLng = null;
         this.pendingDisplayFloorResetAnchorSource = "none";
@@ -7476,7 +7694,9 @@ public class SensorFusion implements SensorEventListener, Observer {
             double longitudeDeg,
             @Nullable double[] localFix,
             @Nullable Integer floorPrior,
-            float accuracyMeters
+            float rawAccuracyMeters,
+            float normalizedAccuracyMeters,
+            float fusionAccuracyMeters
     ) {
         if (!DEBUG_FUSION_TRACE) {
             return;
@@ -7493,7 +7713,9 @@ public class SensorFusion implements SensorEventListener, Observer {
                             + " floorPrior=" + (floorPrior == null ? "n/a" : floorPrior)
                             + " currentFloor=" + getCurrentFloor()
                             + " displayFloor=" + getUserVisibleFloor()
-                            + " accuracyM=" + formatDebugDouble(accuracyMeters)
+                            + " rawAccuracyM=" + formatDebugDouble(rawAccuracyMeters)
+                            + " normalizedAccuracyM=" + formatDebugDouble(normalizedAccuracyMeters)
+                            + " pfSigmaM=" + formatDebugDouble(fusionAccuracyMeters)
                             + " obsAgeMs=" + observationAgeMs
                             + " fused=" + formatFusedPose(latestFusedPose)
                             + " displayedRaw=" + formatLatLng(lastDisplayedFusedMarkerRawLatLng)

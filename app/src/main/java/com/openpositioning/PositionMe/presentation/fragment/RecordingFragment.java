@@ -118,8 +118,11 @@ public class RecordingFragment extends Fragment {
     private long lastObservedHeadingSampleTimestampMs = Long.MIN_VALUE;
     private String lastUiPoseDiagnosticState = "";
 
-    static int resolveMapUpdateFloor(@NonNull FusedPose fusedPose) {
-        return fusedPose.getFloor();
+    static int resolveMapUpdateFloor(
+            @Nullable Integer preferredDisplayFloor,
+            @NonNull FusedPose fusedPose
+    ) {
+        return preferredDisplayFloor != null ? preferredDisplayFloor : fusedPose.getFloor();
     }
 
     // Distance tracking
@@ -444,7 +447,7 @@ public class RecordingFragment extends Fragment {
                     trajectoryMapFragment.updateUserLocation(
                             newLocation,
                             orientationDeg,
-                            resolveMapUpdateFloor(fusedPose),
+                            resolveMapUpdateFloor(Integer.valueOf(bestKnownFloor), fusedPose),
                             fusedPose.getTimestampMs()
                     );
                 } else if (hasFreshHeading) {

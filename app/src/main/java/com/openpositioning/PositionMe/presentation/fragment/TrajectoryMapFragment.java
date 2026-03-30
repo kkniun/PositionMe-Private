@@ -63,6 +63,7 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double TRAJECTORY_DUPLICATE_SUPPRESS_THRESHOLD_M = 0.15;
     private static final double RAW_POINT_DUPLICATE_THRESHOLD_M = 0.25;
     private static final double TRAJECTORY_STATIONARY_HINT_THRESHOLD_M = 0.45;
+    private static final long MARKER_FAST_FOLLOW_WINDOW_MS = 1_500L;
     private static final double HEADING_FREEZE_LOW_CONFIDENCE_THRESHOLD = 0.40;
     // 地图 marker 的视觉基准当前比期望“尖头朝上”右偏约 90 度，只在显示层做常量修正。
     private static final float FUSED_MARKER_VISUAL_OFFSET_DEG = 0f;
@@ -309,7 +310,11 @@ public class TrajectoryMapFragment extends Fragment {
                 if (displayFloor == null) {
                     return;
                 }
-                LatLng displayedLocation = resolveDisplayLocation(currentRawLocation, displayFloor);
+                LatLng displayedLocation = resolveDisplayLocation(
+                        currentRawLocation,
+                        displayFloor,
+                        System.currentTimeMillis()
+                );
                 currentLocation = displayedLocation;
                 updateFusedMarker(
                         displayedLocation,
@@ -509,13 +514,20 @@ public class TrajectoryMapFragment extends Fragment {
             return;
         }
         boolean crossFloorDisplayUpdate = DisplayFloorResetGate.requiresResetToken(lastRenderedFusedFloor, floor);
-        boolean legalFloorReset = crossFloorDisplayUpdate
+        boolean authorizedFloorReset = crossFloorDisplayUpdate
+                && sensorFusion != null
+                && sensorFusion.isDisplayFloorChangeReady(floor, timestampMs);
+        boolean hasPendingFloorResetToken = crossFloorDisplayUpdate
                 && sensorFusion != null
                 && sensorFusion.hasPendingDisplayFloorReset(floor, timestampMs);
-        LatLng crossFloorLandingLocation = legalFloorReset && sensorFusion != null
+        LatLng crossFloorLandingLocation = hasPendingFloorResetToken && sensorFusion != null
                 ? sensorFusion.peekPendingDisplayFloorResetLanding(floor, timestampMs)
                 : null;
-        if (DisplayFloorResetGate.shouldHoldCrossFloorUpdate(lastRenderedFusedFloor, floor, legalFloorReset)) {
+        if (DisplayFloorResetGate.shouldHoldCrossFloorUpdate(
+                lastRenderedFusedFloor,
+                floor,
+                authorizedFloorReset
+        )) {
             recordDisplayDecision(
                     internalPoseUpdated,
                     false,
@@ -523,7 +535,7 @@ public class TrajectoryMapFragment extends Fragment {
                     false,
                     0.0,
                     "held_last_valid_pose",
-                    "cross_floor_without_reset_token"
+                    "cross_floor_not_authorized"
             );
             if (currentLocation != null) {
                 updateFusedMarker(currentLocation, orientation, true);
@@ -632,7 +644,11 @@ public class TrajectoryMapFragment extends Fragment {
             return;
         }
         currentRawLocation = renderedRawLocation;
-        LatLng displayedLocation = resolveDisplayLocation(renderedRawLocation, floor);
+        if ((crossFloorDisplayUpdate && authorizedFloorReset)
+                || (sensorFusion != null && sensorFusion.shouldFastFollowDisplayedMarker(timestampMs))) {
+            markerDisplayFilter.armFastFollowWindow(timestampMs, MARKER_FAST_FOLLOW_WINDOW_MS);
+        }
+        LatLng displayedLocation = resolveDisplayLocation(renderedRawLocation, floor, timestampMs);
         LatLng smoothedDisplayedLocation = displayedLocation;
         boolean displayPointRenderable =
                 MapDisplayConstraintFilter.isRenderablePoint(displayedLocation, floor);
@@ -702,8 +718,8 @@ public class TrajectoryMapFragment extends Fragment {
             }
         }
         boolean floorSwitchCommitted = false;
-        if (crossFloorDisplayUpdate && legalFloorReset && sensorFusion != null) {
-            floorSwitchCommitted = sensorFusion.commitPendingDisplayFloorReset(
+        if (crossFloorDisplayUpdate && authorizedFloorReset && sensorFusion != null) {
+            floorSwitchCommitted = sensorFusion.commitDisplayFloorIfReady(
                     floor,
                     timestampMs,
                     displayedLocation
@@ -1405,7 +1421,7 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     @NonNull
-    private LatLng resolveDisplayLocation(@NonNull LatLng rawLocation, int floor) {
+    private LatLng resolveDisplayLocation(@NonNull LatLng rawLocation, int floor, long timestampMs) {
         LatLng currentDisplayedLocation = markerDisplayFilter.getFilteredPosition();
         boolean bypassFilter = currentDisplayedLocation != null
                 && MapDisplayConstraintFilter.shouldBypassSmoothing(
@@ -1417,7 +1433,8 @@ public class TrajectoryMapFragment extends Fragment {
         return markerDisplayFilter.updatePosition(
                 rawLocation,
                 sensorFusion != null && sensorFusion.isStationary(),
-                !displaySmoothingEnabled || bypassFilter
+                !displaySmoothingEnabled || bypassFilter,
+                timestampMs
         );
     }
 

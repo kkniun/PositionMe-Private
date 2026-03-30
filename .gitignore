@@ -18,4 +18,5 @@ local.properties
 # local-only docs
 _local_docs/
 .agentdocs/
-AGENTS.md
+AGENTS.mdartifacts/
+secrets.properties
