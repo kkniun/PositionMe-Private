@@ -101,6 +101,8 @@ public class SensorFusion implements SensorEventListener, Observer {
     public static final float FILTER_COEFFICIENT = 0.96f;
     // Toggle for heading debug logs across modules
     public static final boolean DEBUG_HEADING = false;
+    /** When true, logs map clip / step liveness at most ~1 Hz (field diagnosis for “stuck until WiFi”). */
+    public static final boolean DEBUG_FUSION_LIVENESS = false;
     //Tuning value for low pass filter
     private static final float ALPHA = 0.8f;
     // String for creating WiFi fingerprint JSO N object
@@ -108,26 +110,32 @@ public class SensorFusion implements SensorEventListener, Observer {
     private static final String DEFAULT_COLLECTION_VENUE = "traj";
     /** Conservative for fusion: API does not return horizontal uncertainty; under-estimating widens bad snaps. */
     private static final float DEFAULT_WIFI_ACCURACY_M = 10.0f;
+    /** WiFi fixes that jump this far beyond this derived gate (m) get inflated measurement std. */
+    private static final double WIFI_OUTLIER_BASELINE_M = 18.0;
+    private static final double WIFI_OUTLIER_ACC_FACTOR = 3.0;
+    private static final float WIFI_OUTLIER_INFLATED_ACCURACY_CAP_M = 55.0f;
     private static final float GNSS_GPS_ACCURACY_WEIGHT_FACTOR = 0.65f;
     private static final float GNSS_NETWORK_ACCURACY_PENALTY_FACTOR = 1.35f;
     private static final float MIN_GNSS_EFFECTIVE_ACCURACY_M = 1.5f;
-    private static final float HEADING_BIAS_ALPHA = 0.11f;
+    private static final float HEADING_BIAS_ALPHA = 0.15f;
+    private static final float HEADING_BIAS_FROM_FUSED_STEP_ALPHA = 0.085f;
+    private static final double MIN_FUSED_STEP_FOR_HEADING_CALIBRATION_M = 0.32;
     private static final float MAX_HEADING_BIAS_RAD = (float) Math.toRadians(45.0);
     private static final float MAX_BIAS_CALIBRATION_FIX_ACCURACY_M = 12.0f;
-    private static final double MIN_BIAS_CALIBRATION_DISPLACEMENT_M = 2.5;
+    private static final double MIN_BIAS_CALIBRATION_DISPLACEMENT_M = 2.2;
     private static final double MIN_ABSOLUTE_FIX_START_STD_M = 1.0;
     /** Before the particle filter is initialised, keep collecting fixes and lock the ENU origin on the best-accuracy fix, or after a timeout (whichever comes first). */
     private static final float FIRST_ORIGIN_MAX_ACCURACY_M = 18.0f;
     private static final long FIRST_ORIGIN_FALLBACK_MS = 4000L;
     /** Minimum GNSS speed (m/s) to trust course bearing for initial heading alignment. */
     private static final float MIN_GNSS_SPEED_FOR_COURSE_HEADING_MPS = 0.45f;
-    private static final double MIN_PDR_DRIFT_COMPENSATION_M = 0.45;
+    private static final double MIN_PDR_DRIFT_COMPENSATION_M = 0.38;
     /** Fused mean must move at least this far before overwriting integrated PDR (avoids freeze when PF rejects all motion). */
     private static final double MIN_FUSED_MOVE_TO_RESYNC_PDR_M = 0.02;
     /** Binary-search iterations to find the longest wall-safe prefix of each PDR step (sliding along walls). */
     private static final int MAP_CLIP_SEGMENT_ITERS = 16;
     private static final double PDR_HARD_REANCHOR_DISTANCE_M = 14.0;
-    private static final float PDR_SOFT_REANCHOR_ALPHA = 0.34f;
+    private static final float PDR_SOFT_REANCHOR_ALPHA = 0.40f;
     private static final float MAX_PDR_COMPENSATION_FIX_ACCURACY_M = 22.0f;
     private static final float PDR_HARD_REANCHOR_FIX_ACCURACY_M = 2.5f;
     //endregion
@@ -236,6 +244,7 @@ public class SensorFusion implements SensorEventListener, Observer {
     private boolean hasManualStartLocation;
     private float lastPredictHeadingRad;
     private float lastPredictElevation;
+    private long lastFusionLivenessLogMs;
     private long lastRecordedFusedPoseTimestampMs;
     /** Last PDR step length (m) for map-based floor gating (stairs vs lift). */
     private float lastFloorGateStepLengthM;
@@ -608,6 +617,25 @@ public class SensorFusion implements SensorEventListener, Observer {
                             currentPdrFloor,
                             currentTime
                     );
+                    if (pfInitialized) {
+                        maybeCalibrateHeadingBiasFromFusedMotion(fusedXBefore, fusedYBefore);
+                    }
+                    if (DEBUG_FUSION_LIVENESS) {
+                        long nowL = SystemClock.elapsedRealtime();
+                        if (nowL - lastFusionLivenessLogMs >= 1200L) {
+                            lastFusionLivenessLogMs = nowL;
+                            boolean fm = !Double.isNaN(fusedXBefore) && latestFusedPose != null
+                                    && Math.hypot(
+                                    latestFusedPose.getX() - fusedXBefore,
+                                    latestFusedPose.getY() - fusedYBefore
+                            ) > MIN_FUSED_MOVE_TO_RESYNC_PDR_M;
+                            Log.d("FusionLiveness", "clipT=" + String.format(Locale.US, "%.2f", clipT)
+                                    + " stepM=" + String.format(Locale.US, "%.2f", pdrDelta.getStepLengthMeters())
+                                    + " fusedMoved=" + fm
+                                    + " walls=" + MapConstraintRepository.hasWallConstraints()
+                                    + " outline=" + MapConstraintRepository.hasVenueOutline());
+                        }
+                    }
                     this.lastPredictHeadingRad = currentHeadingRad;
                     this.lastPredictElevation = this.elevation;
 
@@ -1014,7 +1042,8 @@ public class SensorFusion implements SensorEventListener, Observer {
                                     System.currentTimeMillis(),
                                     wifiLocation.latitude,
                                     wifiLocation.longitude,
-                                    DEFAULT_WIFI_ACCURACY_M
+                                    DEFAULT_WIFI_ACCURACY_M,
+                                    true
                             ),
                             resolveStep1InitializationFloor(elevationDrivenFloor),
                             elevationDrivenFloor
@@ -1057,7 +1086,8 @@ public class SensorFusion implements SensorEventListener, Observer {
                 elevationDrivenFloor,
                 elevationDrivenFloor,
                 absoluteFix.getTimestampMs(),
-                absoluteFix.getAccuracyMeters()
+                absoluteFix.getAccuracyMeters(),
+                absoluteFix.isFromWifiPositioning()
         );
     }
 
@@ -1069,7 +1099,8 @@ public class SensorFusion implements SensorEventListener, Observer {
                 elevationDrivenFloor,
                 elevationDrivenFloor,
                 timestampMs,
-                DEFAULT_WIFI_ACCURACY_M
+                DEFAULT_WIFI_ACCURACY_M,
+                false
         );
     }
 
@@ -1087,7 +1118,8 @@ public class SensorFusion implements SensorEventListener, Observer {
                 elevationDrivenFloor,
                 elevationDrivenFloor,
                 timestampMs,
-                accuracyMeters
+                accuracyMeters,
+                false
         );
     }
 
@@ -1097,7 +1129,8 @@ public class SensorFusion implements SensorEventListener, Observer {
             int initializationFloor,
             @Nullable Integer floorPrior,
             long timestampMs,
-            float accuracyMeters
+            float accuracyMeters,
+            boolean wifiPositioningFix
     ) {
         if (!saveRecording) {
             return;
@@ -1145,6 +1178,8 @@ public class SensorFusion implements SensorEventListener, Observer {
         maybeSetInitialPositionIfAbsent(this.trajectory, latitudeDeg, longitudeDeg);
         double[] localFix = converter.toLocalMeters(latitudeDeg, longitudeDeg);
         float reportedAccuracy = sanitizeAccuracyForFusion(accuracyMeters);
+        reportedAccuracy = inflateWifiMeasurementIfOutlier(
+                wifiPositioningFix, reportedAccuracy, localFix[0], localFix[1]);
         float fusionMeasurementAccuracy = sharpenAccuracyForParticleFusion(reportedAccuracy);
         maybeCalibrateHeadingBiasFromAbsoluteFix(localFix[0], localFix[1], reportedAccuracy);
         this.latestFusedPose = applyAbsoluteFixForStep1(
@@ -1181,7 +1216,8 @@ public class SensorFusion implements SensorEventListener, Observer {
                 initializationFloor,
                 floorPrior,
                 absoluteFix.getTimestampMs(),
-                absoluteFix.getAccuracyMeters()
+                absoluteFix.getAccuracyMeters(),
+                absoluteFix.isFromWifiPositioning()
         );
     }
 
@@ -1368,8 +1404,36 @@ public class SensorFusion implements SensorEventListener, Observer {
      */
     private static float sharpenAccuracyForParticleFusion(float reportedAccuracyMeters) {
         float r = sanitizeAccuracyForFusion(reportedAccuracyMeters);
-        float s = r * 0.70f;
-        return Math.max(2.8f, Math.min(20f, s));
+        float factor = r <= 6.0f ? 0.64f : 0.70f;
+        float s = r * factor;
+        float floorMin = r <= 5.5f ? 2.5f : 2.8f;
+        return Math.max(floorMin, Math.min(20f, s));
+    }
+
+    /**
+     * WiFi fingerprint fixes occasionally snap tens of metres away. Inflate reported accuracy so the
+     * particle update down-weights outliers instead of dragging the whole cloud.
+     */
+    private float inflateWifiMeasurementIfOutlier(
+            boolean wifiPositioningFix,
+            float reportedAccuracyM,
+            double fixLocalX,
+            double fixLocalY
+    ) {
+        if (!wifiPositioningFix || !pfInitialized || latestFusedPose == null) {
+            return reportedAccuracyM;
+        }
+        double dx = fixLocalX - latestFusedPose.getX();
+        double dy = fixLocalY - latestFusedPose.getY();
+        double jump = Math.hypot(dx, dy);
+        double gate = Math.max(WIFI_OUTLIER_BASELINE_M, WIFI_OUTLIER_ACC_FACTOR * reportedAccuracyM);
+        if (jump <= gate) {
+            return reportedAccuracyM;
+        }
+        return Math.max(
+                reportedAccuracyM,
+                Math.min(WIFI_OUTLIER_INFLATED_ACCURACY_CAP_M, (float) (jump * 0.40))
+        );
     }
 
     /**
@@ -1413,6 +1477,28 @@ public class SensorFusion implements SensorEventListener, Observer {
         lastHeadingCalibrationFixX = fixX;
         lastHeadingCalibrationFixY = fixY;
         lastHeadingCalibrationFixAccuracy = accuracyMeters;
+    }
+
+    /**
+     * Between GNSS/WiFi fixes, nudge heading bias using fused displacement after each step so map-linked
+     * constraints do not leave the walk direction systematically wrong.
+     */
+    private void maybeCalibrateHeadingBiasFromFusedMotion(double prevFusedX, double prevFusedY) {
+        if (latestFusedPose == null || Double.isNaN(prevFusedX) || Double.isNaN(prevFusedY)) {
+            return;
+        }
+        double dx = latestFusedPose.getX() - prevFusedX;
+        double dy = latestFusedPose.getY() - prevFusedY;
+        double displacement = Math.hypot(dx, dy);
+        if (displacement < MIN_FUSED_STEP_FOR_HEADING_CALIBRATION_M) {
+            return;
+        }
+        float motionHeading = (float) Math.atan2(dx, dy);
+        float sensorHeading = getCurrentHeadingRad();
+        float observedBias = normalizeHeadingDelta(motionHeading - sensorHeading);
+        float biasError = normalizeHeadingDelta(observedBias - headingBiasRad);
+        headingBiasRad = normalizeHeadingDelta(headingBiasRad + HEADING_BIAS_FROM_FUSED_STEP_ALPHA * biasError);
+        headingBiasRad = Math.max(-MAX_HEADING_BIAS_RAD, Math.min(MAX_HEADING_BIAS_RAD, headingBiasRad));
     }
 
     private ParticleFilterEngine createParticleFilterEngine() {
@@ -1460,7 +1546,10 @@ public class SensorFusion implements SensorEventListener, Observer {
                     || !MapConstraintRepository.isPointInsideVenueOutline(b)) {
                 return false;
             }
-            if (MapConstraintRepository.segmentLeavesVenueInterior(a, b)) {
+            // Without wall polygons, only endpoints are enforced. Concave footprints often falsely
+            // reject straight walks via segmentLeavesVenueInterior (“stuck until WiFi reanchor”).
+            if (MapConstraintRepository.hasWallConstraints()
+                    && MapConstraintRepository.segmentLeavesVenueInterior(a, b)) {
                 return false;
             }
         }
@@ -2320,6 +2409,7 @@ public class SensorFusion implements SensorEventListener, Observer {
         this.pendingBestOriginLon = Double.NaN;
         this.pendingBestAccuracyM = Float.POSITIVE_INFINITY;
         this.lastRecordedFusedPoseTimestampMs = -1L;
+        this.lastFusionLivenessLogMs = 0L;
         this.headingBiasRad = 0f;
         this.lastHeadingCalibrationFixX = Double.NaN;
         this.lastHeadingCalibrationFixY = Double.NaN;

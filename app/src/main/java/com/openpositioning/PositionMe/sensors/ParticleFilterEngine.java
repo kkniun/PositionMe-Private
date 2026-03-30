@@ -30,7 +30,7 @@ public class ParticleFilterEngine {
         );
     }
 
-    private static final int DEFAULT_PARTICLE_COUNT = 100;
+    private static final int DEFAULT_PARTICLE_COUNT = 120;
     private static final double DEFAULT_INITIAL_STD_M = 2.0;
     private static final double DEFAULT_PREDICTION_NOISE_STD_M = 0.095;
     private static final double MIN_PREDICTION_NOISE_STD_M = 0.025;

@@ -71,7 +71,7 @@ public class RecordingFragment extends Fragment {
     private MaterialButton completeButton, cancelButton, addMarkerButton;
     private ImageView recIcon;
     private ProgressBar timeRemaining;
-    private TextView elevation, distanceTravelled, gnssError, floorStatus, elevatorStatus, systemStatus, lastUpdateTime, trackingContextHint;
+    private TextView elevation, distanceTravelled, gnssError, floorStatus, systemStatus, lastUpdateTime, trackingContextHint;
 
     // Marker data  elements
     private final List<MarkerPoint> markerPoints = new ArrayList<>();
@@ -185,7 +185,6 @@ public class RecordingFragment extends Fragment {
         distanceTravelled = view.findViewById(R.id.currentDistanceTraveled);
         gnssError = view.findViewById(R.id.gnssError);
         floorStatus = view.findViewById(R.id.currentFloorStatus);
-        elevatorStatus = view.findViewById(R.id.elevatorStatus);
         systemStatus = view.findViewById(R.id.systemStatus);
         lastUpdateTime = view.findViewById(R.id.lastUpdateTime);
         trackingContextHint = view.findViewById(R.id.trackingContextHint);
@@ -219,7 +218,6 @@ public class RecordingFragment extends Fragment {
         distanceTravelled.setText(getString(R.string.travelled_distance_value, "0"));
         distanceTravelled.setVisibility(View.GONE);
         floorStatus.setText(getString(R.string.floor_status_unknown));
-        elevatorStatus.setText(getString(R.string.elevator_status_unknown));
         systemStatus.setText(getString(R.string.system_status_default));
         lastUpdateTime.setText(getString(R.string.last_update_default));
         trackingContextHint.setVisibility(View.GONE);
@@ -344,7 +342,6 @@ public class RecordingFragment extends Fragment {
         FusedPose fusedPose = sensorFusion.getLatestFusedPose();
         if (fusedPose == null) {
             floorStatus.setText(getString(R.string.floor_status_unknown));
-            elevatorStatus.setText(getString(R.string.elevator_status_unknown));
             systemStatus.setText(getString(
                     R.string.system_status_value,
                     getString(sensorFusion.isWaitingForAbsoluteFix()
@@ -376,7 +373,6 @@ public class RecordingFragment extends Fragment {
         float elevationVal = sensorFusion.getElevation();
         elevation.setText(getString(R.string.elevation, String.format("%.1f", elevationVal)));
         floorStatus.setText(resolveFloorStatusText(fusedPose.getFloor()));
-        elevatorStatus.setText(resolveElevatorStatusText());
         systemStatus.setText(getString(
                 R.string.system_status_value,
                 resolveSystemStatusLabel()
@@ -524,16 +520,6 @@ public class RecordingFragment extends Fragment {
             normalized += 360.0;
         }
         return (float) normalized;
-    }
-
-    private String resolveElevatorStatusText() {
-        if (trajectoryMapFragment != null && !trajectoryMapFragment.isMappedVenueActive()) {
-            return getString(R.string.elevator_status_unknown);
-        }
-        return getString(
-                R.string.elevator_status_value,
-                getString(sensorFusion.getElevator() ? R.string.elevator_active : R.string.elevator_inactive)
-        );
     }
 
     private void updateTrackingContextHint() {

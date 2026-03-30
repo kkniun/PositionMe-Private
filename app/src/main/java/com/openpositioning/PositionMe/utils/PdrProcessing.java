@@ -53,9 +53,9 @@ public class PdrProcessing {
     private static final float ELEVATOR_STEP_SUPPRESSION = 0.75f;
     private static final float MIN_STEP_SCALE = 0.75f;
     private static final float MAX_STEP_SCALE = 1.40f;
-    private static final float BASE_STEP_SCALE_CALIBRATION_ALPHA = 0.10f;
+    private static final float BASE_STEP_SCALE_CALIBRATION_ALPHA = 0.12f;
     private static final float MIN_CALIBRATION_FIX_QUALITY_M = 15.0f;
-    private static final float MIN_CALIBRATION_DISPLACEMENT_M = 2.2f;
+    private static final float MIN_CALIBRATION_DISPLACEMENT_M = 2.0f;
     //endregion
 
     //region Instance variables

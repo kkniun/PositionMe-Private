@@ -73,6 +73,8 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double DISPLAY_SMOOTHING_ALPHA = 0.16;
     /** Cap metres moved toward the raw fix per tick to avoid visible teleports after WiFi/GNSS jumps. */
     private static final double MAX_DISPLAY_STEP_METERS = 0.9;
+    /** Raw fused jumps larger than this skip smoothing so recovery does not crawl for many seconds. */
+    private static final double DISPLAY_SNAP_JUMP_METERS = 10.0;
     private static final double HEADING_MOVEMENT_MIN_DISTANCE_M = 1.05;
     private static final float HEADING_SENSOR_SMOOTH_ALPHA = 0.09f;
     private static final float HEADING_COURSE_BLEND_ALPHA = 0.22f;
@@ -716,6 +718,10 @@ public class TrajectoryMapFragment extends Fragment {
             return rawLocation;
         }
         double distMeters = UtilFunctions.distanceBetweenPoints(smoothedFusedLocation, rawLocation);
+        if (distMeters >= DISPLAY_SNAP_JUMP_METERS) {
+            smoothedFusedLocation = rawLocation;
+            return rawLocation;
+        }
         double alpha = DISPLAY_SMOOTHING_ALPHA;
         if (distMeters > 1e-6 && distMeters > MAX_DISPLAY_STEP_METERS) {
             alpha = Math.min(alpha, MAX_DISPLAY_STEP_METERS / distMeters);
@@ -879,20 +885,20 @@ public class TrajectoryMapFragment extends Fragment {
         if (fusedMarkerIcon != null) {
             return fusedMarkerIcon;
         }
-        int sizePx = dpToPx(54);
-        int arrowSizePx = dpToPx(24);
+        int sizePx = dpToPx(27);
+        int arrowSizePx = dpToPx(12);
         Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
 
         Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         fillPaint.setColor(Color.WHITE);
-        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - dpToPx(2), fillPaint);
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - dpToPx(1), fillPaint);
 
         Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         strokePaint.setColor(FUSED_COLOR);
         strokePaint.setStyle(Paint.Style.STROKE);
-        strokePaint.setStrokeWidth(dpToPx(3));
-        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - dpToPx(2), strokePaint);
+        strokePaint.setStrokeWidth(Math.max(1f, dpToPx(3) / 2f));
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - dpToPx(1), strokePaint);
 
         Bitmap arrowBitmap = UtilFunctions.getBitmapFromVector(requireContext(), R.drawable.ic_baseline_navigation_24);
         Bitmap scaledArrowBitmap = Bitmap.createScaledBitmap(arrowBitmap, arrowSizePx, arrowSizePx, true);
@@ -906,39 +912,45 @@ public class TrajectoryMapFragment extends Fragment {
 
     private BitmapDescriptor getGnssObservationIcon() {
         if (gnssObservationIcon == null) {
-            gnssObservationIcon = createObservationIcon(GNSS_COLOR, 12, 1);
+            gnssObservationIcon = createObservationIcon(GNSS_COLOR, 6f, 0.5f);
         }
         return gnssObservationIcon;
     }
 
     private BitmapDescriptor getWifiObservationIcon() {
         if (wifiObservationIcon == null) {
-            wifiObservationIcon = createObservationIcon(WIFI_COLOR, 15, 2);
+            wifiObservationIcon = createObservationIcon(WIFI_COLOR, 7.5f, 1f);
         }
         return wifiObservationIcon;
     }
 
     private BitmapDescriptor getPdrObservationIcon() {
         if (pdrObservationIcon == null) {
-            pdrObservationIcon = createObservationIcon(PDR_COLOR, 15, 2);
+            pdrObservationIcon = createObservationIcon(PDR_COLOR, 7.5f, 1f);
         }
         return pdrObservationIcon;
     }
 
-    private BitmapDescriptor createObservationIcon(int color, int sizeDp, int strokeWidthDp) {
-        int sizePx = dpToPx(sizeDp);
+    private BitmapDescriptor createObservationIcon(int color, float sizeDp, float strokeWidthDp) {
+        int sizePx = (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP,
+                sizeDp,
+                getResources().getDisplayMetrics());
         Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
 
         Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         fillPaint.setColor(color);
-        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 1f, fillPaint);
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 0.5f, fillPaint);
 
         Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         strokePaint.setColor(Color.WHITE);
         strokePaint.setStyle(Paint.Style.STROKE);
-        strokePaint.setStrokeWidth(dpToPx(strokeWidthDp));
-        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 1f, strokePaint);
+        strokePaint.setStrokeWidth(TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP,
+                strokeWidthDp,
+                getResources().getDisplayMetrics()));
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 0.5f, strokePaint);
 
         return BitmapDescriptorFactory.fromBitmap(bitmap);
     }
@@ -957,19 +969,19 @@ public class TrajectoryMapFragment extends Fragment {
             return cached;
         }
 
-        int sizePx = dpToPx(36);
+        int sizePx = dpToPx(18);
         Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
 
         Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         fillPaint.setColor(Color.parseColor("#D9485F"));
-        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 2f, fillPaint);
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 1f, fillPaint);
 
         Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         strokePaint.setColor(Color.WHITE);
         strokePaint.setStyle(Paint.Style.STROKE);
-        strokePaint.setStrokeWidth(3f);
-        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 2f, strokePaint);
+        strokePaint.setStrokeWidth(1.5f);
+        canvas.drawCircle(sizePx / 2f, sizePx / 2f, (sizePx / 2f) - 1f, strokePaint);
 
         Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         textPaint.setColor(Color.WHITE);

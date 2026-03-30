@@ -103,18 +103,6 @@
                     android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="@color/md_theme_secondary"
                     android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/elevatorStatus"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="16dp"
-                    android:ellipsize="end"
-                    android:singleLine="true"
-                    android:text="@string/elevator_status_unknown"
-                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
-                    android:textColor="@color/md_theme_secondary"
-                    android:textStyle="bold" />
             </LinearLayout>
 
             <LinearLayout
