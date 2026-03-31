@@ -589,7 +589,7 @@ public class SensorFusion implements SensorEventListener {
             particleFilterEngine.setCurrentLogicalFloor(logicalFloor);
         }
         if (indoorFloorController != null) {
-            indoorFloorController.reset();
+            indoorFloorController.confirmManualFloor(state.elevation, logicalFloor);
         }
     }
 
@@ -603,7 +603,7 @@ public class SensorFusion implements SensorEventListener {
 
     public int getPreferredDisplayLogicalFloor() {
         int fusedFloor = getCurrentLogicalFloor();
-        if (isIndoorContextActive()) {
+        if (indoorFloorController != null && indoorFloorController.hasConfirmedAnchor()) {
             return fusedFloor;
         }
 
@@ -629,7 +629,7 @@ public class SensorFusion implements SensorEventListener {
         Integer resolvedFloor = indoorFloorController.evaluate(
                 currentPosition,
                 state.elevation,
-                null,
+                getLatLngWifiPositioning() != null ? getWifiFloor() : null,
                 false,
                 timestampMillis
         );
@@ -884,8 +884,21 @@ public class SensorFusion implements SensorEventListener {
      */
     public int getWifiFloor() {
         int observedFloor = wifiPositionManager.getWifiFloor();
-        if (particleFilterEngine != null && particleFilterEngine.isIndoorContextActive()) {
-            return particleFilterEngine.normalizeObservedFloor(observedFloor);
+        if (indoorSpatialConstraintModel != null) {
+            LatLng contextPosition = getCurrentFusedPosition();
+            if (contextPosition == null) {
+                contextPosition = getLatLngWifiPositioning();
+            }
+            if (contextPosition == null) {
+                float[] gnssPosition = getGNSSLatitude(false);
+                if (gnssPosition != null && (gnssPosition[0] != 0f || gnssPosition[1] != 0f)) {
+                    contextPosition = new LatLng(gnssPosition[0], gnssPosition[1]);
+                }
+            }
+            if (contextPosition != null) {
+                indoorSpatialConstraintModel.updatePosition(contextPosition);
+            }
+            return indoorSpatialConstraintModel.normalizeExternalFloorObservation(observedFloor);
         }
         return observedFloor;
     }

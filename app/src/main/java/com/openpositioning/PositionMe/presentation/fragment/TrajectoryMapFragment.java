@@ -295,51 +295,48 @@ public class TrajectoryMapFragment extends Fragment {
     public LatLng updateUserLocation(@NonNull LatLng newLocation, float orientation) {
         if (gMap == null) return newLocation;
 
-        // Keep track of current location
         LatLng oldLocation = this.currentLocation;
-        float resolvedDirection = resolveDisplayDirection(oldLocation, newLocation, orientation);
-        boolean insignificantMove = oldLocation != null
-                && UtilFunctions.distanceBetweenPoints(oldLocation, newLocation) < 0.18;
-        boolean insignificantRotation = directionMarker != null
-                && absoluteBearingDelta(lastDirectionDegrees, resolvedDirection) < 2.5f;
-        this.currentLocation = newLocation;
-
-        if (insignificantMove && insignificantRotation) {
-            if (indoorMapManager != null) {
-                indoorMapManager.setCurrentLocation(newLocation);
-                syncDisplayedFloor();
-                setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
-            }
-            updateTrackHistory(newLocation);
-            return newLocation;
-        }
-
-        if (directionMarker == null) {
-            updateDirectionMarker(newLocation, resolvedDirection);
-            gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(newLocation, 19f));
-            lastCameraLocation = newLocation;
-            lastCameraUpdateMs = SystemClock.elapsedRealtime();
-        } else {
-            updateDirectionMarker(newLocation, resolvedDirection);
-            long now = SystemClock.elapsedRealtime();
-            boolean movedEnough = lastCameraLocation == null
-                    || UtilFunctions.distanceBetweenPoints(lastCameraLocation, newLocation)
-                    >= CAMERA_RECENTER_DISTANCE_METERS;
-            if (movedEnough && now - lastCameraUpdateMs >= CAMERA_RECENTER_INTERVAL_MS) {
-                gMap.moveCamera(CameraUpdateFactory.newLatLng(newLocation));
-                lastCameraLocation = newLocation;
-                lastCameraUpdateMs = now;
-            }
-        }
-
-        // Update indoor map overlay
+        LatLng displayLocation = newLocation;
         if (indoorMapManager != null) {
             indoorMapManager.setCurrentLocation(newLocation);
             syncDisplayedFloor();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
+            displayLocation = indoorMapManager.constrainPositionToLegalSpace(oldLocation, newLocation);
+            indoorMapManager.setCurrentLocation(displayLocation);
         }
-        updateTrackHistory(newLocation);
-        return newLocation;
+
+        float resolvedDirection = resolveDisplayDirection(oldLocation, displayLocation, orientation);
+        boolean insignificantMove = oldLocation != null
+                && UtilFunctions.distanceBetweenPoints(oldLocation, displayLocation) < 0.18;
+        boolean insignificantRotation = directionMarker != null
+                && absoluteBearingDelta(lastDirectionDegrees, resolvedDirection) < 2.5f;
+        this.currentLocation = displayLocation;
+
+        if (insignificantMove && insignificantRotation) {
+            updateTrackHistory(displayLocation);
+            return displayLocation;
+        }
+
+        if (directionMarker == null) {
+            updateDirectionMarker(displayLocation, resolvedDirection);
+            gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(displayLocation, 19f));
+            lastCameraLocation = displayLocation;
+            lastCameraUpdateMs = SystemClock.elapsedRealtime();
+        } else {
+            updateDirectionMarker(displayLocation, resolvedDirection);
+            long now = SystemClock.elapsedRealtime();
+            boolean movedEnough = lastCameraLocation == null
+                    || UtilFunctions.distanceBetweenPoints(lastCameraLocation, displayLocation)
+                    >= CAMERA_RECENTER_DISTANCE_METERS;
+            if (movedEnough && now - lastCameraUpdateMs >= CAMERA_RECENTER_INTERVAL_MS) {
+                gMap.moveCamera(CameraUpdateFactory.newLatLng(displayLocation));
+                lastCameraLocation = displayLocation;
+                lastCameraUpdateMs = now;
+            }
+        }
+
+        updateTrackHistory(displayLocation);
+        return displayLocation;
     }
 
     public boolean isRenderSurfaceReady() {
@@ -734,7 +731,7 @@ public class TrajectoryMapFragment extends Fragment {
 
         if (userTrackHistory.isEmpty()) {
             userTrackHistory.add(location);
-            polyline.setPoints(new ArrayList<>(userTrackHistory));
+            refreshDisplayedTrackPolyline();
             return;
         }
 
@@ -744,7 +741,7 @@ public class TrajectoryMapFragment extends Fragment {
 
         if (distanceMeters <= TRACK_REPLACE_DISTANCE_METERS) {
             userTrackHistory.set(lastIndex, location);
-            polyline.setPoints(new ArrayList<>(userTrackHistory));
+            refreshDisplayedTrackPolyline();
             return;
         }
 
@@ -754,12 +751,12 @@ public class TrajectoryMapFragment extends Fragment {
             while (userTrackHistory.size() > MAX_TRACK_HISTORY_POINTS) {
                 userTrackHistory.remove(0);
             }
-            polyline.setPoints(new ArrayList<>(userTrackHistory));
+            refreshDisplayedTrackPolyline();
             return;
         }
 
         userTrackHistory.set(lastIndex, location);
-        polyline.setPoints(new ArrayList<>(userTrackHistory));
+        refreshDisplayedTrackPolyline();
     }
 
     private void clearTrackHistory() {
@@ -767,6 +764,16 @@ public class TrajectoryMapFragment extends Fragment {
         if (polyline != null) {
             polyline.setPoints(Collections.emptyList());
         }
+    }
+
+    private void refreshDisplayedTrackPolyline() {
+        if (polyline == null) {
+            return;
+        }
+        List<LatLng> displayPath = indoorMapManager == null
+                ? new ArrayList<>(userTrackHistory)
+                : indoorMapManager.buildLegalDisplayPath(userTrackHistory);
+        polyline.setPoints(displayPath);
     }
 
     private float absoluteBearingDelta(float first, float second) {

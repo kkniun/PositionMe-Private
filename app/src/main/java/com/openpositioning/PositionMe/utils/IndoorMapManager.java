@@ -3,6 +3,7 @@ package com.openpositioning.PositionMe.utils;
 import android.graphics.Color;
 import android.util.Log;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.google.android.gms.maps.GoogleMap;
@@ -74,6 +75,8 @@ public class IndoorMapManager {
     private static final double MAX_ROUTE_DETOUR_FACTOR = 2.4;
     private static final double MAX_ROUTE_DETOUR_METERS = 18.0;
     private static final double INTERIOR_NODE_PULL_RATIO = 0.28;
+    private static final double WALL_PROJECTION_MAX_METERS = 6.0;
+    private static final double WALL_EXIT_OFFSET_METERS = 0.12;
 
     private int cachedRouteFloor = Integer.MIN_VALUE;
     private List<LatLng> cachedRouteNodes = new ArrayList<>();
@@ -252,6 +255,44 @@ public class IndoorMapManager {
             }
         }
         return safe;
+    }
+
+    /**
+     * Constrains the live user position to the nearest legal point on the current floor.
+     *
+     * <p>If the new point would move through a wall, the point is clipped to the last legal
+     * boundary along that segment. If the point still ends up inside a wall polygon, it is
+     * projected to the nearest wall edge with a minimal outward offset.</p>
+     */
+    public LatLng constrainPositionToLegalSpace(@Nullable LatLng previousLocation,
+                                                @Nullable LatLng candidateLocation) {
+        if (!isIndoorMapSet || currentFloorShapes == null || candidateLocation == null) {
+            return candidateLocation;
+        }
+
+        LatLng corrected = candidateLocation;
+        if (previousLocation != null && isBlocked(previousLocation, corrected)) {
+            corrected = constrainToLegalPath(previousLocation, corrected);
+        }
+
+        if (isInsideWall(corrected)) {
+            LatLng projected = projectToNearestWallBoundary(candidateLocation);
+            if (projected != null) {
+                corrected = projected;
+            }
+            if (isInsideWall(corrected)) {
+                LatLng snapped = snapRouteEndpoint(candidateLocation, getRouteNodes());
+                if (snapped != null) {
+                    corrected = snapped;
+                }
+            }
+        }
+
+        if (previousLocation != null && isBlocked(previousLocation, corrected)) {
+            corrected = constrainToLegalPath(previousLocation, corrected);
+        }
+
+        return corrected;
     }
 
     /**
@@ -893,6 +934,77 @@ public class IndoorMapManager {
         return new LatLng(
                 start.latitude + (end.latitude - start.latitude) * ratio,
                 start.longitude + (end.longitude - start.longitude) * ratio
+        );
+    }
+
+    @Nullable
+    private LatLng projectToNearestWallBoundary(@NonNull LatLng rawPoint) {
+        FloorplanApiClient.FloorShapes floor = currentFloorShapes.get(currentFloor);
+        LatLng nearestBoundary = null;
+        double nearestDistanceMeters = Double.MAX_VALUE;
+
+        for (FloorplanApiClient.MapShapeFeature feature : floor.getFeatures()) {
+            if (!"wall".equals(feature.getIndoorType())) {
+                continue;
+            }
+
+            boolean polygonGeometry = isPolygonGeometry(feature.getGeometryType());
+            for (List<LatLng> part : feature.getParts()) {
+                if (part == null || part.size() < 2) {
+                    continue;
+                }
+
+                int segmentCount = polygonGeometry ? part.size() : part.size() - 1;
+                for (int i = 0; i < segmentCount; i++) {
+                    LatLng segStart = part.get(i);
+                    LatLng segEnd = part.get((i + 1) % part.size());
+                    LatLng boundaryPoint = projectPointOntoSegment(rawPoint, segStart, segEnd);
+                    double distanceMeters = UtilFunctions.distanceBetweenPoints(rawPoint, boundaryPoint);
+                    if (distanceMeters < nearestDistanceMeters) {
+                        nearestDistanceMeters = distanceMeters;
+                        nearestBoundary = boundaryPoint;
+                    }
+                }
+            }
+        }
+
+        if (nearestBoundary == null || nearestDistanceMeters > WALL_PROJECTION_MAX_METERS) {
+            return null;
+        }
+        return offsetBeyondBoundary(rawPoint, nearestBoundary, WALL_EXIT_OFFSET_METERS);
+    }
+
+    private LatLng projectPointOntoSegment(LatLng point, LatLng segStart, LatLng segEnd) {
+        double cosLat = Math.cos(Math.toRadians(point.latitude));
+        double ax = (segStart.longitude - point.longitude) * 111_111d * cosLat;
+        double ay = (segStart.latitude - point.latitude) * 111_111d;
+        double bx = (segEnd.longitude - point.longitude) * 111_111d * cosLat;
+        double by = (segEnd.latitude - point.latitude) * 111_111d;
+        double abx = bx - ax;
+        double aby = by - ay;
+        double abSquared = abx * abx + aby * aby;
+        if (abSquared <= 1e-9) {
+            return segStart;
+        }
+
+        double projection = -(ax * abx + ay * aby) / abSquared;
+        projection = Math.max(0d, Math.min(1d, projection));
+        return new LatLng(
+                segStart.latitude + (segEnd.latitude - segStart.latitude) * projection,
+                segStart.longitude + (segEnd.longitude - segStart.longitude) * projection
+        );
+    }
+
+    private LatLng offsetBeyondBoundary(LatLng fromInside, LatLng boundaryPoint, double extraMeters) {
+        double distanceMeters = UtilFunctions.distanceBetweenPoints(fromInside, boundaryPoint);
+        if (distanceMeters <= 0.01d) {
+            return boundaryPoint;
+        }
+
+        double ratio = (distanceMeters + extraMeters) / distanceMeters;
+        return new LatLng(
+                fromInside.latitude + (boundaryPoint.latitude - fromInside.latitude) * ratio,
+                fromInside.longitude + (boundaryPoint.longitude - fromInside.longitude) * ratio
         );
     }
 
