@@ -15,6 +15,7 @@ public class IndoorFloorController {
     private static final double STAIRS_HORIZONTAL_MIN_METERS = 1.8;
     private static final double WIFI_FLOOR_TOLERANCE = 1.0;
     private static final float FLOOR_CHANGE_TRIGGER_RATIO = 0.48f;
+    private static final float ABSOLUTE_ELEVATION_SWITCH_METERS = 4.0f;
 
     private final IndoorSpatialConstraintModel spatialModel;
 
@@ -71,7 +72,10 @@ public class IndoorFloorController {
             return null;
         }
 
-        boolean strongVerticalCue = Math.abs(elevationDelta) >= floorHeight * FLOOR_CHANGE_TRIGGER_RATIO;
+        boolean absoluteElevationOverride =
+                Math.abs(elevationDelta) >= ABSOLUTE_ELEVATION_SWITCH_METERS;
+        boolean strongVerticalCue = absoluteElevationOverride
+                || Math.abs(elevationDelta) >= floorHeight * FLOOR_CHANGE_TRIGGER_RATIO;
         if (!strongVerticalCue) {
             return null;
         }
@@ -93,7 +97,7 @@ public class IndoorFloorController {
 
         boolean liftLike = nearLift && (elevatorHint || horizontalMovement <= LIFT_HORIZONTAL_MAX_METERS);
         boolean stairsLike = nearStairs && horizontalMovement >= STAIRS_HORIZONTAL_MIN_METERS;
-        if (!liftLike && !stairsLike) {
+        if (!liftLike && !stairsLike && !absoluteElevationOverride) {
             return null;
         }
 
