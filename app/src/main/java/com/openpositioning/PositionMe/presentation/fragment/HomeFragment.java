@@ -168,7 +168,10 @@ public class HomeFragment extends Fragment {
         float[] gnss = sensorFusion.getSensorValueMap().get(SensorTypes.GNSSLATLONG);
         if (gnss != null && (gnss[0] != 0f || gnss[1] != 0f)) {
             LatLng gnssPosition = new LatLng(gnss[0], gnss[1]);
-            trajectoryMapFragment.setInitialCameraPosition(gnssPosition);
+            trajectoryMapFragment.updateUserLocation(
+                    gnssPosition,
+                    (float) Math.toDegrees(sensorFusion.passOrientation())
+            );
             requestNearbyFloorplanIfNeeded(gnssPosition);
             gnssStatusTextView.setText(R.string.auto_init_waiting);
             gnssStatusTextView.setVisibility(View.VISIBLE);

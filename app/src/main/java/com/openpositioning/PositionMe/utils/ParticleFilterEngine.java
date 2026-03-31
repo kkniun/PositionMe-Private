@@ -27,13 +27,13 @@ public class ParticleFilterEngine {
         WIFI
     }
 
-    private static final int PARTICLE_COUNT = 320;
+    private static final int PARTICLE_COUNT = 240;
     private static final int MAX_TAIL_SIZE = 5;
     private static final int MAX_HISTORY_SIZE = 600;
     private static final long MIN_HISTORY_INTERVAL_MS = 1_000L;
     private static final double MIN_HISTORY_DISTANCE_METERS = 0.6;
     private static final double MAX_STEP_METERS = 2.5;
-    private static final double MIN_INIT_CONFIDENCE = 0.55;
+    private static final double MIN_INIT_CONFIDENCE = 0.40;
     private static final double RESAMPLE_THRESHOLD_RATIO = 0.48;
     private static final double WIFI_FLOOR_SIGMA = 0.9;
     private static final double FLOOR_MODE_SWITCH_DOMINANCE = 0.46;

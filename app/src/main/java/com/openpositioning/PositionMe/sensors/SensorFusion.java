@@ -14,6 +14,7 @@ import android.os.SystemClock;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.preference.PreferenceManager;
 
 import com.google.android.gms.maps.model.LatLng;
@@ -506,7 +507,7 @@ public class SensorFusion implements SensorEventListener {
      * Returns true once the system has auto-initialised from a reliable GNSS/WiFi observation.
      */
     public boolean hasAutomaticStartFix() {
-        return particleFilterEngine != null && particleFilterEngine.isInitialized();
+        return getBestAvailableStartPosition() != null;
     }
 
     /**
@@ -604,23 +605,37 @@ public class SensorFusion implements SensorEventListener {
      * Copies the auto-initialised fused position into trajectory metadata fields.
      */
     public boolean prepareAutomaticStart() {
-        LatLng fusedPosition = getCurrentFusedPosition();
-        if (fusedPosition == null) {
+        LatLng startPosition = getBestAvailableStartPosition();
+        if (startPosition == null) {
             return false;
         }
 
         setStartGNSSLatitude(new float[]{
-                (float) fusedPosition.latitude,
-                (float) fusedPosition.longitude
+                (float) startPosition.latitude,
+                (float) startPosition.longitude
         });
 
         if (getSelectedBuildingId() == null || getSelectedBuildingId().isEmpty()) {
-            String inferredBuilding = inferBuildingIdForPosition(fusedPosition);
+            String inferredBuilding = inferBuildingIdForPosition(startPosition);
             if (inferredBuilding != null) {
                 setSelectedBuildingId(inferredBuilding);
             }
         }
         return true;
+    }
+
+    @Nullable
+    private LatLng getBestAvailableStartPosition() {
+        LatLng fusedPosition = getCurrentFusedPosition();
+        if (fusedPosition != null) {
+            return fusedPosition;
+        }
+
+        float[] gnssPosition = getGNSSLatitude(false);
+        if (gnssPosition != null && (gnssPosition[0] != 0f || gnssPosition[1] != 0f)) {
+            return new LatLng(gnssPosition[0], gnssPosition[1]);
+        }
+        return null;
     }
 
     /**

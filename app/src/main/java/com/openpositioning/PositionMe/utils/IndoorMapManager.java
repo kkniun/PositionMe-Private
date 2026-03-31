@@ -275,6 +275,16 @@ public class IndoorMapManager {
         return routedPath;
     }
 
+    public List<LatLng> buildLegalDisplaySegment(@Nullable LatLng start, @Nullable LatLng end) {
+        if (start == null || end == null) {
+            return Collections.emptyList();
+        }
+        List<LatLng> routedSegment = new ArrayList<>();
+        routedSegment.add(start);
+        appendLegalSegment(routedSegment, start, end);
+        return routedSegment;
+    }
+
     /**
      * Returns true if the point lies inside or close to the requested indoor feature type.
      */

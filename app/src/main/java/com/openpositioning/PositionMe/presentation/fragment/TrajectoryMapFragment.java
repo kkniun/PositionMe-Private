@@ -68,6 +68,8 @@ public class TrajectoryMapFragment extends Fragment {
 
     private static final float DIRECTION_MARKER_SIZE_DP = 18f;
     private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
+    private static final double CAMERA_RECENTER_DISTANCE_METERS = 4.0;
+    private static final long CAMERA_RECENTER_INTERVAL_MS = 1_500L;
     private GoogleMap gMap; // Google Maps instance
     private LatLng currentLocation; // Stores the user's current location
     private Marker directionMarker; // Current user direction arrow
@@ -89,6 +91,12 @@ public class TrajectoryMapFragment extends Fragment {
     private IndoorMapManager indoorMapManager; // Manages indoor mapping
     private SensorFusion sensorFusion;
     private float lastDirectionDegrees = 0f;
+    private LatLng lastCameraLocation;
+    private long lastCameraUpdateMs;
+    private int lastRenderedRawHistorySize;
+    private LatLng lastRenderedRawLastPoint;
+    private int lastRenderedLogicalFloor = Integer.MIN_VALUE;
+    private final List<LatLng> cachedDisplayHistory = new ArrayList<>();
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
@@ -314,22 +322,20 @@ public class TrajectoryMapFragment extends Fragment {
         if (directionMarker == null) {
             updateDirectionMarker(newLocation, resolvedDirection);
             gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(newLocation, 19f));
+            lastCameraLocation = newLocation;
+            lastCameraUpdateMs = SystemClock.elapsedRealtime();
         } else {
             updateDirectionMarker(newLocation, resolvedDirection);
-            gMap.moveCamera(CameraUpdateFactory.newLatLng(newLocation));
-        }
-
-        if (polyline != null) {
-            List<LatLng> points = new ArrayList<>(polyline.getPoints());
-            if (oldLocation == null) {
-                points.add(newLocation);
-                polyline.setPoints(points);
-            } else if (!oldLocation.equals(newLocation)) {
-                points.add(newLocation);
-                polyline.setPoints(points);
+            long now = SystemClock.elapsedRealtime();
+            boolean movedEnough = lastCameraLocation == null
+                    || UtilFunctions.distanceBetweenPoints(lastCameraLocation, newLocation)
+                    >= CAMERA_RECENTER_DISTANCE_METERS;
+            if (movedEnough && now - lastCameraUpdateMs >= CAMERA_RECENTER_INTERVAL_MS) {
+                gMap.moveCamera(CameraUpdateFactory.newLatLng(newLocation));
+                lastCameraLocation = newLocation;
+                lastCameraUpdateMs = now;
             }
         }
-
 
         // Update indoor map overlay
         if (indoorMapManager != null) {
@@ -438,12 +444,60 @@ public class TrajectoryMapFragment extends Fragment {
         if (polyline == null) return;
         if (fusedHistory == null) {
             polyline.setPoints(Collections.emptyList());
+            cachedDisplayHistory.clear();
+            lastRenderedRawHistorySize = 0;
+            lastRenderedRawLastPoint = null;
+            lastRenderedLogicalFloor = Integer.MIN_VALUE;
             return;
         }
         if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
-            polyline.setPoints(indoorMapManager.buildLegalDisplayPath(fusedHistory));
+            int currentLogicalFloor = indoorMapManager.getCurrentLogicalFloor();
+            boolean needFullRebuild = cachedDisplayHistory.isEmpty()
+                    || fusedHistory.isEmpty()
+                    || fusedHistory.size() < lastRenderedRawHistorySize
+                    || lastRenderedRawHistorySize == 0
+                    || lastRenderedLogicalFloor != currentLogicalFloor
+                    || lastRenderedRawLastPoint == null
+                    || UtilFunctions.distanceBetweenPoints(
+                    lastRenderedRawLastPoint,
+                    fusedHistory.get(lastRenderedRawHistorySize - 1)
+            ) > 0.25;
+
+            if (needFullRebuild) {
+                cachedDisplayHistory.clear();
+                cachedDisplayHistory.addAll(indoorMapManager.buildLegalDisplayPath(fusedHistory));
+            } else {
+                for (int i = lastRenderedRawHistorySize; i < fusedHistory.size(); i++) {
+                    LatLng previous = fusedHistory.get(i - 1);
+                    LatLng current = fusedHistory.get(i);
+                    List<LatLng> segment = indoorMapManager.buildLegalDisplaySegment(previous, current);
+                    for (int j = 1; j < segment.size(); j++) {
+                        LatLng candidate = segment.get(j);
+                        if (cachedDisplayHistory.isEmpty()
+                                || UtilFunctions.distanceBetweenPoints(
+                                cachedDisplayHistory.get(cachedDisplayHistory.size() - 1),
+                                candidate
+                        ) >= 0.1) {
+                            cachedDisplayHistory.add(candidate);
+                        }
+                    }
+                }
+            }
+
+            lastRenderedRawHistorySize = fusedHistory.size();
+            lastRenderedRawLastPoint = fusedHistory.isEmpty()
+                    ? null
+                    : fusedHistory.get(fusedHistory.size() - 1);
+            lastRenderedLogicalFloor = currentLogicalFloor;
+            polyline.setPoints(cachedDisplayHistory);
             return;
         }
+        cachedDisplayHistory.clear();
+        lastRenderedRawHistorySize = fusedHistory.size();
+        lastRenderedRawLastPoint = fusedHistory.isEmpty()
+                ? null
+                : fusedHistory.get(fusedHistory.size() - 1);
+        lastRenderedLogicalFloor = Integer.MIN_VALUE;
         polyline.setPoints(fusedHistory);
     }
 
@@ -499,6 +553,12 @@ public class TrajectoryMapFragment extends Fragment {
         lastGnssLocation = null;
         currentLocation  = null;
         lastDirectionDegrees = 0f;
+        lastCameraLocation = null;
+        lastCameraUpdateMs = 0L;
+        lastRenderedRawHistorySize = 0;
+        lastRenderedRawLastPoint = null;
+        lastRenderedLogicalFloor = Integer.MIN_VALUE;
+        cachedDisplayHistory.clear();
 
         // Clear test point markers
         for (com.google.android.gms.maps.model.Marker m : testPointMarkers) {

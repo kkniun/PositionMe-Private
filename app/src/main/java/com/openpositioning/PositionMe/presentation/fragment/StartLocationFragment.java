@@ -553,9 +553,9 @@ public class StartLocationFragment extends Fragment {
 
     private LatLng resolveInitialMapPosition() {
         if (!manualSelectionEnabled) {
-            LatLng fusedPosition = sensorFusion.getCurrentFusedPosition();
-            if (fusedPosition != null) {
-                return fusedPosition;
+            LatLng automaticPosition = getBestAutomaticPreviewPosition();
+            if (automaticPosition != null) {
+                return automaticPosition;
             }
         }
 
@@ -572,25 +572,25 @@ public class StartLocationFragment extends Fragment {
             return;
         }
 
-        LatLng fusedPosition = sensorFusion.getCurrentFusedPosition();
-        if (fusedPosition == null) {
+        LatLng automaticPosition = getBestAutomaticPreviewPosition();
+        if (automaticPosition == null) {
             button.setEnabled(false);
             instructionText.setText(R.string.auto_init_waiting);
             return;
         }
 
-        updateStartMarker(fusedPosition, true);
+        updateStartMarker(automaticPosition, true);
         button.setEnabled(true);
 
         boolean shouldRefreshFloorplan = lastFloorplanRequestPosition == null
                 || UtilFunctions.distanceBetweenPoints(
                 lastFloorplanRequestPosition,
-                fusedPosition
+                automaticPosition
         ) >= FLOORPLAN_REFRESH_DISTANCE_METERS;
         if (shouldRefreshFloorplan) {
             requestBuildingData();
         } else {
-            autoSelectBuildingForPosition(fusedPosition);
+            autoSelectBuildingForPosition(automaticPosition);
         }
 
         if (selectedBuildingId != null && !selectedBuildingId.isEmpty()) {
@@ -603,6 +603,20 @@ public class StartLocationFragment extends Fragment {
         } else {
             instructionText.setText(R.string.auto_init_ready);
         }
+    }
+
+    @Nullable
+    private LatLng getBestAutomaticPreviewPosition() {
+        LatLng fusedPosition = sensorFusion.getCurrentFusedPosition();
+        if (fusedPosition != null) {
+            return fusedPosition;
+        }
+
+        float[] gnssPosition = sensorFusion.getGNSSLatitude(false);
+        if (gnssPosition[0] != 0f || gnssPosition[1] != 0f) {
+            return new LatLng(gnssPosition[0], gnssPosition[1]);
+        }
+        return null;
     }
 
     private void updateStartMarker(LatLng autoPosition, boolean animateCamera) {
