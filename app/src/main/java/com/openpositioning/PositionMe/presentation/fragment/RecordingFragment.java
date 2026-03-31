@@ -262,7 +262,6 @@ public class RecordingFragment extends Fragment {
                     (float) Math.toDegrees(sensorFusion.passOrientation())
             );
             if (displayedLocation != null) {
-                sensorFusion.applyMapConstrainedPosition(displayedLocation);
                 if (previousDisplayedLocation != null) {
                     distance += UtilFunctions.distanceBetweenPoints(
                             previousDisplayedLocation,

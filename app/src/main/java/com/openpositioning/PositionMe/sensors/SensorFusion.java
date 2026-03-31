@@ -830,7 +830,11 @@ public class SensorFusion implements SensorEventListener {
      * @return current floor number.
      */
     public int getWifiFloor() {
-        return wifiPositionManager.getWifiFloor();
+        int observedFloor = wifiPositionManager.getWifiFloor();
+        if (particleFilterEngine != null && particleFilterEngine.isIndoorContextActive()) {
+            return particleFilterEngine.normalizeObservedFloor(observedFloor);
+        }
+        return observedFloor;
     }
 
     /**

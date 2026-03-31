@@ -10,12 +10,15 @@ import com.google.android.gms.maps.model.LatLng;
 public class IndoorFloorController {
 
     private static final long FLOOR_CHANGE_DEBOUNCE_MS = 2_500L;
+    private static final long TRANSITION_ZONE_LATCH_MS = 6_000L;
     private static final double TRANSITION_ZONE_RADIUS_METERS = 6.0;
     private static final double LIFT_HORIZONTAL_MAX_METERS = 2.0;
-    private static final double STAIRS_HORIZONTAL_MIN_METERS = 1.8;
+    private static final double STAIRS_HORIZONTAL_MIN_METERS = 0.8;
     private static final double WIFI_FLOOR_TOLERANCE = 1.0;
-    private static final float FLOOR_CHANGE_TRIGGER_RATIO = 0.48f;
+    private static final float FLOOR_CHANGE_TRIGGER_RATIO = 0.38f;
+    private static final float MIN_VERTICAL_CHANGE_METERS = 2.4f;
     private static final float ABSOLUTE_ELEVATION_SWITCH_METERS = 4.0f;
+    private static final int MAX_EVALUATED_FLOOR_JUMP = 2;
 
     private final IndoorSpatialConstraintModel spatialModel;
 
@@ -24,6 +27,7 @@ public class IndoorFloorController {
     private int baselineLogicalFloor;
     private int lastCandidateFloor = Integer.MIN_VALUE;
     private long lastCandidateSinceMs;
+    private long lastTransitionZoneSeenMs;
 
     public IndoorFloorController(IndoorSpatialConstraintModel spatialModel) {
         this.spatialModel = spatialModel;
@@ -35,6 +39,7 @@ public class IndoorFloorController {
         baselineLogicalFloor = 0;
         lastCandidateFloor = Integer.MIN_VALUE;
         lastCandidateSinceMs = 0L;
+        lastTransitionZoneSeenMs = 0L;
     }
 
     @Nullable
@@ -63,8 +68,8 @@ public class IndoorFloorController {
         }
 
         float elevationDelta = elevationMeters - baselineElevation;
-        int floorDelta = Math.round(elevationDelta / floorHeight);
-        if (floorDelta == 0) {
+        float absoluteElevationDelta = Math.abs(elevationDelta);
+        if (absoluteElevationDelta < Math.max(MIN_VERTICAL_CHANGE_METERS * 0.35f, 0.8f)) {
             if (baselineLocation != null
                     && UtilFunctions.distanceBetweenPoints(baselineLocation, currentPosition) > 10.0) {
                 seedBaseline(currentPosition, elevationMeters);
@@ -73,37 +78,56 @@ public class IndoorFloorController {
         }
 
         boolean absoluteElevationOverride =
-                Math.abs(elevationDelta) >= ABSOLUTE_ELEVATION_SWITCH_METERS;
+                absoluteElevationDelta >= ABSOLUTE_ELEVATION_SWITCH_METERS;
         boolean strongVerticalCue = absoluteElevationOverride
-                || Math.abs(elevationDelta) >= floorHeight * FLOOR_CHANGE_TRIGGER_RATIO;
+                || absoluteElevationDelta >= Math.max(
+                        MIN_VERTICAL_CHANGE_METERS,
+                        floorHeight * FLOOR_CHANGE_TRIGGER_RATIO
+                );
         if (!strongVerticalCue) {
             return null;
         }
 
-        boolean nearLift = spatialModel.isNearFeature(
-                currentPosition,
-                "lift",
-                TRANSITION_ZONE_RADIUS_METERS
-        );
-        boolean nearStairs = spatialModel.isNearFeature(
-                currentPosition,
-                "stairs",
-                TRANSITION_ZONE_RADIUS_METERS
-        );
+        boolean nearLift = isNearTransitionFeature(currentPosition, "lift");
+        boolean nearStairs = isNearTransitionFeature(currentPosition, "stairs");
+        if (nearLift || nearStairs) {
+            lastTransitionZoneSeenMs = timestampMillis;
+        }
+        boolean inLatchedTransitionWindow =
+                timestampMillis - lastTransitionZoneSeenMs <= TRANSITION_ZONE_LATCH_MS;
 
         double horizontalMovement = baselineLocation == null
                 ? 0d
                 : UtilFunctions.distanceBetweenPoints(baselineLocation, currentPosition);
 
-        boolean liftLike = nearLift && (elevatorHint || horizontalMovement <= LIFT_HORIZONTAL_MAX_METERS);
-        boolean stairsLike = nearStairs && horizontalMovement >= STAIRS_HORIZONTAL_MIN_METERS;
+        boolean liftLike = (nearLift || inLatchedTransitionWindow)
+                && (elevatorHint || horizontalMovement <= LIFT_HORIZONTAL_MAX_METERS);
+        boolean stairsLike = (nearStairs || inLatchedTransitionWindow)
+                && horizontalMovement >= STAIRS_HORIZONTAL_MIN_METERS;
         if (!liftLike && !stairsLike && !absoluteElevationOverride) {
             return null;
         }
 
-        int candidateFloor = baselineLogicalFloor + floorDelta;
+        int floorStepMagnitude = Math.max(
+                1,
+                Math.min(
+                        MAX_EVALUATED_FLOOR_JUMP,
+                        Math.round(absoluteElevationDelta / floorHeight)
+                )
+        );
+        int floorDelta = elevationDelta >= 0f ? floorStepMagnitude : -floorStepMagnitude;
+        int candidateFloor = spatialModel.clampLogicalFloor(
+                spatialModel.getCurrentBuildingId(),
+                baselineLogicalFloor + floorDelta
+        );
         if (wifiFloor != null && Math.abs(wifiFloor - candidateFloor) <= WIFI_FLOOR_TOLERANCE) {
-            candidateFloor = wifiFloor;
+            candidateFloor = spatialModel.clampLogicalFloor(
+                    spatialModel.getCurrentBuildingId(),
+                    wifiFloor
+            );
+        }
+        if (candidateFloor == spatialModel.getCurrentLogicalFloor()) {
+            return null;
         }
 
         if (candidateFloor != lastCandidateFloor) {
@@ -120,7 +144,25 @@ public class IndoorFloorController {
         seedBaseline(currentPosition, elevationMeters);
         lastCandidateFloor = Integer.MIN_VALUE;
         lastCandidateSinceMs = 0L;
+        lastTransitionZoneSeenMs = timestampMillis;
         return spatialModel.getCurrentLogicalFloor();
+    }
+
+    private boolean isNearTransitionFeature(LatLng currentPosition, String indoorType) {
+        String buildingId = spatialModel.getCurrentBuildingId();
+        int currentFloor = spatialModel.getCurrentLogicalFloor();
+        for (int floor = currentFloor - 1; floor <= currentFloor + 1; floor++) {
+            if (spatialModel.isNearFeature(
+                    currentPosition,
+                    indoorType,
+                    TRANSITION_ZONE_RADIUS_METERS,
+                    buildingId,
+                    floor
+            )) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void seedBaseline(LatLng currentPosition, float elevationMeters) {

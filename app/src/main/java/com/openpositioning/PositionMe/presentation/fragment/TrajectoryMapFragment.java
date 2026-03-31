@@ -308,28 +308,24 @@ public class TrajectoryMapFragment extends Fragment {
 
         // Keep track of current location
         LatLng oldLocation = this.currentLocation;
-        LatLng constrainedLocation = newLocation;
-        if (indoorMapManager != null && oldLocation != null) {
-            constrainedLocation = indoorMapManager.constrainToLegalPath(oldLocation, newLocation);
-        }
-        this.currentLocation = constrainedLocation;
-        float resolvedDirection = resolveDisplayDirection(oldLocation, constrainedLocation, orientation);
+        this.currentLocation = newLocation;
+        float resolvedDirection = resolveDisplayDirection(oldLocation, newLocation, orientation);
 
         if (directionMarker == null) {
-            updateDirectionMarker(constrainedLocation, resolvedDirection);
-            gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(constrainedLocation, 19f));
+            updateDirectionMarker(newLocation, resolvedDirection);
+            gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(newLocation, 19f));
         } else {
-            updateDirectionMarker(constrainedLocation, resolvedDirection);
-            gMap.moveCamera(CameraUpdateFactory.newLatLng(constrainedLocation));
+            updateDirectionMarker(newLocation, resolvedDirection);
+            gMap.moveCamera(CameraUpdateFactory.newLatLng(newLocation));
         }
 
         if (polyline != null) {
             List<LatLng> points = new ArrayList<>(polyline.getPoints());
             if (oldLocation == null) {
-                points.add(constrainedLocation);
+                points.add(newLocation);
                 polyline.setPoints(points);
-            } else if (!oldLocation.equals(constrainedLocation)) {
-                points.add(constrainedLocation);
+            } else if (!oldLocation.equals(newLocation)) {
+                points.add(newLocation);
                 polyline.setPoints(points);
             }
         }
@@ -337,14 +333,14 @@ public class TrajectoryMapFragment extends Fragment {
 
         // Update indoor map overlay
         if (indoorMapManager != null) {
-            indoorMapManager.setCurrentLocation(constrainedLocation);
+            indoorMapManager.setCurrentLocation(newLocation);
             if (sensorFusion != null && sensorFusion.isIndoorContextActive()) {
                 indoorMapManager.setCurrentFloor(sensorFusion.getCurrentLogicalFloor(), true);
                 updateFloorLabel();
             }
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
         }
-        return constrainedLocation;
+        return newLocation;
     }
 
 
@@ -440,8 +436,15 @@ public class TrajectoryMapFragment extends Fragment {
 
     public void renderFusedHistory(@Nullable List<LatLng> fusedHistory) {
         if (polyline == null) return;
-        polyline.setPoints(fusedHistory == null ? Collections.emptyList() : fusedHistory);
-        updateDirectionFromHistory(fusedHistory);
+        if (fusedHistory == null) {
+            polyline.setPoints(Collections.emptyList());
+            return;
+        }
+        if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
+            polyline.setPoints(indoorMapManager.buildLegalDisplayPath(fusedHistory));
+            return;
+        }
+        polyline.setPoints(fusedHistory);
     }
 
     public void renderObservationTails(@Nullable List<LatLng> gnssTrail,
@@ -700,6 +703,11 @@ public class TrajectoryMapFragment extends Fragment {
     private float resolveDisplayDirection(@Nullable LatLng previousLocation,
                                           @NonNull LatLng currentLocation,
                                           float fallbackOrientationDegrees) {
+        if (!Float.isNaN(fallbackOrientationDegrees)) {
+            lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
+            return lastDirectionDegrees;
+        }
+
         if (previousLocation != null
                 && UtilFunctions.distanceBetweenPoints(previousLocation, currentLocation)
                 >= MIN_DIRECTION_DISTANCE_METERS) {
@@ -711,11 +719,6 @@ public class TrajectoryMapFragment extends Fragment {
             return lastDirectionDegrees;
         }
 
-        if (Float.isNaN(fallbackOrientationDegrees)) {
-            return lastDirectionDegrees;
-        }
-
-        lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
         return lastDirectionDegrees;
     }
 

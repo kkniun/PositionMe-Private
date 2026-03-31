@@ -132,6 +132,10 @@ public class ParticleFilterEngine {
         return latestWifiFloor;
     }
 
+    public synchronized int normalizeObservedFloor(int observedFloor) {
+        return spatialConstraintModel.normalizeExternalFloorObservation(observedFloor);
+    }
+
     public synchronized int getCurrentLogicalFloor() {
         return spatialConstraintModel.getCurrentLogicalFloor();
     }
@@ -257,7 +261,6 @@ public class ParticleFilterEngine {
             return currentLatLng;
         }
 
-        latestWifiFloor = floor;
         double accuracyMeters = floor != 0 ? 7.0 : 8.5;
         double confidence = floor != 0 ? 0.86 : 0.78;
 
@@ -340,12 +343,19 @@ public class ParticleFilterEngine {
                                          double headingRad,
                                          long timestampMillis,
                                          @Nullable Integer floor) {
+        spatialConstraintModel.updatePosition(latLng);
+        Integer normalizedFloor = floor;
+        if (source == ObservationSource.WIFI && floor != null && spatialConstraintModel.hasIndoorContext()) {
+            normalizedFloor = spatialConstraintModel.normalizeExternalFloorObservation(floor);
+            latestWifiFloor = normalizedFloor;
+        }
+
         if (source == ObservationSource.GNSS) {
             appendTail(gnssTail, latLng);
         } else {
             appendTail(wifiTail, latLng);
-            if (floor != null) {
-                latestWifiFloor = floor;
+            if (normalizedFloor != null) {
+                latestWifiFloor = normalizedFloor;
             }
         }
 
@@ -355,15 +365,14 @@ public class ParticleFilterEngine {
             }
 
             reference = new EnuReference(latLng);
-            spatialConstraintModel.updatePosition(latLng);
-            if (floor != null && spatialConstraintModel.hasIndoorContext()) {
-                spatialConstraintModel.setCurrentLogicalFloor(floor);
+            if (normalizedFloor != null && spatialConstraintModel.hasIndoorContext()) {
+                spatialConstraintModel.setCurrentLogicalFloor(normalizedFloor);
             }
             initialiseParticles(
                     accuracyMeters,
                     headingRad,
                     spatialConstraintModel.getCurrentLogicalFloor(),
-                    floor,
+                    normalizedFloor,
                     confidence
             );
             initialized = true;
@@ -380,12 +389,11 @@ public class ParticleFilterEngine {
             return currentLatLng;
         }
 
-        spatialConstraintModel.updatePosition(latLng);
-        if (source == ObservationSource.WIFI && floor != null) {
-            injectFloorHypotheses(floor, confidence);
+        if (source == ObservationSource.WIFI && normalizedFloor != null) {
+            injectFloorHypotheses(normalizedFloor, confidence);
         }
         double[] local = reference.toLocal(latLng);
-        updateWeights(local[0], local[1], accuracyMeters, confidence, source, floor);
+        updateWeights(local[0], local[1], accuracyMeters, confidence, source, normalizedFloor);
 
         if (effectiveParticleCount() < RESAMPLE_THRESHOLD_RATIO * particles.size()) {
             resample();

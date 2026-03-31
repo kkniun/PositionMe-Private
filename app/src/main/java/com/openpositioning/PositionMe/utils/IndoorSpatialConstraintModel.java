@@ -7,6 +7,7 @@ import com.openpositioning.PositionMe.data.remote.FloorplanApiClient;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Core indoor spatial model shared by fusion, map matching and floor control.
@@ -86,6 +87,27 @@ public class IndoorSpatialConstraintModel {
                 logicalToFloorIndex(buildingId, logicalFloor)
         );
         return floorIndexToLogical(buildingId, clampedIndex);
+    }
+
+    public int normalizeExternalFloorObservation(int observedFloor) {
+        return normalizeExternalFloorObservation(currentBuildingId, observedFloor);
+    }
+
+    public int normalizeExternalFloorObservation(@Nullable String buildingId, int observedFloor) {
+        Integer shiftedIndex = findFloorIndexByLogicalFloor(buildingId, observedFloor - 1);
+        Integer exactIndex = findFloorIndexByLogicalFloor(buildingId, observedFloor);
+        boolean hasGroundFloor = findFloorIndexByLogicalFloor(buildingId, 0) != null;
+
+        if (hasGroundFloor && shiftedIndex != null) {
+            return clampLogicalFloor(buildingId, observedFloor - 1);
+        }
+        if (exactIndex != null) {
+            return clampLogicalFloor(buildingId, observedFloor);
+        }
+        if (shiftedIndex != null) {
+            return clampLogicalFloor(buildingId, observedFloor - 1);
+        }
+        return clampLogicalFloor(buildingId, observedFloor);
     }
 
     public float getCurrentFloorHeight() {
@@ -374,10 +396,18 @@ public class IndoorSpatialConstraintModel {
     }
 
     private int logicalToFloorIndex(@Nullable String buildingId, int logicalFloor) {
+        Integer mappedIndex = findFloorIndexByLogicalFloor(buildingId, logicalFloor);
+        if (mappedIndex != null) {
+            return mappedIndex;
+        }
         return logicalFloor + getFloorBias(buildingId);
     }
 
     private int floorIndexToLogical(@Nullable String buildingId, int floorIndex) {
+        Integer mappedLogicalFloor = parseLogicalFloor(buildingId, floorIndex);
+        if (mappedLogicalFloor != null) {
+            return mappedLogicalFloor;
+        }
         return floorIndex - getFloorBias(buildingId);
     }
 
@@ -399,6 +429,102 @@ public class IndoorSpatialConstraintModel {
 
     private int defaultLogicalFloorForBuilding(@Nullable String buildingId) {
         return 0;
+    }
+
+    @Nullable
+    private Integer findFloorIndexByLogicalFloor(@Nullable String buildingId, int logicalFloor) {
+        FloorplanApiClient.BuildingInfo building = getBuilding(buildingId);
+        if (building == null || building.getFloorShapesList() == null) {
+            return null;
+        }
+
+        List<FloorplanApiClient.FloorShapes> floors = building.getFloorShapesList();
+        for (int i = 0; i < floors.size(); i++) {
+            Integer parsedLogical = parseLogicalFloorLabel(
+                    floors.get(i).getDisplayName(),
+                    floors.get(i).getKey()
+            );
+            if (parsedLogical != null && parsedLogical == logicalFloor) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    private Integer parseLogicalFloor(@Nullable String buildingId, int floorIndex) {
+        FloorplanApiClient.BuildingInfo building = getBuilding(buildingId);
+        if (building == null || building.getFloorShapesList() == null
+                || floorIndex < 0 || floorIndex >= building.getFloorShapesList().size()) {
+            return null;
+        }
+
+        FloorplanApiClient.FloorShapes floor = building.getFloorShapesList().get(floorIndex);
+        return parseLogicalFloorLabel(floor.getDisplayName(), floor.getKey());
+    }
+
+    @Nullable
+    private Integer parseLogicalFloorLabel(@Nullable String displayName, @Nullable String fallbackKey) {
+        Integer parsed = parseSingleFloorLabel(displayName);
+        if (parsed != null) {
+            return parsed;
+        }
+        return parseSingleFloorLabel(fallbackKey);
+    }
+
+    @Nullable
+    private Integer parseSingleFloorLabel(@Nullable String rawLabel) {
+        if (rawLabel == null) {
+            return null;
+        }
+
+        String normalized = rawLabel.trim().toUpperCase(Locale.UK);
+        if (normalized.isEmpty()) {
+            return null;
+        }
+
+        normalized = normalized
+                .replace("FLOOR", "")
+                .replace("LEVEL", "")
+                .replace("STOREY", "")
+                .replace("STORY", "")
+                .replace("_", "")
+                .replace("-", "")
+                .replace(" ", "");
+
+        if ("G".equals(normalized) || "GF".equals(normalized) || "GROUND".equals(normalized)) {
+            return 0;
+        }
+        if ("LG".equals(normalized) || "LOWGROUND".equals(normalized)
+                || "LOWERGROUND".equals(normalized)) {
+            return -1;
+        }
+        if ("UG".equals(normalized) || "UPGROUND".equals(normalized)
+                || "UPPERGROUND".equals(normalized)) {
+            return 1;
+        }
+
+        if (normalized.startsWith("B") && normalized.length() > 1) {
+            try {
+                return -Integer.parseInt(normalized.substring(1));
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+
+        if (normalized.startsWith("L") && normalized.length() > 1) {
+            try {
+                return Integer.parseInt(normalized.substring(1));
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+
+        try {
+            return Integer.parseInt(normalized);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 
     private boolean isPolygonGeometry(String geometryType) {

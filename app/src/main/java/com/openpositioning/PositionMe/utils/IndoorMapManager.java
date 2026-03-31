@@ -3,6 +3,8 @@ package com.openpositioning.PositionMe.utils;
 import android.graphics.Color;
 import android.util.Log;
 
+import androidx.annotation.Nullable;
+
 import com.google.android.gms.maps.GoogleMap;
 import com.google.android.gms.maps.model.LatLng;
 import com.google.android.gms.maps.model.Polygon;
@@ -13,7 +15,9 @@ import com.openpositioning.PositionMe.data.remote.FloorplanApiClient;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Manages indoor floor map display for all supported buildings
@@ -63,6 +67,12 @@ public class IndoorMapManager {
     private static final int LIFT_STROKE = Color.argb(220, 0, 137, 123);
     private static final int LIFT_FILL = Color.argb(70, 0, 137, 123);
     private static final int DEFAULT_STROKE = Color.argb(150, 100, 100, 100);
+    private static final double ROUTE_NODE_SNAP_METERS = 4.0;
+    private static final double MAX_ROUTE_EDGE_METERS = 35.0;
+    private static final double INTERIOR_NODE_PULL_RATIO = 0.28;
+
+    private int cachedRouteFloor = Integer.MIN_VALUE;
+    private List<LatLng> cachedRouteNodes = new ArrayList<>();
 
     /**
      * Constructor to set the map instance.
@@ -126,6 +136,10 @@ public class IndoorMapManager {
      * (e.g. G=0, LG=-1, 1=1).
      */
     public int getCurrentLogicalFloor() {
+        Integer parsed = parseLogicalFloor(currentFloor);
+        if (parsed != null) {
+            return parsed;
+        }
         return currentFloor - getAutoFloorBias();
     }
 
@@ -174,7 +188,12 @@ public class IndoorMapManager {
         if (currentFloorShapes == null || currentFloorShapes.isEmpty()) return;
 
         if (autoFloor) {
-            newFloor += getAutoFloorBias();
+            Integer mappedFloor = resolveFloorIndexForLogicalFloor(newFloor);
+            if (mappedFloor != null) {
+                newFloor = mappedFloor;
+            } else {
+                newFloor += getAutoFloorBias();
+            }
         }
 
         if (newFloor >= 0 && newFloor < currentFloorShapes.size()
@@ -232,6 +251,31 @@ public class IndoorMapManager {
     }
 
     /**
+     * Builds a display polyline that keeps the live user position untouched while rerouting
+     * only the line segments that would otherwise cross walls.
+     */
+    public List<LatLng> buildLegalDisplayPath(@Nullable List<LatLng> rawHistory) {
+        if (rawHistory == null || rawHistory.isEmpty()) {
+            return Collections.emptyList();
+        }
+        if (!isIndoorMapSet || currentFloorShapes == null
+                || currentFloor < 0 || currentFloor >= currentFloorShapes.size()) {
+            return new ArrayList<>(rawHistory);
+        }
+
+        List<LatLng> routedPath = new ArrayList<>();
+        LatLng previous = rawHistory.get(0);
+        routedPath.add(previous);
+
+        for (int i = 1; i < rawHistory.size(); i++) {
+            LatLng current = rawHistory.get(i);
+            appendLegalSegment(routedPath, previous, current);
+            previous = current;
+        }
+        return routedPath;
+    }
+
+    /**
      * Returns true if the point lies inside or close to the requested indoor feature type.
      */
     public boolean isNearIndoorFeature(LatLng point, String indoorType, double radiusMeters) {
@@ -259,6 +303,216 @@ public class IndoorMapManager {
             }
         }
         return false;
+    }
+
+    private void appendLegalSegment(List<LatLng> routedPath, LatLng start, LatLng end) {
+        if (start == null || end == null) {
+            return;
+        }
+
+        if (!isBlocked(start, end) && !isInsideWall(end)) {
+            addDistinctPoint(routedPath, end);
+            return;
+        }
+
+        List<LatLng> detour = routeShortestLegalPath(start, end);
+        if (detour.size() >= 2) {
+            for (int i = 1; i < detour.size(); i++) {
+                addDistinctPoint(routedPath, detour.get(i));
+            }
+            return;
+        }
+
+        LatLng safe = constrainToLegalPath(start, end);
+        if (safe != null && !samePoint(routedPath.get(routedPath.size() - 1), safe)) {
+            addDistinctPoint(routedPath, safe);
+        }
+    }
+
+    private List<LatLng> routeShortestLegalPath(LatLng rawStart, LatLng rawEnd) {
+        List<LatLng> routeNodes = getRouteNodes();
+        LatLng start = snapRouteEndpoint(rawStart, routeNodes);
+        LatLng end = snapRouteEndpoint(rawEnd, routeNodes);
+        if (start == null || end == null) {
+            return Collections.emptyList();
+        }
+        if (!isBlocked(start, end) && !isInsideWall(end)) {
+            List<LatLng> direct = new ArrayList<>();
+            direct.add(start);
+            direct.add(end);
+            return direct;
+        }
+
+        List<LatLng> graphNodes = new ArrayList<>(routeNodes.size() + 2);
+        graphNodes.add(start);
+        graphNodes.add(end);
+        graphNodes.addAll(routeNodes);
+
+        int nodeCount = graphNodes.size();
+        double[] distance = new double[nodeCount];
+        int[] previous = new int[nodeCount];
+        boolean[] visited = new boolean[nodeCount];
+        for (int i = 0; i < nodeCount; i++) {
+            distance[i] = Double.POSITIVE_INFINITY;
+            previous[i] = -1;
+        }
+        distance[0] = 0d;
+
+        for (int iteration = 0; iteration < nodeCount; iteration++) {
+            int currentIndex = -1;
+            double currentDistance = Double.POSITIVE_INFINITY;
+            for (int i = 0; i < nodeCount; i++) {
+                if (!visited[i] && distance[i] < currentDistance) {
+                    currentDistance = distance[i];
+                    currentIndex = i;
+                }
+            }
+
+            if (currentIndex < 0 || currentIndex == 1) {
+                break;
+            }
+
+            visited[currentIndex] = true;
+            for (int nextIndex = 0; nextIndex < nodeCount; nextIndex++) {
+                if (nextIndex == currentIndex || visited[nextIndex]) {
+                    continue;
+                }
+
+                LatLng from = graphNodes.get(currentIndex);
+                LatLng to = graphNodes.get(nextIndex);
+                if (!isRouteEdgeAllowed(from, to, currentIndex <= 1 || nextIndex <= 1)) {
+                    continue;
+                }
+
+                double edgeDistance = UtilFunctions.distanceBetweenPoints(from, to);
+                double alternativeDistance = distance[currentIndex] + edgeDistance;
+                if (alternativeDistance < distance[nextIndex]) {
+                    distance[nextIndex] = alternativeDistance;
+                    previous[nextIndex] = currentIndex;
+                }
+            }
+        }
+
+        if (Double.isInfinite(distance[1])) {
+            return Collections.emptyList();
+        }
+
+        List<LatLng> path = new ArrayList<>();
+        for (int index = 1; index >= 0; index = previous[index]) {
+            path.add(graphNodes.get(index));
+            if (index == 0) {
+                break;
+            }
+        }
+        Collections.reverse(path);
+        return path;
+    }
+
+    @Nullable
+    private LatLng snapRouteEndpoint(LatLng rawPoint, List<LatLng> routeNodes) {
+        if (!isInsideWall(rawPoint)) {
+            return rawPoint;
+        }
+
+        LatLng nearest = null;
+        double nearestDistance = Double.MAX_VALUE;
+        for (LatLng candidate : routeNodes) {
+            if (candidate == null || isInsideWall(candidate)) {
+                continue;
+            }
+            double distance = UtilFunctions.distanceBetweenPoints(rawPoint, candidate);
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                nearest = candidate;
+            }
+        }
+
+        if (nearestDistance <= ROUTE_NODE_SNAP_METERS || nearest != null) {
+            return nearest;
+        }
+        return null;
+    }
+
+    private boolean isRouteEdgeAllowed(LatLng start, LatLng end, boolean allowLongEdge) {
+        if (start == null || end == null || isInsideWall(start) || isInsideWall(end)) {
+            return false;
+        }
+
+        double distance = UtilFunctions.distanceBetweenPoints(start, end);
+        if (!allowLongEdge && distance > MAX_ROUTE_EDGE_METERS) {
+            return false;
+        }
+        return !isBlocked(start, end);
+    }
+
+    private List<LatLng> getRouteNodes() {
+        if (cachedRouteFloor == currentFloor && !cachedRouteNodes.isEmpty()) {
+            return cachedRouteNodes;
+        }
+
+        List<LatLng> nodes = new ArrayList<>();
+        FloorplanApiClient.FloorShapes floor = currentFloorShapes.get(currentFloor);
+        for (FloorplanApiClient.MapShapeFeature feature : floor.getFeatures()) {
+            if ("wall".equals(feature.getIndoorType())) {
+                continue;
+            }
+
+            boolean polygonGeometry = isPolygonGeometry(feature.getGeometryType());
+            for (List<LatLng> part : feature.getParts()) {
+                if (part == null || part.isEmpty()) {
+                    continue;
+                }
+
+                if (polygonGeometry && part.size() >= 3) {
+                    LatLng centroid = computeCentroid(part);
+                    addRouteNode(nodes, centroid);
+                    for (LatLng vertex : part) {
+                        addRouteNode(nodes, interpolate(vertex, centroid, INTERIOR_NODE_PULL_RATIO));
+                    }
+                } else {
+                    for (LatLng point : part) {
+                        addRouteNode(nodes, point);
+                    }
+                }
+            }
+        }
+
+        cachedRouteFloor = currentFloor;
+        cachedRouteNodes = nodes;
+        return cachedRouteNodes;
+    }
+
+    private void addRouteNode(List<LatLng> nodes, @Nullable LatLng candidate) {
+        if (candidate == null || isInsideWall(candidate)) {
+            return;
+        }
+
+        for (LatLng existing : nodes) {
+            if (UtilFunctions.distanceBetweenPoints(existing, candidate) < 0.75) {
+                return;
+            }
+        }
+        nodes.add(candidate);
+    }
+
+    private void addDistinctPoint(List<LatLng> points, LatLng candidate) {
+        if (points.isEmpty() || !samePoint(points.get(points.size() - 1), candidate)) {
+            points.add(candidate);
+        }
+    }
+
+    private boolean samePoint(LatLng a, LatLng b) {
+        return UtilFunctions.distanceBetweenPoints(a, b) < 0.15;
+    }
+
+    private LatLng computeCentroid(List<LatLng> polygon) {
+        double latitudeSum = 0d;
+        double longitudeSum = 0d;
+        for (LatLng point : polygon) {
+            latitudeSum += point.latitude;
+            longitudeSum += point.longitude;
+        }
+        return new LatLng(latitudeSum / polygon.size(), longitudeSum / polygon.size());
     }
 
     /**
@@ -306,6 +560,10 @@ public class IndoorMapManager {
                 }
 
                 if (currentFloorShapes != null && !currentFloorShapes.isEmpty()) {
+                    Integer groundFloorIndex = resolveFloorIndexForLogicalFloor(0);
+                    if (groundFloorIndex != null) {
+                        currentFloor = groundFloorIndex;
+                    }
                     drawFloorShapes(currentFloor);
                     isIndoorMapSet = true;
                 }
@@ -316,6 +574,7 @@ public class IndoorMapManager {
                 currentBuilding = BUILDING_NONE;
                 currentFloor = 0;
                 currentFloorShapes = null;
+                invalidateRouteCache();
             }
         } catch (Exception ex) {
             Log.e(TAG, "Error with overlay: " + ex.toString());
@@ -330,6 +589,7 @@ public class IndoorMapManager {
      */
     private void drawFloorShapes(int floorIndex) {
         clearDrawnShapes();
+        invalidateRouteCache();
 
         if (currentFloorShapes == null || floorIndex < 0
                 || floorIndex >= currentFloorShapes.size()) return;
@@ -615,5 +875,100 @@ public class IndoorMapManager {
         double closestX = ax + projection * abx;
         double closestY = ay + projection * aby;
         return Math.hypot(closestX, closestY);
+    }
+
+    @Nullable
+    private Integer resolveFloorIndexForLogicalFloor(int logicalFloor) {
+        if (currentFloorShapes == null) {
+            return null;
+        }
+        for (int i = 0; i < currentFloorShapes.size(); i++) {
+            Integer parsed = parseLogicalFloorLabel(
+                    currentFloorShapes.get(i).getDisplayName(),
+                    currentFloorShapes.get(i).getKey()
+            );
+            if (parsed != null && parsed == logicalFloor) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    private Integer parseLogicalFloor(int floorIndex) {
+        if (currentFloorShapes == null || floorIndex < 0 || floorIndex >= currentFloorShapes.size()) {
+            return null;
+        }
+        FloorplanApiClient.FloorShapes floor = currentFloorShapes.get(floorIndex);
+        return parseLogicalFloorLabel(floor.getDisplayName(), floor.getKey());
+    }
+
+    @Nullable
+    private Integer parseLogicalFloorLabel(String displayName, String fallbackKey) {
+        Integer parsed = parseSingleFloorLabel(displayName);
+        if (parsed != null) {
+            return parsed;
+        }
+        return parseSingleFloorLabel(fallbackKey);
+    }
+
+    @Nullable
+    private Integer parseSingleFloorLabel(String rawLabel) {
+        if (rawLabel == null) {
+            return null;
+        }
+
+        String normalized = rawLabel.trim().toUpperCase(Locale.UK);
+        if (normalized.isEmpty()) {
+            return null;
+        }
+
+        normalized = normalized
+                .replace("FLOOR", "")
+                .replace("LEVEL", "")
+                .replace("STOREY", "")
+                .replace("STORY", "")
+                .replace("_", "")
+                .replace("-", "")
+                .replace(" ", "");
+
+        if ("G".equals(normalized) || "GF".equals(normalized) || "GROUND".equals(normalized)) {
+            return 0;
+        }
+        if ("LG".equals(normalized) || "LOWGROUND".equals(normalized)
+                || "LOWERGROUND".equals(normalized)) {
+            return -1;
+        }
+        if ("UG".equals(normalized) || "UPGROUND".equals(normalized)
+                || "UPPERGROUND".equals(normalized)) {
+            return 1;
+        }
+
+        if (normalized.startsWith("B") && normalized.length() > 1) {
+            try {
+                return -Integer.parseInt(normalized.substring(1));
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+
+        if (normalized.startsWith("L") && normalized.length() > 1) {
+            try {
+                return Integer.parseInt(normalized.substring(1));
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+
+        try {
+            return Integer.parseInt(normalized);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private void invalidateRouteCache() {
+        cachedRouteFloor = Integer.MIN_VALUE;
+        cachedRouteNodes = new ArrayList<>();
     }
 }

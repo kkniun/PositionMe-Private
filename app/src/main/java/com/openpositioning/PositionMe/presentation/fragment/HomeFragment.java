@@ -156,9 +156,6 @@ public class HomeFragment extends Fragment {
                     fusedPosition,
                     (float) Math.toDegrees(sensorFusion.passOrientation())
             );
-            if (displayedLocation != null) {
-                sensorFusion.applyMapConstrainedPosition(displayedLocation);
-            }
             trajectoryMapFragment.renderFusedHistory(sensorFusion.getFusedTrack());
             trajectoryMapFragment.renderObservationTails(
                     sensorFusion.getRecentGnssTrail(),
