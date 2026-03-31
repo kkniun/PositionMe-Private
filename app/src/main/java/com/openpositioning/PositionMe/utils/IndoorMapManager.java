@@ -77,6 +77,8 @@ public class IndoorMapManager {
     private static final double INTERIOR_NODE_PULL_RATIO = 0.28;
     private static final double WALL_PROJECTION_MAX_METERS = 6.0;
     private static final double WALL_EXIT_OFFSET_METERS = 0.12;
+    private static final double LIVE_ROUTE_PROGRESS_MIN_METERS = 0.45;
+    private static final double LIVE_ROUTE_PROGRESS_GAIN = 1.35;
 
     private int cachedRouteFloor = Integer.MIN_VALUE;
     private List<LatLng> cachedRouteNodes = new ArrayList<>();
@@ -270,12 +272,28 @@ public class IndoorMapManager {
             return candidateLocation;
         }
 
-        LatLng corrected = candidateLocation;
-        if (previousLocation != null && isBlocked(previousLocation, corrected)) {
-            corrected = constrainToLegalPath(previousLocation, corrected);
+        boolean candidateNearWall = distanceToNearestWallMeters(candidateLocation) <= 0.18d;
+        if (previousLocation != null) {
+            double directDistance = UtilFunctions.distanceBetweenPoints(previousLocation, candidateLocation);
+            if (directDistance >= 0.10d
+                    && (isBlocked(previousLocation, candidateLocation)
+                    || isInsideWall(candidateLocation)
+                    || candidateNearWall)) {
+                List<LatLng> detour = routeShortestLegalPath(previousLocation, candidateLocation, directDistance);
+                if (detour.size() >= 2) {
+                    LatLng progressed = advanceAlongPath(
+                            detour,
+                            Math.max(LIVE_ROUTE_PROGRESS_MIN_METERS, directDistance * LIVE_ROUTE_PROGRESS_GAIN)
+                    );
+                    if (progressed != null && !isInsideWall(progressed)) {
+                        return progressed;
+                    }
+                }
+            }
         }
 
-        if (isInsideWall(corrected)) {
+        LatLng corrected = candidateLocation;
+        if (isInsideWall(corrected) || candidateNearWall) {
             LatLng projected = projectToNearestWallBoundary(candidateLocation);
             if (projected != null) {
                 corrected = projected;
@@ -288,11 +306,32 @@ public class IndoorMapManager {
             }
         }
 
-        if (previousLocation != null && isBlocked(previousLocation, corrected)) {
-            corrected = constrainToLegalPath(previousLocation, corrected);
+        return corrected;
+    }
+
+    @Nullable
+    private LatLng advanceAlongPath(@NonNull List<LatLng> path, double targetDistanceMeters) {
+        if (path.size() < 2) {
+            return path.isEmpty() ? null : path.get(path.size() - 1);
         }
 
-        return corrected;
+        double remaining = Math.max(0d, targetDistanceMeters);
+        LatLng previous = path.get(0);
+        for (int i = 1; i < path.size(); i++) {
+            LatLng current = path.get(i);
+            double segmentDistance = UtilFunctions.distanceBetweenPoints(previous, current);
+            if (segmentDistance <= 1e-3d) {
+                previous = current;
+                continue;
+            }
+            if (remaining <= segmentDistance) {
+                double ratio = remaining / segmentDistance;
+                return interpolate(previous, current, ratio);
+            }
+            remaining -= segmentDistance;
+            previous = current;
+        }
+        return path.get(path.size() - 1);
     }
 
     /**
@@ -1020,6 +1059,28 @@ public class IndoorMapManager {
             );
         }
         return bestDistance;
+    }
+
+    private double distanceToNearestWallMeters(LatLng point) {
+        FloorplanApiClient.FloorShapes floor = currentFloorShapes.get(currentFloor);
+        double nearestDistance = Double.MAX_VALUE;
+        for (FloorplanApiClient.MapShapeFeature feature : floor.getFeatures()) {
+            if (!"wall".equals(feature.getIndoorType())) {
+                continue;
+            }
+
+            boolean polygonGeometry = isPolygonGeometry(feature.getGeometryType());
+            for (List<LatLng> part : feature.getParts()) {
+                if (part == null || part.size() < 2) {
+                    continue;
+                }
+                nearestDistance = Math.min(
+                        nearestDistance,
+                        distancePointToPathMeters(point, part, polygonGeometry)
+                );
+            }
+        }
+        return nearestDistance;
     }
 
     private double distancePointToSegmentMeters(LatLng point, LatLng segStart, LatLng segEnd) {

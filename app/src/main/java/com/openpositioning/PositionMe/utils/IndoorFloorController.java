@@ -19,13 +19,9 @@ public class IndoorFloorController {
     private static final long FLOOR_CHANGE_DEBOUNCE_MS = 900L;
     private static final float STRONG_ABSOLUTE_SWITCH_METERS = 3.7f;
     private static final float FLOOR_HEIGHT_RATIO_THRESHOLD = 0.78f;
-    private static final float RECENTER_ELEVATION_RATIO = 0.18f;
-    private static final float RECENTER_ELEVATION_ALPHA = 0.12f;
-
     private final IndoorSpatialConstraintModel spatialModel;
 
     private float anchorElevation = Float.NaN;
-    private LatLng anchorLocation;
     private int anchorLogicalFloor;
     private boolean anchorConfirmed;
     private int pendingWifiFloor = Integer.MIN_VALUE;
@@ -39,7 +35,6 @@ public class IndoorFloorController {
 
     public void reset() {
         anchorElevation = Float.NaN;
-        anchorLocation = null;
         anchorLogicalFloor = 0;
         anchorConfirmed = false;
         pendingWifiFloor = Integer.MIN_VALUE;
@@ -56,7 +51,6 @@ public class IndoorFloorController {
         spatialModel.setCurrentLogicalFloor(logicalFloor);
         anchorLogicalFloor = spatialModel.getCurrentLogicalFloor();
         anchorElevation = elevationMeters;
-        anchorLocation = null;
         anchorConfirmed = true;
         clearPendingWifiFloor();
         clearPendingCandidate();
@@ -82,11 +76,6 @@ public class IndoorFloorController {
             return null;
         }
 
-        int currentLogicalFloor = spatialModel.getCurrentLogicalFloor();
-        if (Float.isNaN(anchorElevation)) {
-            seedAnchor(currentPosition, elevationMeters, currentLogicalFloor);
-        }
-
         Integer normalizedWifiFloor = wifiFloor == null
                 ? null
                 : spatialModel.normalizeExternalFloorObservation(wifiFloor);
@@ -101,27 +90,14 @@ public class IndoorFloorController {
         }
 
         if (!anchorConfirmed) {
-            seedAnchor(currentPosition, elevationMeters, spatialModel.getCurrentLogicalFloor());
             return null;
         }
 
+        int currentLogicalFloor = spatialModel.getCurrentLogicalFloor();
         float elevationDelta = elevationMeters - anchorElevation;
-        int estimatedOffset = estimateSingleFloorOffset(elevationDelta, floorHeight);
-
-        if (estimatedOffset == 0) {
-            clearPendingCandidate();
-            recenterAnchorIfStable(currentPosition, elevationMeters, floorHeight);
-            return null;
-        }
-
-        int candidateFloor = spatialModel.clampLogicalFloor(
-                spatialModel.getCurrentBuildingId(),
-                anchorLogicalFloor + Integer.signum(estimatedOffset)
-        );
-
+        int candidateFloor = resolveNextFloor(elevationDelta, floorHeight);
         if (candidateFloor == currentLogicalFloor) {
             clearPendingCandidate();
-            recenterAnchorIfStable(currentPosition, elevationMeters, floorHeight);
             return null;
         }
 
@@ -136,7 +112,6 @@ public class IndoorFloorController {
         }
 
         spatialModel.setCurrentLogicalFloor(candidateFloor);
-        seedAnchor(currentPosition, elevationMeters, candidateFloor);
         clearPendingCandidate();
         return spatialModel.getCurrentLogicalFloor();
     }
@@ -175,51 +150,31 @@ public class IndoorFloorController {
             return spatialModel.getCurrentLogicalFloor();
         }
 
-        if (Math.abs(elevationMeters - anchorElevation) <= Math.max(1.0f, spatialModel.getCurrentFloorHeight() * 0.25f)) {
-            seedAnchor(currentPosition, elevationMeters, spatialModel.getCurrentLogicalFloor());
-            anchorConfirmed = true;
-        }
         clearPendingWifiFloor();
         return null;
     }
 
-    private int estimateSingleFloorOffset(float elevationDelta, float floorHeight) {
-        float absoluteDelta = Math.abs(elevationDelta);
+    private int resolveNextFloor(float elevationDelta, float floorHeight) {
         float floorChangeThreshold = Math.max(
                 STRONG_ABSOLUTE_SWITCH_METERS,
                 floorHeight * FLOOR_HEIGHT_RATIO_THRESHOLD
         );
-
+        float absoluteDelta = Math.abs(elevationDelta);
         if (absoluteDelta < floorChangeThreshold) {
-            return 0;
+            return anchorLogicalFloor;
         }
 
-        int roundedOffset = Math.round(elevationDelta / floorHeight);
-        if (roundedOffset == 0) {
-            roundedOffset = elevationDelta > 0f ? 1 : -1;
-        }
-        return Integer.signum(roundedOffset);
-    }
-
-    private void recenterAnchorIfStable(LatLng currentPosition,
-                                        float elevationMeters,
-                                        float floorHeight) {
-        if (Float.isNaN(anchorElevation)) {
-            return;
-        }
-        float elevationDelta = elevationMeters - anchorElevation;
-        if (Math.abs(elevationDelta) > Math.max(0.9f, floorHeight * RECENTER_ELEVATION_RATIO)) {
-            return;
-        }
-        anchorElevation += elevationDelta * RECENTER_ELEVATION_ALPHA;
-        anchorLocation = currentPosition;
-        anchorLogicalFloor = spatialModel.getCurrentLogicalFloor();
+        int movedFloors = 1 + (int) Math.floor((absoluteDelta - floorChangeThreshold) / floorHeight);
+        int direction = elevationDelta > 0f ? 1 : -1;
+        return spatialModel.clampLogicalFloor(
+                spatialModel.getCurrentBuildingId(),
+                anchorLogicalFloor + direction * movedFloors
+        );
     }
 
     private void seedAnchor(LatLng currentPosition, float elevationMeters, int logicalFloor) {
-        anchorElevation = elevationMeters;
-        anchorLocation = currentPosition;
         anchorLogicalFloor = logicalFloor;
+        anchorElevation = elevationMeters;
     }
 
     private void clearPendingWifiFloor() {
