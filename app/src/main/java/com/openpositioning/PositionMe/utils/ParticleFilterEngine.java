@@ -31,7 +31,10 @@ public class ParticleFilterEngine {
     private static final int MAX_TAIL_SIZE = 5;
     private static final int MAX_HISTORY_SIZE = 600;
     private static final long MIN_HISTORY_INTERVAL_MS = 1_000L;
+    private static final long HISTORY_ACTIVE_MOTION_WINDOW_MS = 2_500L;
     private static final double MIN_HISTORY_DISTANCE_METERS = 0.85;
+    private static final double MAX_HISTORY_SEGMENT_METERS = 4.0;
+    private static final double STATIONARY_REBASE_DISTANCE_METERS = 2.5;
     private static final double MAX_STEP_METERS = 2.5;
     private static final double MIN_INIT_CONFIDENCE = 0.40;
     private static final double RESAMPLE_THRESHOLD_RATIO = 0.48;
@@ -39,6 +42,10 @@ public class ParticleFilterEngine {
     private static final double FLOOR_MODE_SWITCH_DOMINANCE = 0.46;
     private static final double FLOOR_MODE_SWITCH_MARGIN = 0.10;
     private static final double FLOOR_JITTER_PROBABILITY = 0.08;
+    private static final double GNSS_OBSERVATION_PULL_MIN = 0.28;
+    private static final double GNSS_OBSERVATION_PULL_MAX = 0.64;
+    private static final double WIFI_OBSERVATION_PULL_MIN = 0.22;
+    private static final double WIFI_OBSERVATION_PULL_MAX = 0.48;
     private static final double EARTH_RADIUS_METERS = 6_378_137.0;
 
     private final Random random = new Random();
@@ -68,6 +75,7 @@ public class ParticleFilterEngine {
     private int dominantParticleFloor;
     private LatLng currentLatLng;
     private long lastHistoryTimestamp;
+    private long lastPdrMotionTimestamp;
 
     public ParticleFilterEngine() {
         this(new IndoorSpatialConstraintModel());
@@ -104,6 +112,7 @@ public class ParticleFilterEngine {
         dominantParticleFloor = 0;
         currentLatLng = null;
         lastHistoryTimestamp = 0L;
+        lastPdrMotionTimestamp = 0L;
         spatialConstraintModel.reset();
     }
 
@@ -309,6 +318,8 @@ public class ParticleFilterEngine {
             return currentLatLng;
         }
 
+        lastPdrMotionTimestamp = timestampMillis;
+
         if (!initialized) {
             return null;
         }
@@ -399,8 +410,16 @@ public class ParticleFilterEngine {
             resample();
         }
 
+        pullParticlesTowardObservation(
+                local[0],
+                local[1],
+                accuracyMeters,
+                confidence,
+                source
+        );
+
         PoseEstimate estimate = estimatePose();
-        double smoothing = source == ObservationSource.WIFI ? 0.34 : 0.40;
+        double smoothing = source == ObservationSource.WIFI ? 0.58 : 0.68;
         commitPose(
                 estimate.easting,
                 estimate.northing,
@@ -410,6 +429,34 @@ public class ParticleFilterEngine {
                 smoothing
         );
         return currentLatLng;
+    }
+
+    private void pullParticlesTowardObservation(double observedEasting,
+                                                double observedNorthing,
+                                                double accuracyMeters,
+                                                double confidence,
+                                                ObservationSource source) {
+        double basePull = source == ObservationSource.WIFI
+                ? clamp(0.18 + confidence * 0.28, WIFI_OBSERVATION_PULL_MIN, WIFI_OBSERVATION_PULL_MAX)
+                : clamp(0.24 + confidence * 0.34, GNSS_OBSERVATION_PULL_MIN, GNSS_OBSERVATION_PULL_MAX);
+        double distanceSensitiveBoost = source == ObservationSource.GNSS
+                ? clamp(0.08 - accuracyMeters * 0.0025, 0.0, 0.08)
+                : clamp(0.06 - accuracyMeters * 0.0020, 0.0, 0.06);
+        double pull = clamp(basePull + distanceSensitiveBoost, 0.20, 0.68);
+        double jitterStd = clamp(accuracyMeters * 0.12, 0.35, source == ObservationSource.WIFI ? 1.2 : 1.8);
+
+        for (Particle particle : particles) {
+            particle.easting = lerp(
+                    particle.easting,
+                    observedEasting + gaussian(0d, jitterStd),
+                    pull
+            );
+            particle.northing = lerp(
+                    particle.northing,
+                    observedNorthing + gaussian(0d, jitterStd),
+                    pull
+            );
+        }
     }
 
     private void initialiseParticles(double accuracyMeters,
@@ -624,16 +671,41 @@ public class ParticleFilterEngine {
 
         if (forceReplaceLastPoint && !fusedHistory.isEmpty()) {
             fusedHistory.removeLast();
-        }
-
-        LatLng lastPoint = fusedHistory.peekLast();
-        boolean shouldAppend = lastPoint == null
-                || UtilFunctions.distanceBetweenPoints(lastPoint, point) >= MIN_HISTORY_DISTANCE_METERS;
-
-        if (!shouldAppend) {
+            addHistoryPoint(point, timestampMillis);
             return;
         }
 
+        if (fusedHistory.isEmpty()) {
+            addHistoryPoint(point, timestampMillis);
+            return;
+        }
+
+        LatLng lastPoint = fusedHistory.peekLast();
+        double distanceMeters = UtilFunctions.distanceBetweenPoints(lastPoint, point);
+        long elapsedMillis = Math.max(0L, timestampMillis - lastHistoryTimestamp);
+        boolean recentlyMoving = lastPdrMotionTimestamp > 0L
+                && timestampMillis - lastPdrMotionTimestamp <= HISTORY_ACTIVE_MOTION_WINDOW_MS;
+
+        if (!recentlyMoving) {
+            if (fusedHistory.size() == 1
+                    && elapsedMillis >= MIN_HISTORY_INTERVAL_MS
+                    && distanceMeters >= STATIONARY_REBASE_DISTANCE_METERS) {
+                fusedHistory.removeLast();
+                addHistoryPoint(point, timestampMillis);
+            }
+            return;
+        }
+
+        if (elapsedMillis < MIN_HISTORY_INTERVAL_MS
+                || distanceMeters < MIN_HISTORY_DISTANCE_METERS
+                || distanceMeters > MAX_HISTORY_SEGMENT_METERS) {
+            return;
+        }
+
+        addHistoryPoint(point, timestampMillis);
+    }
+
+    private void addHistoryPoint(LatLng point, long timestampMillis) {
         fusedHistory.addLast(point);
         while (fusedHistory.size() > MAX_HISTORY_SIZE) {
             fusedHistory.removeFirst();
@@ -663,6 +735,10 @@ public class ParticleFilterEngine {
 
     private double gaussian(double mean, double std) {
         return mean + random.nextGaussian() * std;
+    }
+
+    private double lerp(double from, double to, double alpha) {
+        return from + alpha * (to - from);
     }
 
     private int sampleInitialFloor(@Nullable String buildingId,

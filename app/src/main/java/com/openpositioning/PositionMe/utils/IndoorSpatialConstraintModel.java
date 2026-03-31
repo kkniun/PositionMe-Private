@@ -94,16 +94,12 @@ public class IndoorSpatialConstraintModel {
     }
 
     public int normalizeExternalFloorObservation(@Nullable String buildingId, int observedFloor) {
-        Integer shiftedIndex = findFloorIndexByLogicalFloor(buildingId, observedFloor - 1);
         Integer exactIndex = findFloorIndexByLogicalFloor(buildingId, observedFloor);
-        boolean hasGroundFloor = findFloorIndexByLogicalFloor(buildingId, 0) != null;
-
-        if (hasGroundFloor && shiftedIndex != null) {
-            return clampLogicalFloor(buildingId, observedFloor - 1);
-        }
         if (exactIndex != null) {
             return clampLogicalFloor(buildingId, observedFloor);
         }
+
+        Integer shiftedIndex = findFloorIndexByLogicalFloor(buildingId, observedFloor - 1);
         if (shiftedIndex != null) {
             return clampLogicalFloor(buildingId, observedFloor - 1);
         }

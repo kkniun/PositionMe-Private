@@ -18,8 +18,6 @@ public class IndoorFloorController {
     private static final float FLOOR_CHANGE_TRIGGER_RATIO = 0.38f;
     private static final float MIN_VERTICAL_CHANGE_METERS = 2.4f;
     private static final float ABSOLUTE_ELEVATION_SWITCH_METERS = 4.0f;
-    private static final int MAX_EVALUATED_FLOOR_JUMP = 2;
-
     private final IndoorSpatialConstraintModel spatialModel;
 
     private float baselineElevation = Float.NaN;
@@ -108,14 +106,7 @@ public class IndoorFloorController {
             return null;
         }
 
-        int floorStepMagnitude = Math.max(
-                1,
-                Math.min(
-                        MAX_EVALUATED_FLOOR_JUMP,
-                        Math.round(absoluteElevationDelta / floorHeight)
-                )
-        );
-        int floorDelta = elevationDelta >= 0f ? floorStepMagnitude : -floorStepMagnitude;
+        int floorDelta = elevationDelta >= 0f ? 1 : -1;
         int candidateFloor = spatialModel.clampLogicalFloor(
                 spatialModel.getCurrentBuildingId(),
                 baselineLogicalFloor + floorDelta

@@ -68,7 +68,11 @@ public class IndoorMapManager {
     private static final int LIFT_FILL = Color.argb(70, 0, 137, 123);
     private static final int DEFAULT_STROKE = Color.argb(150, 100, 100, 100);
     private static final double ROUTE_NODE_SNAP_METERS = 4.0;
-    private static final double MAX_ROUTE_EDGE_METERS = 35.0;
+    private static final double MAX_ROUTE_EDGE_METERS = 18.0;
+    private static final double MAX_ROUTE_ENDPOINT_EDGE_METERS = 14.0;
+    private static final double MAX_ROUTABLE_SEGMENT_METERS = 12.0;
+    private static final double MAX_ROUTE_DETOUR_FACTOR = 2.4;
+    private static final double MAX_ROUTE_DETOUR_METERS = 18.0;
     private static final double INTERIOR_NODE_PULL_RATIO = 0.28;
 
     private int cachedRouteFloor = Integer.MIN_VALUE;
@@ -320,12 +324,21 @@ public class IndoorMapManager {
             return;
         }
 
+        double directDistance = UtilFunctions.distanceBetweenPoints(start, end);
         if (!isBlocked(start, end) && !isInsideWall(end)) {
             addDistinctPoint(routedPath, end);
             return;
         }
 
-        List<LatLng> detour = routeShortestLegalPath(start, end);
+        if (directDistance > MAX_ROUTABLE_SEGMENT_METERS) {
+            LatLng safe = constrainToLegalPath(start, end);
+            if (safe != null && !samePoint(routedPath.get(routedPath.size() - 1), safe)) {
+                addDistinctPoint(routedPath, safe);
+            }
+            return;
+        }
+
+        List<LatLng> detour = routeShortestLegalPath(start, end, directDistance);
         if (detour.size() >= 2) {
             for (int i = 1; i < detour.size(); i++) {
                 addDistinctPoint(routedPath, detour.get(i));
@@ -339,7 +352,9 @@ public class IndoorMapManager {
         }
     }
 
-    private List<LatLng> routeShortestLegalPath(LatLng rawStart, LatLng rawEnd) {
+    private List<LatLng> routeShortestLegalPath(LatLng rawStart,
+                                                LatLng rawEnd,
+                                                double directDistance) {
         List<LatLng> routeNodes = getRouteNodes();
         LatLng start = snapRouteEndpoint(rawStart, routeNodes);
         LatLng end = snapRouteEndpoint(rawEnd, routeNodes);
@@ -390,7 +405,12 @@ public class IndoorMapManager {
 
                 LatLng from = graphNodes.get(currentIndex);
                 LatLng to = graphNodes.get(nextIndex);
-                if (!isRouteEdgeAllowed(from, to, currentIndex <= 1 || nextIndex <= 1)) {
+                if (!isRouteEdgeAllowed(
+                        from,
+                        to,
+                        currentIndex <= 1 || nextIndex <= 1,
+                        directDistance
+                )) {
                     continue;
                 }
 
@@ -415,6 +435,12 @@ public class IndoorMapManager {
             }
         }
         Collections.reverse(path);
+        if (pathLengthMeters(path) > Math.max(
+                MAX_ROUTE_DETOUR_METERS,
+                directDistance * MAX_ROUTE_DETOUR_FACTOR
+        )) {
+            return Collections.emptyList();
+        }
         return path;
     }
 
@@ -437,13 +463,16 @@ public class IndoorMapManager {
             }
         }
 
-        if (nearestDistance <= ROUTE_NODE_SNAP_METERS || nearest != null) {
+        if (nearest != null && nearestDistance <= ROUTE_NODE_SNAP_METERS) {
             return nearest;
         }
         return null;
     }
 
-    private boolean isRouteEdgeAllowed(LatLng start, LatLng end, boolean allowLongEdge) {
+    private boolean isRouteEdgeAllowed(LatLng start,
+                                       LatLng end,
+                                       boolean allowLongEdge,
+                                       double directDistance) {
         if (start == null || end == null || isInsideWall(start) || isInsideWall(end)) {
             return false;
         }
@@ -452,7 +481,21 @@ public class IndoorMapManager {
         if (!allowLongEdge && distance > MAX_ROUTE_EDGE_METERS) {
             return false;
         }
+        if (allowLongEdge && distance > Math.max(
+                MAX_ROUTE_ENDPOINT_EDGE_METERS,
+                directDistance * 1.75
+        )) {
+            return false;
+        }
         return !isBlocked(start, end);
+    }
+
+    private double pathLengthMeters(List<LatLng> points) {
+        double total = 0d;
+        for (int i = 1; i < points.size(); i++) {
+            total += UtilFunctions.distanceBetweenPoints(points.get(i - 1), points.get(i));
+        }
+        return total;
     }
 
     private List<LatLng> getRouteNodes() {

@@ -82,6 +82,7 @@ public class StartLocationFragment extends Fragment {
     private LatLng lastFloorplanRequestPosition;
     private LatLng previousAutoPreviewPosition;
     private float lastAutoPreviewDirectionDegrees;
+    private String currentPreviewFloorDisplayName;
 
     // Building selection state
     private String selectedBuildingId;
@@ -373,6 +374,7 @@ public class StartLocationFragment extends Fragment {
         for (Polyline p : previewPolylines) p.remove();
         previewPolygons.clear();
         previewPolylines.clear();
+        currentPreviewFloorDisplayName = null;
 
         FloorplanApiClient.BuildingInfo building = floorplanBuildingMap.get(buildingName);
         if (building == null) return;
@@ -385,6 +387,7 @@ public class StartLocationFragment extends Fragment {
 
         int previewFloor = resolvePreviewFloorIndex(buildingName, floors);
         FloorplanApiClient.FloorShapes floor = floors.get(previewFloor);
+        currentPreviewFloorDisplayName = floor.getDisplayName();
 
         for (FloorplanApiClient.MapShapeFeature feature : floor.getFeatures()) {
             String geoType = feature.getGeometryType();
@@ -440,11 +443,12 @@ public class StartLocationFragment extends Fragment {
         if (buildingInfoCard == null || buildingNameText == null) return;
 
         String displayName = formatBuildingName(buildingName);
-        if (!manualSelectionEnabled && sensorFusion.isIndoorContextActive()) {
+        if (!manualSelectionEnabled && currentPreviewFloorDisplayName != null
+                && !currentPreviewFloorDisplayName.isEmpty()) {
             buildingNameText.setText(
                     getString(R.string.buildingSelected, displayName)
                             + " | Floor "
-                            + sensorFusion.getCurrentFloorDisplayName()
+                            + currentPreviewFloorDisplayName
             );
         } else {
             buildingNameText.setText(getString(R.string.buildingSelected, displayName));
@@ -647,8 +651,8 @@ public class StartLocationFragment extends Fragment {
 
         selectedBuildingId = inferredBuildingId;
         sensorFusion.setSelectedBuildingId(inferredBuildingId);
-        updateBuildingInfoDisplay(inferredBuildingId);
         showFloorPlanOverlay(inferredBuildingId);
+        updateBuildingInfoDisplay(inferredBuildingId);
 
         if (selectedPolygon != null) {
             selectedPolygon.setFillColor(FILL_COLOR_DEFAULT);
@@ -690,7 +694,7 @@ public class StartLocationFragment extends Fragment {
                 >= MIN_DIRECTION_DISTANCE_METERS) {
             lastAutoPreviewDirectionDegrees =
                     computeHeadingDegrees(previousAutoPreviewPosition, currentPosition);
-        } else if (Float.compare(lastAutoPreviewDirectionDegrees, 0f) == 0) {
+        } else {
             lastAutoPreviewDirectionDegrees =
                     normalizeDegrees((float) Math.toDegrees(sensorFusion.passOrientation()));
         }
