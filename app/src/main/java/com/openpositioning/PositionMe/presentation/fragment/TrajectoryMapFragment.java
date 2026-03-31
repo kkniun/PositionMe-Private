@@ -14,7 +14,6 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Spinner;
 import android.widget.TextView;
-import com.google.android.material.switchmaterial.SwitchMaterial;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -70,7 +69,7 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
     private static final double CAMERA_RECENTER_DISTANCE_METERS = 4.0;
     private static final long CAMERA_RECENTER_INTERVAL_MS = 1_500L;
-    private static final double LIVE_TRACK_SEGMENT_MIN_METERS = 0.22;
+    private static final double LIVE_TRACK_SEGMENT_MIN_METERS = 0.06;
     private static final double LIVE_TRACK_SEGMENT_MAX_METERS = 4.5;
     private GoogleMap gMap; // Google Maps instance
     private LatLng currentLocation; // Stores the user's current location
@@ -96,6 +95,7 @@ public class TrajectoryMapFragment extends Fragment {
     private LatLng lastRenderedRawLastPoint;
     private int lastRenderedLogicalFloor = Integer.MIN_VALUE;
     private final List<LatLng> cachedDisplayHistory = new ArrayList<>();
+    private final List<LatLng> latestRawFusedHistory = new ArrayList<>();
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
@@ -108,13 +108,12 @@ public class TrajectoryMapFragment extends Fragment {
     private Runnable autoFloorTask;
 
     // UI
+    private View mapControlsCard;
     private Spinner switchMapSpinner;
-
-    private SwitchMaterial gnssSwitch;
-    private SwitchMaterial autoFloorSwitch;
 
     private com.google.android.material.floatingactionbutton.FloatingActionButton floorUpButton, floorDownButton;
     private TextView floorLabel;
+    private boolean previewFloorOnlyMode;
 
 
     public TrajectoryMapFragment() {
@@ -136,12 +135,12 @@ public class TrajectoryMapFragment extends Fragment {
         super.onViewCreated(view, savedInstanceState);
 
         // Grab references to UI controls
+        mapControlsCard  = view.findViewById(R.id.mapControlsCard);
         switchMapSpinner = view.findViewById(R.id.mapSwitchSpinner);
-        gnssSwitch      = view.findViewById(R.id.gnssSwitch);
-        autoFloorSwitch = view.findViewById(R.id.autoFloor);
         floorUpButton   = view.findViewById(R.id.floorUpButton);
         floorDownButton = view.findViewById(R.id.floorDownButton);
         floorLabel      = view.findViewById(R.id.floorLabel);
+        applyOverlayMode();
 
         // Setup floor up/down UI hidden initially until we know there's an indoor map
         setFloorControlsVisibility(View.GONE);
@@ -198,19 +197,12 @@ public class TrajectoryMapFragment extends Fragment {
         });
     }
 
+    public void setPreviewFloorOnlyMode(boolean enabled) {
+        previewFloorOnlyMode = enabled;
+        applyOverlayMode();
+    }
+
     private void configureAlwaysOnControls() {
-        if (gnssSwitch != null) {
-            gnssSwitch.setText(R.string.gnss_always_on);
-            gnssSwitch.setChecked(true);
-            gnssSwitch.setClickable(false);
-            gnssSwitch.setFocusable(false);
-        }
-        if (autoFloorSwitch != null) {
-            autoFloorSwitch.setText(R.string.auto_floor_always_on);
-            autoFloorSwitch.setChecked(true);
-            autoFloorSwitch.setClickable(false);
-            autoFloorSwitch.setFocusable(false);
-        }
         isGnssOn = true;
     }
 
@@ -320,6 +312,7 @@ public class TrajectoryMapFragment extends Fragment {
                 syncDisplayedFloor();
                 setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
             }
+            refreshLivePolylineTail();
             return newLocation;
         }
 
@@ -347,6 +340,7 @@ public class TrajectoryMapFragment extends Fragment {
             syncDisplayedFloor();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
         }
+        refreshLivePolylineTail();
         return newLocation;
     }
 
@@ -425,11 +419,14 @@ public class TrajectoryMapFragment extends Fragment {
         if (fusedHistory == null) {
             polyline.setPoints(Collections.emptyList());
             cachedDisplayHistory.clear();
+            latestRawFusedHistory.clear();
             lastRenderedRawHistorySize = 0;
             lastRenderedRawLastPoint = null;
             lastRenderedLogicalFloor = Integer.MIN_VALUE;
             return;
         }
+        latestRawFusedHistory.clear();
+        latestRawFusedHistory.addAll(fusedHistory);
         if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
             int currentLogicalFloor = indoorMapManager.getCurrentLogicalFloor();
             boolean needFullRebuild = cachedDisplayHistory.isEmpty()
@@ -491,10 +488,14 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     private void setFloorControlsVisibility(int visibility) {
-        floorUpButton.setVisibility(visibility);
-        floorDownButton.setVisibility(visibility);
         floorLabel.setVisibility(visibility);
-        autoFloorSwitch.setVisibility(visibility);
+        if (previewFloorOnlyMode) {
+            floorUpButton.setVisibility(View.GONE);
+            floorDownButton.setVisibility(View.GONE);
+        } else {
+            floorUpButton.setVisibility(visibility);
+            floorDownButton.setVisibility(visibility);
+        }
         if (visibility == View.VISIBLE) {
             updateFloorLabel();
         }
@@ -812,6 +813,17 @@ public class TrajectoryMapFragment extends Fragment {
                     displayPath.add(candidate);
                 }
             }
+            if (!displayPath.isEmpty()
+                    && UtilFunctions.distanceBetweenPoints(
+                    displayPath.get(displayPath.size() - 1),
+                    currentLocation
+            ) >= LIVE_TRACK_SEGMENT_MIN_METERS
+                    && UtilFunctions.distanceBetweenPoints(
+                    displayPath.get(displayPath.size() - 1),
+                    currentLocation
+            ) <= 0.75) {
+                displayPath.add(currentLocation);
+            }
             return displayPath;
         }
 
@@ -825,8 +837,33 @@ public class TrajectoryMapFragment extends Fragment {
         return displayPath;
     }
 
+    private void refreshLivePolylineTail() {
+        if (polyline == null || latestRawFusedHistory.isEmpty()) {
+            return;
+        }
+        if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
+            polyline.setPoints(buildLiveDisplayPath(cachedDisplayHistory, latestRawFusedHistory));
+            return;
+        }
+        polyline.setPoints(buildLiveDisplayPath(latestRawFusedHistory, latestRawFusedHistory));
+    }
+
     private float absoluteBearingDelta(float first, float second) {
         float delta = Math.abs(normalizeDegrees(first) - normalizeDegrees(second));
         return delta > 180f ? 360f - delta : delta;
+    }
+
+    private void applyOverlayMode() {
+        if (mapControlsCard != null) {
+            mapControlsCard.setVisibility(previewFloorOnlyMode ? View.GONE : View.VISIBLE);
+        }
+        if (previewFloorOnlyMode) {
+            if (floorUpButton != null) {
+                floorUpButton.setVisibility(View.GONE);
+            }
+            if (floorDownButton != null) {
+                floorDownButton.setVisibility(View.GONE);
+            }
+        }
     }
 }

@@ -126,6 +126,7 @@ public class HomeFragment extends Fragment {
                     .replace(R.id.mapFragmentContainer, trajectoryMapFragment)
                     .commit();
         }
+        trajectoryMapFragment.setPreviewFloorOnlyMode(true);
         lastRenderedPositionVersion = -1L;
         lastRenderedFusedTrackVersion = -1L;
         lastRenderedObservationVersion = -1L;

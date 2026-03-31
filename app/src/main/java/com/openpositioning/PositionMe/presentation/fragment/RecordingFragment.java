@@ -138,6 +138,7 @@ public class RecordingFragment extends Fragment {
                     .replace(R.id.trajectoryMapFragmentContainer, trajectoryMapFragment)
                     .commit();
         }
+        trajectoryMapFragment.setPreviewFloorOnlyMode(false);
         lastRenderedPositionVersion = -1L;
         lastRenderedFusedTrackVersion = -1L;
         lastRenderedObservationVersion = -1L;
