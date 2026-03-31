@@ -14,7 +14,6 @@ public class IndoorFloorController {
     private static final double TRANSITION_ZONE_RADIUS_METERS = 6.0;
     private static final double LIFT_HORIZONTAL_MAX_METERS = 2.0;
     private static final double STAIRS_HORIZONTAL_MIN_METERS = 0.8;
-    private static final double WIFI_FLOOR_TOLERANCE = 1.0;
     private static final float FLOOR_CHANGE_TRIGGER_RATIO = 0.38f;
     private static final float MIN_VERTICAL_CHANGE_METERS = 2.4f;
     private static final float ABSOLUTE_ELEVATION_SWITCH_METERS = 4.0f;
@@ -111,7 +110,7 @@ public class IndoorFloorController {
                 spatialModel.getCurrentBuildingId(),
                 baselineLogicalFloor + floorDelta
         );
-        if (wifiFloor != null && Math.abs(wifiFloor - candidateFloor) <= WIFI_FLOOR_TOLERANCE) {
+        if (wifiFloor != null && wifiFloor == candidateFloor) {
             candidateFloor = spatialModel.clampLogicalFloor(
                     spatialModel.getCurrentBuildingId(),
                     wifiFloor

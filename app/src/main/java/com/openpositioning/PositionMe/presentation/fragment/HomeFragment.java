@@ -53,6 +53,7 @@ public class HomeFragment extends Fragment {
     private TrajectoryMapFragment trajectoryMapFragment;
     private final Handler previewHandler = new Handler(Looper.getMainLooper());
     private LatLng lastFloorplanRequestPosition;
+    private long lastRenderedPositionVersion = -1L;
     private long lastRenderedFusedTrackVersion = -1L;
     private long lastRenderedObservationVersion = -1L;
 
@@ -125,6 +126,7 @@ public class HomeFragment extends Fragment {
                     .replace(R.id.mapFragmentContainer, trajectoryMapFragment)
                     .commit();
         }
+        lastRenderedPositionVersion = -1L;
         lastRenderedFusedTrackVersion = -1L;
         lastRenderedObservationVersion = -1L;
     }
@@ -185,9 +187,12 @@ public class HomeFragment extends Fragment {
             return;
         }
 
+        long positionVersion = sensorFusion.getCurrentFusedPositionVersion();
         long fusedTrackVersion = sensorFusion.getFusedTrackVersion();
-        if (fusedTrackVersion != lastRenderedFusedTrackVersion) {
+        if (fusedTrackVersion != lastRenderedFusedTrackVersion
+                || positionVersion != lastRenderedPositionVersion) {
             trajectoryMapFragment.renderFusedHistory(sensorFusion.getFusedTrack());
+            lastRenderedPositionVersion = positionVersion;
             lastRenderedFusedTrackVersion = fusedTrackVersion;
         }
 

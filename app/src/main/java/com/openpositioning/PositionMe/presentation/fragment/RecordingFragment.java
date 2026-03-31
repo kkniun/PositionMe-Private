@@ -82,6 +82,7 @@ public class RecordingFragment extends Fragment {
     // Distance tracking
     private float distance = 0f;
     private LatLng previousDisplayedLocation;
+    private long lastRenderedPositionVersion = -1L;
     private long lastRenderedFusedTrackVersion = -1L;
     private long lastRenderedObservationVersion = -1L;
 
@@ -137,6 +138,7 @@ public class RecordingFragment extends Fragment {
                     .replace(R.id.trajectoryMapFragmentContainer, trajectoryMapFragment)
                     .commit();
         }
+        lastRenderedPositionVersion = -1L;
         lastRenderedFusedTrackVersion = -1L;
         lastRenderedObservationVersion = -1L;
 
@@ -306,9 +308,12 @@ public class RecordingFragment extends Fragment {
             return;
         }
 
+        long positionVersion = sensorFusion.getCurrentFusedPositionVersion();
         long fusedTrackVersion = sensorFusion.getFusedTrackVersion();
-        if (fusedTrackVersion != lastRenderedFusedTrackVersion) {
+        if (fusedTrackVersion != lastRenderedFusedTrackVersion
+                || positionVersion != lastRenderedPositionVersion) {
             trajectoryMapFragment.renderFusedHistory(sensorFusion.getFusedTrack());
+            lastRenderedPositionVersion = positionVersion;
             lastRenderedFusedTrackVersion = fusedTrackVersion;
         }
 

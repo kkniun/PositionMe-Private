@@ -70,6 +70,8 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
     private static final double CAMERA_RECENTER_DISTANCE_METERS = 4.0;
     private static final long CAMERA_RECENTER_INTERVAL_MS = 1_500L;
+    private static final double LIVE_TRACK_SEGMENT_MIN_METERS = 0.22;
+    private static final double LIVE_TRACK_SEGMENT_MAX_METERS = 4.5;
     private GoogleMap gMap; // Google Maps instance
     private LatLng currentLocation; // Stores the user's current location
     private Marker directionMarker; // Current user direction arrow
@@ -467,7 +469,7 @@ public class TrajectoryMapFragment extends Fragment {
                     ? null
                     : fusedHistory.get(fusedHistory.size() - 1);
             lastRenderedLogicalFloor = currentLogicalFloor;
-            polyline.setPoints(cachedDisplayHistory);
+            polyline.setPoints(buildLiveDisplayPath(cachedDisplayHistory, fusedHistory));
             return;
         }
         cachedDisplayHistory.clear();
@@ -476,7 +478,7 @@ public class TrajectoryMapFragment extends Fragment {
                 ? null
                 : fusedHistory.get(fusedHistory.size() - 1);
         lastRenderedLogicalFloor = Integer.MIN_VALUE;
-        polyline.setPoints(fusedHistory);
+        polyline.setPoints(buildLiveDisplayPath(fusedHistory, fusedHistory));
     }
 
     public void renderObservationTails(@Nullable List<LatLng> gnssTrail,
@@ -779,6 +781,48 @@ public class TrajectoryMapFragment extends Fragment {
             value += 360f;
         }
         return value;
+    }
+
+    private List<LatLng> buildLiveDisplayPath(@NonNull List<LatLng> committedDisplayPath,
+                                              @NonNull List<LatLng> rawFusedHistory) {
+        if (currentLocation == null || rawFusedHistory.isEmpty()) {
+            return committedDisplayPath;
+        }
+
+        LatLng lastRawPoint = rawFusedHistory.get(rawFusedHistory.size() - 1);
+        double liveSegmentDistance = UtilFunctions.distanceBetweenPoints(lastRawPoint, currentLocation);
+        if (liveSegmentDistance < LIVE_TRACK_SEGMENT_MIN_METERS
+                || liveSegmentDistance > LIVE_TRACK_SEGMENT_MAX_METERS) {
+            return committedDisplayPath;
+        }
+
+        List<LatLng> displayPath = new ArrayList<>(committedDisplayPath);
+        if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
+            List<LatLng> liveSegment = indoorMapManager.buildLegalDisplaySegment(
+                    lastRawPoint,
+                    currentLocation
+            );
+            for (int i = 1; i < liveSegment.size(); i++) {
+                LatLng candidate = liveSegment.get(i);
+                if (displayPath.isEmpty()
+                        || UtilFunctions.distanceBetweenPoints(
+                        displayPath.get(displayPath.size() - 1),
+                        candidate
+                ) >= 0.1) {
+                    displayPath.add(candidate);
+                }
+            }
+            return displayPath;
+        }
+
+        if (displayPath.isEmpty()
+                || UtilFunctions.distanceBetweenPoints(
+                displayPath.get(displayPath.size() - 1),
+                currentLocation
+        ) >= 0.1) {
+            displayPath.add(currentLocation);
+        }
+        return displayPath;
     }
 
     private float absoluteBearingDelta(float first, float second) {
