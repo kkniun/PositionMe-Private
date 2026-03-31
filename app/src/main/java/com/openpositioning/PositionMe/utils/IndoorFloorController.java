@@ -5,25 +5,30 @@ import androidx.annotation.Nullable;
 import com.google.android.gms.maps.model.LatLng;
 
 /**
- * Indoor floor transition controller driven by barometric height change and indoor features.
+ * Indoor floor transition controller driven primarily by cumulative elevation change.
+ *
+ * <p>The current confirmed logical floor acts as an elevation anchor. Once the user is anchored
+ * to a floor, subsequent barometric height deltas are interpreted relative to that floor:
+ * approximately one floor-height down means the next lower floor, two floor-heights down means
+ * two floors lower, and climbing back up toward the anchor elevation returns to the anchor floor.</p>
  */
 public class IndoorFloorController {
 
-    private static final long FLOOR_CHANGE_DEBOUNCE_MS = 2_500L;
-    private static final long TRANSITION_ZONE_LATCH_MS = 6_000L;
+    private static final long FLOOR_CHANGE_DEBOUNCE_MS = 1_400L;
+    private static final long TRANSITION_ZONE_LATCH_MS = 8_000L;
     private static final double TRANSITION_ZONE_RADIUS_METERS = 6.0;
-    private static final double LIFT_HORIZONTAL_MAX_METERS = 2.0;
-    private static final double STAIRS_HORIZONTAL_MIN_METERS = 0.8;
-    private static final float FLOOR_CHANGE_TRIGGER_RATIO = 0.38f;
-    private static final float MIN_VERTICAL_CHANGE_METERS = 2.4f;
-    private static final float ABSOLUTE_ELEVATION_SWITCH_METERS = 4.0f;
+    private static final float STRONG_ABSOLUTE_SWITCH_METERS = 4.0f;
+    private static final float RECENTER_ELEVATION_RATIO = 0.22f;
+    private static final float RECENTER_ELEVATION_ALPHA = 0.18f;
+    private static final int MAX_FLOOR_OFFSET = 3;
+
     private final IndoorSpatialConstraintModel spatialModel;
 
-    private float baselineElevation = Float.NaN;
-    private LatLng baselineLocation;
-    private int baselineLogicalFloor;
-    private int lastCandidateFloor = Integer.MIN_VALUE;
-    private long lastCandidateSinceMs;
+    private float anchorElevation = Float.NaN;
+    private LatLng anchorLocation;
+    private int anchorLogicalFloor;
+    private int pendingCandidateFloor = Integer.MIN_VALUE;
+    private long pendingCandidateSinceMs;
     private long lastTransitionZoneSeenMs;
 
     public IndoorFloorController(IndoorSpatialConstraintModel spatialModel) {
@@ -31,11 +36,11 @@ public class IndoorFloorController {
     }
 
     public void reset() {
-        baselineElevation = Float.NaN;
-        baselineLocation = null;
-        baselineLogicalFloor = 0;
-        lastCandidateFloor = Integer.MIN_VALUE;
-        lastCandidateSinceMs = 0L;
+        anchorElevation = Float.NaN;
+        anchorLocation = null;
+        anchorLogicalFloor = 0;
+        pendingCandidateFloor = Integer.MIN_VALUE;
+        pendingCandidateSinceMs = 0L;
         lastTransitionZoneSeenMs = 0L;
     }
 
@@ -59,83 +64,107 @@ public class IndoorFloorController {
             return null;
         }
 
-        if (Float.isNaN(baselineElevation)) {
-            seedBaseline(currentPosition, elevationMeters);
-            return null;
-        }
-
-        float elevationDelta = elevationMeters - baselineElevation;
-        float absoluteElevationDelta = Math.abs(elevationDelta);
-        if (absoluteElevationDelta < Math.max(MIN_VERTICAL_CHANGE_METERS * 0.35f, 0.8f)) {
-            if (baselineLocation != null
-                    && UtilFunctions.distanceBetweenPoints(baselineLocation, currentPosition) > 10.0) {
-                seedBaseline(currentPosition, elevationMeters);
-            }
-            return null;
-        }
-
-        boolean absoluteElevationOverride =
-                absoluteElevationDelta >= ABSOLUTE_ELEVATION_SWITCH_METERS;
-        boolean strongVerticalCue = absoluteElevationOverride
-                || absoluteElevationDelta >= Math.max(
-                        MIN_VERTICAL_CHANGE_METERS,
-                        floorHeight * FLOOR_CHANGE_TRIGGER_RATIO
-                );
-        if (!strongVerticalCue) {
+        int currentLogicalFloor = spatialModel.getCurrentLogicalFloor();
+        if (Float.isNaN(anchorElevation)) {
+            seedAnchor(currentPosition, elevationMeters, currentLogicalFloor);
             return null;
         }
 
         boolean nearLift = isNearTransitionFeature(currentPosition, "lift");
         boolean nearStairs = isNearTransitionFeature(currentPosition, "stairs");
-        if (nearLift || nearStairs) {
+        if (nearLift || nearStairs || elevatorHint) {
             lastTransitionZoneSeenMs = timestampMillis;
         }
-        boolean inLatchedTransitionWindow =
+        boolean transitionSupported =
                 timestampMillis - lastTransitionZoneSeenMs <= TRANSITION_ZONE_LATCH_MS;
 
-        double horizontalMovement = baselineLocation == null
-                ? 0d
-                : UtilFunctions.distanceBetweenPoints(baselineLocation, currentPosition);
+        float elevationDelta = elevationMeters - anchorElevation;
+        int estimatedOffset = estimateFloorOffset(
+                elevationDelta,
+                floorHeight,
+                transitionSupported || elevatorHint
+        );
 
-        boolean liftLike = (nearLift || inLatchedTransitionWindow)
-                && (elevatorHint || horizontalMovement <= LIFT_HORIZONTAL_MAX_METERS);
-        boolean stairsLike = (nearStairs || inLatchedTransitionWindow)
-                && horizontalMovement >= STAIRS_HORIZONTAL_MIN_METERS;
-        if (!liftLike && !stairsLike && !absoluteElevationOverride) {
+        if (estimatedOffset == 0) {
+            clearPendingCandidate();
+            recenterAnchorIfStable(currentPosition, elevationMeters, floorHeight);
             return null;
         }
 
-        int floorDelta = elevationDelta >= 0f ? 1 : -1;
         int candidateFloor = spatialModel.clampLogicalFloor(
                 spatialModel.getCurrentBuildingId(),
-                baselineLogicalFloor + floorDelta
+                anchorLogicalFloor + estimatedOffset
         );
+
+        if (candidateFloor == currentLogicalFloor) {
+            clearPendingCandidate();
+            recenterAnchorIfStable(currentPosition, elevationMeters, floorHeight);
+            return null;
+        }
+
         if (wifiFloor != null && wifiFloor == candidateFloor) {
-            candidateFloor = spatialModel.clampLogicalFloor(
-                    spatialModel.getCurrentBuildingId(),
-                    wifiFloor
-            );
+            transitionSupported = true;
         }
-        if (candidateFloor == spatialModel.getCurrentLogicalFloor()) {
+
+        boolean strongAbsoluteCue = Math.abs(elevationDelta) >= STRONG_ABSOLUTE_SWITCH_METERS;
+        if (!transitionSupported && !strongAbsoluteCue) {
+            clearPendingCandidate();
             return null;
         }
 
-        if (candidateFloor != lastCandidateFloor) {
-            lastCandidateFloor = candidateFloor;
-            lastCandidateSinceMs = timestampMillis;
+        if (candidateFloor != pendingCandidateFloor) {
+            pendingCandidateFloor = candidateFloor;
+            pendingCandidateSinceMs = timestampMillis;
             return null;
         }
 
-        if (timestampMillis - lastCandidateSinceMs < FLOOR_CHANGE_DEBOUNCE_MS) {
+        long debounceMs = wifiFloor != null && wifiFloor == candidateFloor
+                ? FLOOR_CHANGE_DEBOUNCE_MS / 2
+                : FLOOR_CHANGE_DEBOUNCE_MS;
+        if (timestampMillis - pendingCandidateSinceMs < debounceMs) {
             return null;
         }
 
         spatialModel.setCurrentLogicalFloor(candidateFloor);
-        seedBaseline(currentPosition, elevationMeters);
-        lastCandidateFloor = Integer.MIN_VALUE;
-        lastCandidateSinceMs = 0L;
+        seedAnchor(currentPosition, elevationMeters, candidateFloor);
+        clearPendingCandidate();
         lastTransitionZoneSeenMs = timestampMillis;
         return spatialModel.getCurrentLogicalFloor();
+    }
+
+    private int estimateFloorOffset(float elevationDelta,
+                                    float floorHeight,
+                                    boolean transitionSupported) {
+        float absoluteDelta = Math.abs(elevationDelta);
+        float floorChangeThreshold = transitionSupported
+                ? Math.max(2.6f, floorHeight * 0.64f)
+                : Math.max(3.2f, floorHeight * 0.82f);
+
+        if (absoluteDelta < floorChangeThreshold) {
+            return 0;
+        }
+
+        int roundedOffset = Math.round(elevationDelta / floorHeight);
+        if (roundedOffset == 0) {
+            roundedOffset = elevationDelta > 0f ? 1 : -1;
+        }
+        roundedOffset = Math.max(-MAX_FLOOR_OFFSET, Math.min(MAX_FLOOR_OFFSET, roundedOffset));
+        return roundedOffset;
+    }
+
+    private void recenterAnchorIfStable(LatLng currentPosition,
+                                        float elevationMeters,
+                                        float floorHeight) {
+        if (Float.isNaN(anchorElevation)) {
+            return;
+        }
+        float elevationDelta = elevationMeters - anchorElevation;
+        if (Math.abs(elevationDelta) > Math.max(0.9f, floorHeight * RECENTER_ELEVATION_RATIO)) {
+            return;
+        }
+        anchorElevation += elevationDelta * RECENTER_ELEVATION_ALPHA;
+        anchorLocation = currentPosition;
+        anchorLogicalFloor = spatialModel.getCurrentLogicalFloor();
     }
 
     private boolean isNearTransitionFeature(LatLng currentPosition, String indoorType) {
@@ -155,9 +184,14 @@ public class IndoorFloorController {
         return false;
     }
 
-    private void seedBaseline(LatLng currentPosition, float elevationMeters) {
-        baselineElevation = elevationMeters;
-        baselineLocation = currentPosition;
-        baselineLogicalFloor = spatialModel.getCurrentLogicalFloor();
+    private void seedAnchor(LatLng currentPosition, float elevationMeters, int logicalFloor) {
+        anchorElevation = elevationMeters;
+        anchorLocation = currentPosition;
+        anchorLogicalFloor = logicalFloor;
+    }
+
+    private void clearPendingCandidate() {
+        pendingCandidateFloor = Integer.MIN_VALUE;
+        pendingCandidateSinceMs = 0L;
     }
 }

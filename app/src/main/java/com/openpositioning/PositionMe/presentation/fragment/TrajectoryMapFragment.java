@@ -69,8 +69,10 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
     private static final double CAMERA_RECENTER_DISTANCE_METERS = 4.0;
     private static final long CAMERA_RECENTER_INTERVAL_MS = 1_500L;
-    private static final double LIVE_TRACK_SEGMENT_MIN_METERS = 0.06;
-    private static final double LIVE_TRACK_SEGMENT_MAX_METERS = 4.5;
+    private static final int MAX_TRACK_HISTORY_POINTS = 600;
+    private static final double TRACK_APPEND_DISTANCE_METERS = 0.06;
+    private static final double TRACK_REPLACE_DISTANCE_METERS = 0.03;
+    private static final double MAX_TRACK_APPEND_DISTANCE_METERS = 6.0;
     private GoogleMap gMap; // Google Maps instance
     private LatLng currentLocation; // Stores the user's current location
     private Marker directionMarker; // Current user direction arrow
@@ -91,11 +93,7 @@ public class TrajectoryMapFragment extends Fragment {
     private float lastDirectionDegrees = 0f;
     private LatLng lastCameraLocation;
     private long lastCameraUpdateMs;
-    private int lastRenderedRawHistorySize;
-    private LatLng lastRenderedRawLastPoint;
-    private int lastRenderedLogicalFloor = Integer.MIN_VALUE;
-    private final List<LatLng> cachedDisplayHistory = new ArrayList<>();
-    private final List<LatLng> latestRawFusedHistory = new ArrayList<>();
+    private final List<LatLng> userTrackHistory = new ArrayList<>();
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
@@ -312,7 +310,7 @@ public class TrajectoryMapFragment extends Fragment {
                 syncDisplayedFloor();
                 setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
             }
-            refreshLivePolylineTail();
+            updateTrackHistory(newLocation);
             return newLocation;
         }
 
@@ -340,7 +338,7 @@ public class TrajectoryMapFragment extends Fragment {
             syncDisplayedFloor();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
         }
-        refreshLivePolylineTail();
+        updateTrackHistory(newLocation);
         return newLocation;
     }
 
@@ -417,65 +415,13 @@ public class TrajectoryMapFragment extends Fragment {
     public void renderFusedHistory(@Nullable List<LatLng> fusedHistory) {
         if (polyline == null) return;
         if (fusedHistory == null) {
-            polyline.setPoints(Collections.emptyList());
-            cachedDisplayHistory.clear();
-            latestRawFusedHistory.clear();
-            lastRenderedRawHistorySize = 0;
-            lastRenderedRawLastPoint = null;
-            lastRenderedLogicalFloor = Integer.MIN_VALUE;
+            clearTrackHistory();
             return;
         }
-        latestRawFusedHistory.clear();
-        latestRawFusedHistory.addAll(fusedHistory);
-        if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
-            int currentLogicalFloor = indoorMapManager.getCurrentLogicalFloor();
-            boolean needFullRebuild = cachedDisplayHistory.isEmpty()
-                    || fusedHistory.isEmpty()
-                    || fusedHistory.size() < lastRenderedRawHistorySize
-                    || lastRenderedRawHistorySize == 0
-                    || lastRenderedLogicalFloor != currentLogicalFloor
-                    || lastRenderedRawLastPoint == null
-                    || UtilFunctions.distanceBetweenPoints(
-                    lastRenderedRawLastPoint,
-                    fusedHistory.get(lastRenderedRawHistorySize - 1)
-            ) > 0.25;
-
-            if (needFullRebuild) {
-                cachedDisplayHistory.clear();
-                cachedDisplayHistory.addAll(indoorMapManager.buildLegalDisplayPath(fusedHistory));
-            } else {
-                for (int i = lastRenderedRawHistorySize; i < fusedHistory.size(); i++) {
-                    LatLng previous = fusedHistory.get(i - 1);
-                    LatLng current = fusedHistory.get(i);
-                    List<LatLng> segment = indoorMapManager.buildLegalDisplaySegment(previous, current);
-                    for (int j = 1; j < segment.size(); j++) {
-                        LatLng candidate = segment.get(j);
-                        if (cachedDisplayHistory.isEmpty()
-                                || UtilFunctions.distanceBetweenPoints(
-                                cachedDisplayHistory.get(cachedDisplayHistory.size() - 1),
-                                candidate
-                        ) >= 0.1) {
-                            cachedDisplayHistory.add(candidate);
-                        }
-                    }
-                }
-            }
-
-            lastRenderedRawHistorySize = fusedHistory.size();
-            lastRenderedRawLastPoint = fusedHistory.isEmpty()
-                    ? null
-                    : fusedHistory.get(fusedHistory.size() - 1);
-            lastRenderedLogicalFloor = currentLogicalFloor;
-            polyline.setPoints(buildLiveDisplayPath(cachedDisplayHistory, fusedHistory));
+        if (fusedHistory.isEmpty()) {
+            clearTrackHistory();
             return;
         }
-        cachedDisplayHistory.clear();
-        lastRenderedRawHistorySize = fusedHistory.size();
-        lastRenderedRawLastPoint = fusedHistory.isEmpty()
-                ? null
-                : fusedHistory.get(fusedHistory.size() - 1);
-        lastRenderedLogicalFloor = Integer.MIN_VALUE;
-        polyline.setPoints(buildLiveDisplayPath(fusedHistory, fusedHistory));
     }
 
     public void renderObservationTails(@Nullable List<LatLng> gnssTrail,
@@ -531,10 +477,7 @@ public class TrajectoryMapFragment extends Fragment {
         lastDirectionDegrees = 0f;
         lastCameraLocation = null;
         lastCameraUpdateMs = 0L;
-        lastRenderedRawHistorySize = 0;
-        lastRenderedRawLastPoint = null;
-        lastRenderedLogicalFloor = Integer.MIN_VALUE;
-        cachedDisplayHistory.clear();
+        userTrackHistory.clear();
 
         // Clear test point markers
         for (com.google.android.gms.maps.model.Marker m : testPointMarkers) {
@@ -784,68 +727,46 @@ public class TrajectoryMapFragment extends Fragment {
         return value;
     }
 
-    private List<LatLng> buildLiveDisplayPath(@NonNull List<LatLng> committedDisplayPath,
-                                              @NonNull List<LatLng> rawFusedHistory) {
-        if (currentLocation == null || rawFusedHistory.isEmpty()) {
-            return committedDisplayPath;
+    private void updateTrackHistory(@NonNull LatLng location) {
+        if (polyline == null) {
+            return;
         }
 
-        LatLng lastRawPoint = rawFusedHistory.get(rawFusedHistory.size() - 1);
-        double liveSegmentDistance = UtilFunctions.distanceBetweenPoints(lastRawPoint, currentLocation);
-        if (liveSegmentDistance < LIVE_TRACK_SEGMENT_MIN_METERS
-                || liveSegmentDistance > LIVE_TRACK_SEGMENT_MAX_METERS) {
-            return committedDisplayPath;
+        if (userTrackHistory.isEmpty()) {
+            userTrackHistory.add(location);
+            polyline.setPoints(new ArrayList<>(userTrackHistory));
+            return;
         }
 
-        List<LatLng> displayPath = new ArrayList<>(committedDisplayPath);
-        if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
-            List<LatLng> liveSegment = indoorMapManager.buildLegalDisplaySegment(
-                    lastRawPoint,
-                    currentLocation
-            );
-            for (int i = 1; i < liveSegment.size(); i++) {
-                LatLng candidate = liveSegment.get(i);
-                if (displayPath.isEmpty()
-                        || UtilFunctions.distanceBetweenPoints(
-                        displayPath.get(displayPath.size() - 1),
-                        candidate
-                ) >= 0.1) {
-                    displayPath.add(candidate);
-                }
+        int lastIndex = userTrackHistory.size() - 1;
+        LatLng lastPoint = userTrackHistory.get(lastIndex);
+        double distanceMeters = UtilFunctions.distanceBetweenPoints(lastPoint, location);
+
+        if (distanceMeters <= TRACK_REPLACE_DISTANCE_METERS) {
+            userTrackHistory.set(lastIndex, location);
+            polyline.setPoints(new ArrayList<>(userTrackHistory));
+            return;
+        }
+
+        if (distanceMeters <= MAX_TRACK_APPEND_DISTANCE_METERS
+                && distanceMeters >= TRACK_APPEND_DISTANCE_METERS) {
+            userTrackHistory.add(location);
+            while (userTrackHistory.size() > MAX_TRACK_HISTORY_POINTS) {
+                userTrackHistory.remove(0);
             }
-            if (!displayPath.isEmpty()
-                    && UtilFunctions.distanceBetweenPoints(
-                    displayPath.get(displayPath.size() - 1),
-                    currentLocation
-            ) >= LIVE_TRACK_SEGMENT_MIN_METERS
-                    && UtilFunctions.distanceBetweenPoints(
-                    displayPath.get(displayPath.size() - 1),
-                    currentLocation
-            ) <= 0.75) {
-                displayPath.add(currentLocation);
-            }
-            return displayPath;
+            polyline.setPoints(new ArrayList<>(userTrackHistory));
+            return;
         }
 
-        if (displayPath.isEmpty()
-                || UtilFunctions.distanceBetweenPoints(
-                displayPath.get(displayPath.size() - 1),
-                currentLocation
-        ) >= 0.1) {
-            displayPath.add(currentLocation);
-        }
-        return displayPath;
+        userTrackHistory.set(lastIndex, location);
+        polyline.setPoints(new ArrayList<>(userTrackHistory));
     }
 
-    private void refreshLivePolylineTail() {
-        if (polyline == null || latestRawFusedHistory.isEmpty()) {
-            return;
+    private void clearTrackHistory() {
+        userTrackHistory.clear();
+        if (polyline != null) {
+            polyline.setPoints(Collections.emptyList());
         }
-        if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
-            polyline.setPoints(buildLiveDisplayPath(cachedDisplayHistory, latestRawFusedHistory));
-            return;
-        }
-        polyline.setPoints(buildLiveDisplayPath(latestRawFusedHistory, latestRawFusedHistory));
     }
 
     private float absoluteBearingDelta(float first, float second) {
