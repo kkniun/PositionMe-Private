@@ -39,7 +39,9 @@ import com.google.android.gms.maps.model.PolylineOptions;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 
 /**
@@ -93,7 +95,8 @@ public class TrajectoryMapFragment extends Fragment {
     private float lastDirectionDegrees = 0f;
     private LatLng lastCameraLocation;
     private long lastCameraUpdateMs;
-    private final List<LatLng> userTrackHistory = new ArrayList<>();
+    private final Map<Integer, List<LatLng>> userTrackHistoryByFloor = new HashMap<>();
+    private int activeTrackFloor = Integer.MIN_VALUE;
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
@@ -182,6 +185,7 @@ public class TrajectoryMapFragment extends Fragment {
             if (indoorMapManager != null) {
                 indoorMapManager.increaseFloor();
                 sensorFusion.setCurrentLogicalFloor(indoorMapManager.getCurrentLogicalFloor());
+                syncActiveTrackFloorWithDisplayedFloor();
                 updateFloorLabel();
             }
         });
@@ -190,6 +194,7 @@ public class TrajectoryMapFragment extends Fragment {
             if (indoorMapManager != null) {
                 indoorMapManager.decreaseFloor();
                 sensorFusion.setCurrentLogicalFloor(indoorMapManager.getCurrentLogicalFloor());
+                syncActiveTrackFloorWithDisplayedFloor();
                 updateFloorLabel();
             }
         });
@@ -300,6 +305,7 @@ public class TrajectoryMapFragment extends Fragment {
         if (indoorMapManager != null) {
             indoorMapManager.setCurrentLocation(newLocation);
             syncDisplayedFloor();
+            syncActiveTrackFloorWithDisplayedFloor();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
             displayLocation = indoorMapManager.constrainPositionToLegalSpace(oldLocation, newLocation);
             indoorMapManager.setCurrentLocation(displayLocation);
@@ -474,7 +480,8 @@ public class TrajectoryMapFragment extends Fragment {
         lastDirectionDegrees = 0f;
         lastCameraLocation = null;
         lastCameraUpdateMs = 0L;
-        userTrackHistory.clear();
+        userTrackHistoryByFloor.clear();
+        activeTrackFloor = Integer.MIN_VALUE;
 
         // Clear test point markers
         for (com.google.android.gms.maps.model.Marker m : testPointMarkers) {
@@ -559,6 +566,7 @@ public class TrajectoryMapFragment extends Fragment {
 
         int resolvedFloor = sensorFusion.getPreferredDisplayLogicalFloor();
         indoorMapManager.setCurrentFloor(resolvedFloor, true);
+        syncActiveTrackFloorWithDisplayedFloor();
         updateFloorLabel();
     }
 
@@ -588,6 +596,7 @@ public class TrajectoryMapFragment extends Fragment {
         );
         if (resolvedFloor != null) {
             indoorMapManager.setCurrentFloor(resolvedFloor, true);
+            syncActiveTrackFloorWithDisplayedFloor();
             updateFloorLabel();
             return;
         }
@@ -629,6 +638,7 @@ public class TrajectoryMapFragment extends Fragment {
         }
         int preferredFloor = sensorFusion.getPreferredDisplayLogicalFloor();
         indoorMapManager.setCurrentFloor(preferredFloor, true);
+        syncActiveTrackFloorWithDisplayedFloor();
         updateFloorLabel();
     }
 
@@ -729,6 +739,8 @@ public class TrajectoryMapFragment extends Fragment {
             return;
         }
 
+        List<LatLng> userTrackHistory = getActiveTrackHistory();
+
         if (userTrackHistory.isEmpty()) {
             userTrackHistory.add(location);
             refreshDisplayedTrackPolyline();
@@ -760,7 +772,8 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     private void clearTrackHistory() {
-        userTrackHistory.clear();
+        userTrackHistoryByFloor.clear();
+        activeTrackFloor = Integer.MIN_VALUE;
         if (polyline != null) {
             polyline.setPoints(Collections.emptyList());
         }
@@ -770,10 +783,31 @@ public class TrajectoryMapFragment extends Fragment {
         if (polyline == null) {
             return;
         }
+        List<LatLng> activeHistory = getActiveTrackHistory();
         List<LatLng> displayPath = indoorMapManager == null
-                ? new ArrayList<>(userTrackHistory)
-                : indoorMapManager.buildLegalDisplayPath(userTrackHistory);
+                ? new ArrayList<>(activeHistory)
+                : indoorMapManager.buildLegalDisplayPath(activeHistory);
         polyline.setPoints(displayPath);
+    }
+
+    private List<LatLng> getActiveTrackHistory() {
+        int floorKey = activeTrackFloor != Integer.MIN_VALUE ? activeTrackFloor : 0;
+        return userTrackHistoryByFloor.computeIfAbsent(floorKey, ignored -> new ArrayList<>());
+    }
+
+    private void syncActiveTrackFloorWithDisplayedFloor() {
+        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
+            return;
+        }
+        int displayedFloor = indoorMapManager.getCurrentLogicalFloor();
+        if (displayedFloor == activeTrackFloor) {
+            return;
+        }
+        activeTrackFloor = displayedFloor;
+        refreshDisplayedTrackPolyline();
+        clearCircles(gnssTailCircles);
+        clearCircles(wifiTailCircles);
+        clearCircles(pdrTailCircles);
     }
 
     private float absoluteBearingDelta(float first, float second) {

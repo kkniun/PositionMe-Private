@@ -79,6 +79,7 @@ public class IndoorMapManager {
     private static final double WALL_EXIT_OFFSET_METERS = 0.12;
     private static final double LIVE_ROUTE_PROGRESS_MIN_METERS = 0.45;
     private static final double LIVE_ROUTE_PROGRESS_GAIN = 1.35;
+    private static final double WALL_BLOCK_SAMPLE_SPACING_METERS = 0.6;
 
     private int cachedRouteFloor = Integer.MIN_VALUE;
     private List<LatLng> cachedRouteNodes = new ArrayList<>();
@@ -407,14 +408,6 @@ public class IndoorMapManager {
         double directDistance = UtilFunctions.distanceBetweenPoints(start, end);
         if (!isBlocked(start, end) && !isInsideWall(end)) {
             addDistinctPoint(routedPath, end);
-            return;
-        }
-
-        if (directDistance > MAX_ROUTABLE_SEGMENT_METERS) {
-            LatLng safe = constrainToLegalPath(start, end);
-            if (safe != null && !samePoint(routedPath.get(routedPath.size() - 1), safe)) {
-                addDistinctPoint(routedPath, safe);
-            }
             return;
         }
 
@@ -883,7 +876,25 @@ public class IndoorMapManager {
     }
 
     private boolean isBlocked(LatLng start, LatLng end) {
-        return isInsideWall(end) || segmentCrossesWall(start, end);
+        return isInsideWall(end)
+                || segmentCrossesWall(start, end)
+                || segmentPassesThroughWallBySampling(start, end);
+    }
+
+    private boolean segmentPassesThroughWallBySampling(LatLng start, LatLng end) {
+        double distanceMeters = UtilFunctions.distanceBetweenPoints(start, end);
+        if (distanceMeters <= WALL_BLOCK_SAMPLE_SPACING_METERS) {
+            return false;
+        }
+
+        int sampleCount = Math.max(1, (int) Math.ceil(distanceMeters / WALL_BLOCK_SAMPLE_SPACING_METERS));
+        for (int i = 1; i < sampleCount; i++) {
+            double ratio = (double) i / sampleCount;
+            if (isInsideWall(interpolate(start, end, ratio))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean isInsideWall(LatLng point) {
