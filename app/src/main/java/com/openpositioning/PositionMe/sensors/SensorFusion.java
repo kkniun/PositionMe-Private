@@ -603,16 +603,12 @@ public class SensorFusion implements SensorEventListener {
 
     public int getPreferredDisplayLogicalFloor() {
         int fusedFloor = getCurrentLogicalFloor();
-        if (getLatLngWifiPositioning() == null) {
+        if (isIndoorContextActive()) {
             return fusedFloor;
         }
 
-        int wifiFloor = getWifiFloor();
-        if (!isIndoorContextActive()) {
-            return wifiFloor;
-        }
-        if (fusedFloor == 0 && wifiFloor != 0) {
-            return wifiFloor;
+        if (getLatLngWifiPositioning() != null) {
+            return getWifiFloor();
         }
         return fusedFloor;
     }
@@ -630,12 +626,11 @@ public class SensorFusion implements SensorEventListener {
         if (indoorFloorController == null) {
             return null;
         }
-        Integer wifiFloor = getLatLngWifiPositioning() != null ? getWifiFloor() : null;
         Integer resolvedFloor = indoorFloorController.evaluate(
                 currentPosition,
                 state.elevation,
-                wifiFloor,
-                state.elevator,
+                null,
+                false,
                 timestampMillis
         );
         if (resolvedFloor != null && particleFilterEngine != null) {
