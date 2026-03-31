@@ -340,6 +340,7 @@ public class TrajectoryMapFragment extends Fragment {
             indoorMapManager.setCurrentLocation(constrainedLocation);
             if (sensorFusion != null && sensorFusion.isIndoorContextActive()) {
                 indoorMapManager.setCurrentFloor(sensorFusion.getCurrentLogicalFloor(), true);
+                updateFloorLabel();
             }
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
         }
@@ -466,7 +467,14 @@ public class TrajectoryMapFragment extends Fragment {
      * Updates the floor label text to reflect the current floor display name.
      */
     private void updateFloorLabel() {
-        if (floorLabel != null && indoorMapManager != null) {
+        if (floorLabel == null) {
+            return;
+        }
+        if (sensorFusion != null && sensorFusion.isIndoorContextActive()) {
+            floorLabel.setText(sensorFusion.getCurrentFloorDisplayName());
+            return;
+        }
+        if (indoorMapManager != null) {
             floorLabel.setText(indoorMapManager.getCurrentFloorDisplayName());
         }
     }

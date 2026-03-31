@@ -25,6 +25,8 @@ public class SensorEventHandler {
 
     private static final float ALPHA = 0.8f;
     private static final long LARGE_GAP_THRESHOLD_MS = 500;
+    // Device-specific compass bias: measured north points about 40 degrees east of true north.
+    private static final float TRUE_NORTH_CORRECTION_RAD = (float) Math.toRadians(-40.0);
 
     private final SensorState state;
     private final PdrProcessing pdrProcessing;
@@ -147,6 +149,9 @@ public class SensorEventHandler {
                 float[] rotationVectorDCM = new float[9];
                 SensorManager.getRotationMatrixFromVector(rotationVectorDCM, state.rotation);
                 SensorManager.getOrientation(rotationVectorDCM, state.orientation);
+                state.orientation[0] = normalizeRadians(
+                        state.orientation[0] + TRUE_NORTH_CORRECTION_RAD
+                );
                 break;
 
             case Sensor.TYPE_STEP_DETECTOR:
@@ -216,5 +221,16 @@ public class SensorEventHandler {
      */
     void resetBootTime(long newBootTime) {
         this.bootTime = newBootTime;
+    }
+
+    private float normalizeRadians(float radians) {
+        float value = radians;
+        while (value > Math.PI) {
+            value -= (float) (2d * Math.PI);
+        }
+        while (value < -Math.PI) {
+            value += (float) (2d * Math.PI);
+        }
+        return value;
     }
 }
