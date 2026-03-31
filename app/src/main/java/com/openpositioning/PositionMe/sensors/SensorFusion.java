@@ -532,10 +532,18 @@ public class SensorFusion implements SensorEventListener {
         return particleFilterEngine == null ? null : particleFilterEngine.getCurrentLatLng();
     }
 
+    public long getCurrentFusedPositionVersion() {
+        return particleFilterEngine == null ? 0L : particleFilterEngine.getCurrentPositionVersion();
+    }
+
     public List<LatLng> getFusedTrack() {
         return particleFilterEngine == null
                 ? new ArrayList<>()
                 : particleFilterEngine.getFusedHistory();
+    }
+
+    public long getFusedTrackVersion() {
+        return particleFilterEngine == null ? 0L : particleFilterEngine.getFusedHistoryVersion();
     }
 
     public List<LatLng> getRecentGnssTrail() {
@@ -554,6 +562,10 @@ public class SensorFusion implements SensorEventListener {
         return particleFilterEngine == null
                 ? new ArrayList<>()
                 : particleFilterEngine.getRecentPdrTail();
+    }
+
+    public long getObservationTrailsVersion() {
+        return particleFilterEngine == null ? 0L : particleFilterEngine.getObservationTrailsVersion();
     }
 
     /**

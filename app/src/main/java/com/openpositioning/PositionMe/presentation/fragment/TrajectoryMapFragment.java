@@ -305,8 +305,21 @@ public class TrajectoryMapFragment extends Fragment {
 
         // Keep track of current location
         LatLng oldLocation = this.currentLocation;
-        this.currentLocation = newLocation;
         float resolvedDirection = resolveDisplayDirection(oldLocation, newLocation, orientation);
+        boolean insignificantMove = oldLocation != null
+                && UtilFunctions.distanceBetweenPoints(oldLocation, newLocation) < 0.18;
+        boolean insignificantRotation = directionMarker != null
+                && absoluteBearingDelta(lastDirectionDegrees, resolvedDirection) < 2.5f;
+        this.currentLocation = newLocation;
+
+        if (insignificantMove && insignificantRotation) {
+            if (indoorMapManager != null) {
+                indoorMapManager.setCurrentLocation(newLocation);
+                syncDisplayedFloor();
+                setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
+            }
+            return newLocation;
+        }
 
         if (directionMarker == null) {
             updateDirectionMarker(newLocation, resolvedDirection);
@@ -333,6 +346,10 @@ public class TrajectoryMapFragment extends Fragment {
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
         }
         return newLocation;
+    }
+
+    public boolean isRenderSurfaceReady() {
+        return gMap != null && polyline != null;
     }
 
 
@@ -762,5 +779,10 @@ public class TrajectoryMapFragment extends Fragment {
             value += 360f;
         }
         return value;
+    }
+
+    private float absoluteBearingDelta(float first, float second) {
+        float delta = Math.abs(normalizeDegrees(first) - normalizeDegrees(second));
+        return delta > 180f ? 360f - delta : delta;
     }
 }

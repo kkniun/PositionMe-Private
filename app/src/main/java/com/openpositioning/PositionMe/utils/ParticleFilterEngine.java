@@ -55,6 +55,7 @@ public class ParticleFilterEngine {
     private final ArrayDeque<LatLng> wifiTail = new ArrayDeque<>();
     private final ArrayDeque<LatLng> pdrTail = new ArrayDeque<>();
     private final IndoorSpatialConstraintModel spatialConstraintModel;
+    private final AdaptivePlanarKalmanFilter displayKalmanFilter = new AdaptivePlanarKalmanFilter();
 
     private EnuReference reference;
     private boolean initialized;
@@ -76,6 +77,11 @@ public class ParticleFilterEngine {
     private LatLng currentLatLng;
     private long lastHistoryTimestamp;
     private long lastPdrMotionTimestamp;
+    private long currentPositionVersion;
+    private long fusedHistoryVersion;
+    private long gnssTailVersion;
+    private long wifiTailVersion;
+    private long pdrTailVersion;
 
     public ParticleFilterEngine() {
         this(new IndoorSpatialConstraintModel());
@@ -94,6 +100,7 @@ public class ParticleFilterEngine {
         gnssTail.clear();
         wifiTail.clear();
         pdrTail.clear();
+        displayKalmanFilter.reset();
         reference = null;
         initialized = false;
         hasDisplayPose = false;
@@ -113,6 +120,11 @@ public class ParticleFilterEngine {
         currentLatLng = null;
         lastHistoryTimestamp = 0L;
         lastPdrMotionTimestamp = 0L;
+        currentPositionVersion = 0L;
+        fusedHistoryVersion = 0L;
+        gnssTailVersion = 0L;
+        wifiTailVersion = 0L;
+        pdrTailVersion = 0L;
         spatialConstraintModel.reset();
     }
 
@@ -186,6 +198,18 @@ public class ParticleFilterEngine {
         return new ArrayList<>(fusedHistory);
     }
 
+    public synchronized long getCurrentPositionVersion() {
+        return currentPositionVersion;
+    }
+
+    public synchronized long getFusedHistoryVersion() {
+        return fusedHistoryVersion;
+    }
+
+    public synchronized long getObservationTrailsVersion() {
+        return gnssTailVersion + wifiTailVersion + pdrTailVersion;
+    }
+
     public synchronized List<LatLng> getRecentGnssTail() {
         return new ArrayList<>(gnssTail);
     }
@@ -219,7 +243,9 @@ public class ParticleFilterEngine {
         rawNorthing += deltaN;
         displayEasting = local[0];
         displayNorthing = local[1];
+        displayKalmanFilter.reset(local[0], local[1], timestampMillis);
         currentLatLng = corrected;
+        currentPositionVersion++;
         appendHistory(corrected, timestampMillis, true);
         spatialConstraintModel.updatePosition(corrected);
     }
@@ -332,7 +358,9 @@ public class ParticleFilterEngine {
 
         pdrTrackEasting += deltaE;
         pdrTrackNorthing += deltaN;
-        appendTail(pdrTail, reference.toLatLng(pdrTrackEasting, pdrTrackNorthing));
+        if (appendTail(pdrTail, reference.toLatLng(pdrTrackEasting, pdrTrackNorthing))) {
+            pdrTailVersion++;
+        }
 
         PoseEstimate estimate = estimatePose();
         commitPose(
@@ -341,7 +369,8 @@ public class ParticleFilterEngine {
                 estimate.headingRad,
                 estimate.logicalFloor,
                 timestampMillis,
-                0.22
+                0.22,
+                clamp(0.55 + stepDistance * 0.35, 0.55, 1.35)
         );
         return currentLatLng;
     }
@@ -362,9 +391,13 @@ public class ParticleFilterEngine {
         }
 
         if (source == ObservationSource.GNSS) {
-            appendTail(gnssTail, latLng);
+            if (appendTail(gnssTail, latLng)) {
+                gnssTailVersion++;
+            }
         } else {
-            appendTail(wifiTail, latLng);
+            if (appendTail(wifiTail, latLng)) {
+                wifiTailVersion++;
+            }
             if (normalizedFloor != null) {
                 latestWifiFloor = normalizedFloor;
             }
@@ -395,7 +428,8 @@ public class ParticleFilterEngine {
                     normalizeHeading(headingRad),
                     spatialConstraintModel.getCurrentLogicalFloor(),
                     timestampMillis,
-                    1.0
+                    1.0,
+                    clamp(accuracyMeters * 0.40, 0.9, source == ObservationSource.WIFI ? 3.0 : 5.5)
             );
             return currentLatLng;
         }
@@ -426,7 +460,10 @@ public class ParticleFilterEngine {
                 estimate.headingRad,
                 estimate.logicalFloor,
                 timestampMillis,
-                smoothing
+                smoothing,
+                source == ObservationSource.WIFI
+                        ? clamp(accuracyMeters * 0.36, 0.9, 3.0)
+                        : clamp(accuracyMeters * 0.46, 1.1, 6.0)
         );
         return currentLatLng;
     }
@@ -641,23 +678,37 @@ public class ParticleFilterEngine {
                             double estimatedHeadingRad,
                             int logicalFloor,
                             long timestampMillis,
-                            double smoothingAlpha) {
+                            double headingSmoothingAlpha,
+                            double positionMeasurementSigmaMeters) {
         rawEasting = estimatedEasting;
         rawNorthing = estimatedNorthing;
         rawHeadingRad = normalizeRad(estimatedHeadingRad);
 
         if (!hasDisplayPose) {
+            displayKalmanFilter.reset(rawEasting, rawNorthing, timestampMillis);
             displayEasting = rawEasting;
             displayNorthing = rawNorthing;
             displayHeadingRad = rawHeadingRad;
             hasDisplayPose = true;
         } else {
-            displayEasting = smoothingAlpha * rawEasting + (1d - smoothingAlpha) * displayEasting;
-            displayNorthing = smoothingAlpha * rawNorthing + (1d - smoothingAlpha) * displayNorthing;
-            displayHeadingRad = normalizeRad(circleBlend(displayHeadingRad, rawHeadingRad, smoothingAlpha));
+            displayKalmanFilter.update(
+                    rawEasting,
+                    rawNorthing,
+                    positionMeasurementSigmaMeters,
+                    isRecentPdrMotion(timestampMillis),
+                    timestampMillis
+            );
+            displayEasting = displayKalmanFilter.getEasting();
+            displayNorthing = displayKalmanFilter.getNorthing();
+            displayHeadingRad = normalizeRad(circleBlend(
+                    displayHeadingRad,
+                    rawHeadingRad,
+                    headingSmoothingAlpha
+            ));
         }
 
         currentLatLng = reference.toLatLng(displayEasting, displayNorthing);
+        currentPositionVersion++;
         spatialConstraintModel.updatePosition(currentLatLng);
         dominantParticleFloor = logicalFloor;
         clampParticlesToCurrentContext();
@@ -683,8 +734,7 @@ public class ParticleFilterEngine {
         LatLng lastPoint = fusedHistory.peekLast();
         double distanceMeters = UtilFunctions.distanceBetweenPoints(lastPoint, point);
         long elapsedMillis = Math.max(0L, timestampMillis - lastHistoryTimestamp);
-        boolean recentlyMoving = lastPdrMotionTimestamp > 0L
-                && timestampMillis - lastPdrMotionTimestamp <= HISTORY_ACTIVE_MOTION_WINDOW_MS;
+        boolean recentlyMoving = isRecentPdrMotion(timestampMillis);
 
         if (!recentlyMoving) {
             if (fusedHistory.size() == 1
@@ -711,17 +761,27 @@ public class ParticleFilterEngine {
             fusedHistory.removeFirst();
         }
         lastHistoryTimestamp = timestampMillis;
+        fusedHistoryVersion++;
     }
 
-    private void appendTail(ArrayDeque<LatLng> tail, LatLng point) {
+    private boolean appendTail(ArrayDeque<LatLng> tail, LatLng point) {
+        boolean changed = false;
         LatLng last = tail.peekLast();
         if (last != null && UtilFunctions.distanceBetweenPoints(last, point) < 0.75) {
             tail.removeLast();
+            changed = true;
         }
         tail.addLast(point);
+        changed = true;
         while (tail.size() > MAX_TAIL_SIZE) {
             tail.removeFirst();
         }
+        return changed;
+    }
+
+    private boolean isRecentPdrMotion(long timestampMillis) {
+        return lastPdrMotionTimestamp > 0L
+                && timestampMillis - lastPdrMotionTimestamp <= HISTORY_ACTIVE_MOTION_WINDOW_MS;
     }
 
     private double normalizeHeading(double headingRad) {

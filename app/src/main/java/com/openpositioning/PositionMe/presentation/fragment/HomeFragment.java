@@ -53,6 +53,8 @@ public class HomeFragment extends Fragment {
     private TrajectoryMapFragment trajectoryMapFragment;
     private final Handler previewHandler = new Handler(Looper.getMainLooper());
     private LatLng lastFloorplanRequestPosition;
+    private long lastRenderedFusedTrackVersion = -1L;
+    private long lastRenderedObservationVersion = -1L;
 
     private final Runnable livePreviewTask = new Runnable() {
         @Override
@@ -123,6 +125,8 @@ public class HomeFragment extends Fragment {
                     .replace(R.id.mapFragmentContainer, trajectoryMapFragment)
                     .commit();
         }
+        lastRenderedFusedTrackVersion = -1L;
+        lastRenderedObservationVersion = -1L;
     }
 
     @Override
@@ -152,16 +156,11 @@ public class HomeFragment extends Fragment {
         if (fusedPosition != null) {
             gnssStatusTextView.setVisibility(View.GONE);
             requestNearbyFloorplanIfNeeded(fusedPosition);
-            LatLng displayedLocation = trajectoryMapFragment.updateUserLocation(
+            trajectoryMapFragment.updateUserLocation(
                     fusedPosition,
                     (float) Math.toDegrees(sensorFusion.passOrientation())
             );
-            trajectoryMapFragment.renderFusedHistory(sensorFusion.getFusedTrack());
-            trajectoryMapFragment.renderObservationTails(
-                    sensorFusion.getRecentGnssTrail(),
-                    sensorFusion.getRecentWifiTrail(),
-                    sensorFusion.getRecentPdrTrail()
-            );
+            renderMapOverlaysIfChanged();
             return;
         }
 
@@ -178,6 +177,28 @@ public class HomeFragment extends Fragment {
         } else {
             gnssStatusTextView.setText(R.string.auto_init_waiting);
             gnssStatusTextView.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void renderMapOverlaysIfChanged() {
+        if (trajectoryMapFragment == null || !trajectoryMapFragment.isRenderSurfaceReady()) {
+            return;
+        }
+
+        long fusedTrackVersion = sensorFusion.getFusedTrackVersion();
+        if (fusedTrackVersion != lastRenderedFusedTrackVersion) {
+            trajectoryMapFragment.renderFusedHistory(sensorFusion.getFusedTrack());
+            lastRenderedFusedTrackVersion = fusedTrackVersion;
+        }
+
+        long observationVersion = sensorFusion.getObservationTrailsVersion();
+        if (observationVersion != lastRenderedObservationVersion) {
+            trajectoryMapFragment.renderObservationTails(
+                    sensorFusion.getRecentGnssTrail(),
+                    sensorFusion.getRecentWifiTrail(),
+                    sensorFusion.getRecentPdrTrail()
+            );
+            lastRenderedObservationVersion = observationVersion;
         }
     }
 
