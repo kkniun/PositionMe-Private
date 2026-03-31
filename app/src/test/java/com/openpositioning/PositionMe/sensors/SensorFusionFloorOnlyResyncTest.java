@@ -26,10 +26,15 @@ public class SensorFusionFloorOnlyResyncTest {
     @After
     public void tearDown() throws Exception {
         MapConstraintRepository.clear();
+        sensorFusion.resetAbsoluteAnchorStateForTesting();
         setField("floorOnlyResyncAbsoluteFloor", Integer.MIN_VALUE);
         setField("floorOnlyResyncWindowUntilMs", Long.MIN_VALUE);
         setField("pendingDisplayFloorResetAbsoluteFloor", Integer.MIN_VALUE);
         setField("pendingDisplayFloorResetUntilMs", Long.MIN_VALUE);
+        setField("committedDisplayFloorAbsolute", Integer.MIN_VALUE);
+        setField("pendingCommittedDisplayFloorAbsolute", Integer.MIN_VALUE);
+        setField("liveCurrentFloorAbsolute", Integer.MIN_VALUE);
+        setField("floorSwitchPending", false);
         setField("pendingStableAbsoluteFloorCandidate", null);
         setField("pendingStableAbsoluteFloorCount", 0);
         setField("pendingStableAbsoluteFloorFirstTimestampMs", Long.MIN_VALUE);

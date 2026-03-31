@@ -36,6 +36,14 @@ public class ParticleFilterEngine {
     private static final double SOFT_RECOVERY_SEEDED_RATIO = 0.45;
     private static final double SOFT_RECOVERY_WRONG_FLOOR_SEEDED_RATIO = 0.75;
     private static final double MAX_SOFT_RECOVERY_SEED_STD_M = 2.0;
+    private static final double CLOUD_TRAP_WALL_REJECT_RATIO_THRESHOLD = 0.85;
+    private static final int CLOUD_TRAP_WALL_REJECT_STREAK_THRESHOLD = 5;
+    private static final double RECOVERY_HINT_RESEED_RATIO = 0.35;
+    private static final double RECOVERY_HINT_RESEED_STD_M = 2.0;
+    private static final long RECOVERY_HINT_CLUSTER_MAX_AGE_MS = 10_000L;
+    private static final double RECOVERY_HINT_CLUSTER_MATCH_DISTANCE_M = 4.5;
+    private static final int STARVED_ABSOLUTE_BREAKOUT_STEP_THRESHOLD = 12;
+    private static final int BLIND_BREAKOUT_DURATION_STEPS = 4;
 
     private final ParticleInitializer particleInitializer;
     private final ParticleInitializer.SpawnValidator spawnValidator;
@@ -48,30 +56,72 @@ public class ParticleFilterEngine {
     // 临时调试状态：用于判断 PF 是否被楼层/墙体约束卡住，定位完成后可删除。
     private int lastPredictWallRejectCount;
     private int lastPredictFloorConstraintRejectCount;
+    private double lastPredictWallRejectRatio;
+    private int consecutiveHighWallRejectCount;
+    private boolean cloudTrapped;
+    private int stepsSinceLastAbsoluteFix;
+    private int blindBreakoutStepsRemaining;
     private boolean lastAbsoluteFixReanchored;
     private boolean lastAbsoluteFixRejectedByConstraints;
     private boolean lastAbsoluteFixAcceptedWithLimitedSupport;
     private boolean lastAbsoluteFixCloudRecovered;
+    @Nullable
+    private RecoveryCluster recentRecoveryCluster;
+
+    private static final class RecoveryCluster {
+        final double x;
+        final double y;
+        final int floor;
+        final double accuracyMeters;
+        final long timestampMs;
+
+        RecoveryCluster(
+                double x,
+                double y,
+                int floor,
+                double accuracyMeters,
+                long timestampMs
+        ) {
+            this.x = x;
+            this.y = y;
+            this.floor = floor;
+            this.accuracyMeters = accuracyMeters;
+            this.timestampMs = timestampMs;
+        }
+    }
 
     static final class StateSnapshot {
         private final List<Particle> particles;
         private final long lastTimestampMs;
         private final int lastPredictWallRejectCount;
         private final int lastPredictFloorConstraintRejectCount;
+        private final double lastPredictWallRejectRatio;
+        private final int consecutiveHighWallRejectCount;
+        private final boolean cloudTrapped;
+        private final int stepsSinceLastAbsoluteFix;
+        private final int blindBreakoutStepsRemaining;
         private final boolean lastAbsoluteFixReanchored;
         private final boolean lastAbsoluteFixRejectedByConstraints;
         private final boolean lastAbsoluteFixAcceptedWithLimitedSupport;
         private final boolean lastAbsoluteFixCloudRecovered;
+        @Nullable
+        private final RecoveryCluster recentRecoveryCluster;
 
         StateSnapshot(
                 @NonNull List<Particle> particles,
                 long lastTimestampMs,
                 int lastPredictWallRejectCount,
                 int lastPredictFloorConstraintRejectCount,
+                double lastPredictWallRejectRatio,
+                int consecutiveHighWallRejectCount,
+                boolean cloudTrapped,
+                int stepsSinceLastAbsoluteFix,
+                int blindBreakoutStepsRemaining,
                 boolean lastAbsoluteFixReanchored,
                 boolean lastAbsoluteFixRejectedByConstraints,
                 boolean lastAbsoluteFixAcceptedWithLimitedSupport,
-                boolean lastAbsoluteFixCloudRecovered
+                boolean lastAbsoluteFixCloudRecovered,
+                @Nullable RecoveryCluster recentRecoveryCluster
         ) {
             this.particles = new ArrayList<>(particles.size());
             for (Particle particle : particles) {
@@ -80,10 +130,24 @@ public class ParticleFilterEngine {
             this.lastTimestampMs = lastTimestampMs;
             this.lastPredictWallRejectCount = lastPredictWallRejectCount;
             this.lastPredictFloorConstraintRejectCount = lastPredictFloorConstraintRejectCount;
+            this.lastPredictWallRejectRatio = lastPredictWallRejectRatio;
+            this.consecutiveHighWallRejectCount = consecutiveHighWallRejectCount;
+            this.cloudTrapped = cloudTrapped;
+            this.stepsSinceLastAbsoluteFix = stepsSinceLastAbsoluteFix;
+            this.blindBreakoutStepsRemaining = blindBreakoutStepsRemaining;
             this.lastAbsoluteFixReanchored = lastAbsoluteFixReanchored;
             this.lastAbsoluteFixRejectedByConstraints = lastAbsoluteFixRejectedByConstraints;
             this.lastAbsoluteFixAcceptedWithLimitedSupport = lastAbsoluteFixAcceptedWithLimitedSupport;
             this.lastAbsoluteFixCloudRecovered = lastAbsoluteFixCloudRecovered;
+            this.recentRecoveryCluster = recentRecoveryCluster == null
+                    ? null
+                    : new RecoveryCluster(
+                    recentRecoveryCluster.x,
+                    recentRecoveryCluster.y,
+                    recentRecoveryCluster.floor,
+                    recentRecoveryCluster.accuracyMeters,
+                    recentRecoveryCluster.timestampMs
+            );
         }
     }
 
@@ -164,6 +228,7 @@ public class ParticleFilterEngine {
             int particleCount,
             double positionStdMeters
     ) {
+        resetTrapRecoveryState();
         resetLastAbsoluteFixOutcomeFlags();
         particles.clear();
         particles.addAll(particleInitializer.initialize(
@@ -176,6 +241,8 @@ public class ParticleFilterEngine {
                 spawnValidator
         ));
         lastTimestampMs = timestampMs;
+        stepsSinceLastAbsoluteFix = 0;
+        blindBreakoutStepsRemaining = 0;
         normalizeWeights();
     }
 
@@ -184,8 +251,11 @@ public class ParticleFilterEngine {
             return;
         }
 
+        stepsSinceLastAbsoluteFix++;
+        armBlindBreakoutIfNeeded();
         lastPredictWallRejectCount = 0;
         lastPredictFloorConstraintRejectCount = 0;
+        boolean blindBreakoutActive = blindBreakoutStepsRemaining > 0;
         double stepLengthMeters = delta.getStepLengthMeters();
         double deltaHeadingRad = delta.getDeltaHeadingRad();
         for (Particle particle : particles) {
@@ -232,17 +302,24 @@ public class ParticleFilterEngine {
                     predictedFloor
             )) {
                 lastPredictWallRejectCount++;
-                resetParticleAfterInvalidPrediction(
-                        particle,
-                        previousX,
-                        previousY,
-                        previousFloor,
-                        previousHeadingRad
-                );
-                predictedX = particle.getX();
-                predictedY = particle.getY();
-                predictedFloor = particle.getFloor();
-                predictedHeadingRad = particle.getHeadingRad();
+                if (!canBlindBreakoutThroughConstraint(
+                        blindBreakoutActive,
+                        predictedX,
+                        predictedY,
+                        predictedFloor
+                )) {
+                    resetParticleAfterInvalidPrediction(
+                            particle,
+                            previousX,
+                            previousY,
+                            previousFloor,
+                            previousHeadingRad
+                    );
+                    predictedX = particle.getX();
+                    predictedY = particle.getY();
+                    predictedFloor = particle.getFloor();
+                    predictedHeadingRad = particle.getHeadingRad();
+                }
             }
 
             particle.setX(predictedX);
@@ -251,7 +328,11 @@ public class ParticleFilterEngine {
             particle.setHeadingRad(predictedHeadingRad);
         }
 
+        if (blindBreakoutActive) {
+            blindBreakoutStepsRemaining = Math.max(0, blindBreakoutStepsRemaining - 1);
+        }
         lastTimestampMs = timestampMs;
+        updateCloudTrapState();
         normalizeWeights();
         resampleIfNeeded();
     }
@@ -282,7 +363,14 @@ public class ParticleFilterEngine {
             long timestampMs,
             double accuracyMeters
     ) {
-        updateWithAbsoluteFix(fixX, fixY, Integer.valueOf(floor), timestampMs, accuracyMeters);
+        updateWithAbsoluteFix(
+                fixX,
+                fixY,
+                Integer.valueOf(floor),
+                timestampMs,
+                accuracyMeters,
+                false
+        );
     }
 
     void updateWithAbsoluteFix(
@@ -292,6 +380,19 @@ public class ParticleFilterEngine {
             long timestampMs,
             double accuracyMeters
     ) {
+        updateWithAbsoluteFix(fixX, fixY, floorPrior, timestampMs, accuracyMeters, false);
+    }
+
+    void updateWithAbsoluteFix(
+            double fixX,
+            double fixY,
+            @Nullable Integer floorPrior,
+            long timestampMs,
+            double accuracyMeters,
+            boolean recoveryHint
+    ) {
+        stepsSinceLastAbsoluteFix = 0;
+        blindBreakoutStepsRemaining = 0;
         double measurementStdMeters = sanitizeAccuracyMeters(accuracyMeters);
         double recoveryDecisionAccuracyMeters = measurementStdMeters;
         double supportRatio = particles.isEmpty()
@@ -308,6 +409,16 @@ public class ParticleFilterEngine {
         if (isAbsoluteFixInvalidUnderConstraints(fixX, fixY, validationFloor)) {
             lastAbsoluteFixRejectedByConstraints = true;
             return;
+        }
+        int recoveryFloor = acceptedFloorPrior != null ? acceptedFloorPrior : validationFloor;
+        if (recoveryHint) {
+            rememberRecoveryCluster(
+                    fixX,
+                    fixY,
+                    recoveryFloor,
+                    measurementStdMeters,
+                    timestampMs
+            );
         }
         if (particles.isEmpty()) {
             List<Particle> initializedParticles = particleInitializer.initialize(
@@ -329,6 +440,26 @@ public class ParticleFilterEngine {
             normalizeWeights();
             return;
         }
+        if (cloudTrapped
+                && hasRecentRecoveryClusterNearFix(
+                fixX,
+                fixY,
+                recoveryFloor,
+                timestampMs,
+                recoveryHint
+        )
+                && injectRecoveryHintParticles(
+                fixX,
+                fixY,
+                recoveryFloor,
+                measurementStdMeters,
+                timestampMs
+        )) {
+            lastAbsoluteFixAcceptedWithLimitedSupport = true;
+            lastAbsoluteFixCloudRecovered = true;
+            supportRatio = computeSupportRatioForAbsoluteFix(fixX, fixY, recoveryDecisionAccuracyMeters);
+            reanchorRequired = supportRatio < MIN_SUPPORT_WEIGHT_RATIO;
+        }
 
         if (reanchorRequired) {
             boolean hasMotionSupport = hasMotionCompatibleSupportForAbsoluteFix(
@@ -337,29 +468,27 @@ public class ParticleFilterEngine {
                     validationFloor,
                     MIN_SUPPORT_WEIGHT_RATIO
             );
-            boolean useSoftRecovery = shouldUseSoftCloudRecovery(
-                    fixX,
-                    fixY,
-                    validationFloor,
-                    recoveryDecisionAccuracyMeters,
-                    preferWrongFloorRecovery
-            );
-            boolean useCredibleRecoveryReanchor = !hasMotionSupport
-                    && !useSoftRecovery
-                    && isCredibleRecoveryReanchor(
+            boolean useCredibleRecoveryReanchor = isCredibleRecoveryReanchor(
                     fixX,
                     fixY,
                     validationFloor,
                     recoveryDecisionAccuracyMeters
             );
-            boolean useConservativeRecoveryReanchor = !hasMotionSupport
-                    && !useSoftRecovery
-                    && !useCredibleRecoveryReanchor
+            boolean useConservativeRecoveryReanchor = !useCredibleRecoveryReanchor
                     && isConservativeLegalRecoveryReanchor(
                     fixX,
                     fixY,
                     validationFloor,
                     recoveryDecisionAccuracyMeters
+            );
+            boolean useSoftRecovery = !useCredibleRecoveryReanchor
+                    && !useConservativeRecoveryReanchor
+                    && shouldUseSoftCloudRecovery(
+                    fixX,
+                    fixY,
+                    validationFloor,
+                    recoveryDecisionAccuracyMeters,
+                    preferWrongFloorRecovery
             );
             if (!hasMotionSupport
                     && !useSoftRecovery
@@ -627,6 +756,7 @@ public class ParticleFilterEngine {
     void clearParticles(long timestampMs) {
         particles.clear();
         lastTimestampMs = timestampMs;
+        resetTrapRecoveryState();
         resetLastAbsoluteFixOutcomeFlags();
     }
 
@@ -635,6 +765,164 @@ public class ParticleFilterEngine {
         lastAbsoluteFixRejectedByConstraints = false;
         lastAbsoluteFixAcceptedWithLimitedSupport = false;
         lastAbsoluteFixCloudRecovered = false;
+    }
+
+    private void resetTrapRecoveryState() {
+        lastPredictWallRejectCount = 0;
+        lastPredictFloorConstraintRejectCount = 0;
+        lastPredictWallRejectRatio = 0.0;
+        consecutiveHighWallRejectCount = 0;
+        cloudTrapped = false;
+        stepsSinceLastAbsoluteFix = 0;
+        blindBreakoutStepsRemaining = 0;
+        recentRecoveryCluster = null;
+    }
+
+    private void armBlindBreakoutIfNeeded() {
+        if (blindBreakoutStepsRemaining > 0 || !cloudTrapped) {
+            return;
+        }
+        if (stepsSinceLastAbsoluteFix > STARVED_ABSOLUTE_BREAKOUT_STEP_THRESHOLD) {
+            blindBreakoutStepsRemaining = BLIND_BREAKOUT_DURATION_STEPS;
+        }
+    }
+
+    private boolean canBlindBreakoutThroughConstraint(
+            boolean blindBreakoutActive,
+            double predictedX,
+            double predictedY,
+            int predictedFloor
+    ) {
+        return blindBreakoutActive && spawnValidator.isValid(predictedX, predictedY, predictedFloor);
+    }
+
+    private void rememberRecoveryCluster(
+            double fixX,
+            double fixY,
+            int floor,
+            double accuracyMeters,
+            long timestampMs
+    ) {
+        recentRecoveryCluster = new RecoveryCluster(
+                fixX,
+                fixY,
+                floor,
+                sanitizeAccuracyMeters(accuracyMeters),
+                timestampMs
+        );
+    }
+
+    private boolean hasRecentRecoveryClusterNearFix(
+            double fixX,
+            double fixY,
+            int floor,
+            long timestampMs,
+            boolean recoveryHint
+    ) {
+        if (recoveryHint && recentRecoveryCluster != null) {
+            return true;
+        }
+        if (recentRecoveryCluster == null || recentRecoveryCluster.floor != floor) {
+            return false;
+        }
+        if (timestampMs > 0L
+                && recentRecoveryCluster.timestampMs > 0L
+                && timestampMs - recentRecoveryCluster.timestampMs > RECOVERY_HINT_CLUSTER_MAX_AGE_MS) {
+            return false;
+        }
+        return Math.hypot(
+                fixX - recentRecoveryCluster.x,
+                fixY - recentRecoveryCluster.y
+        ) <= RECOVERY_HINT_CLUSTER_MATCH_DISTANCE_M;
+    }
+
+    private boolean injectRecoveryHintParticles(
+            double fixX,
+            double fixY,
+            int floor,
+            double accuracyMeters,
+            long timestampMs
+    ) {
+        if (particles.isEmpty() || !spawnValidator.isValid(fixX, fixY, floor)) {
+            return false;
+        }
+        int particleCount = particles.size();
+        int injectedParticleCount = Math.min(
+                particleCount,
+                Math.max(1, (int) Math.round(particleCount * RECOVERY_HINT_RESEED_RATIO))
+        );
+        List<Particle> injectedParticles = particleInitializer.initialize(
+                fixX,
+                fixY,
+                floor,
+                injectedParticleCount,
+                Math.min(RECOVERY_HINT_RESEED_STD_M, sanitizeAccuracyMeters(accuracyMeters)),
+                estimateCircularMeanHeading(),
+                spawnValidator
+        );
+        if (injectedParticles.isEmpty()) {
+            return false;
+        }
+
+        int survivorCount = Math.max(0, particleCount - injectedParticles.size());
+        List<Particle> recoveredParticles = new ArrayList<>(particleCount);
+        recoveredParticles.addAll(selectHighestWeightParticles(survivorCount));
+        recoveredParticles.addAll(injectedParticles);
+        while (recoveredParticles.size() < particleCount) {
+            recoveredParticles.add(new Particle(
+                    fixX,
+                    fixY,
+                    floor,
+                    1.0,
+                    estimateCircularMeanHeading()
+            ));
+        }
+        double equalWeight = 1.0 / recoveredParticles.size();
+        for (Particle particle : recoveredParticles) {
+            particle.setWeight(equalWeight);
+        }
+        particles.clear();
+        particles.addAll(recoveredParticles);
+        lastTimestampMs = timestampMs;
+        lastPredictWallRejectCount = 0;
+        lastPredictWallRejectRatio = 0.0;
+        consecutiveHighWallRejectCount = 0;
+        cloudTrapped = false;
+        return true;
+    }
+
+    @NonNull
+    private List<Particle> selectHighestWeightParticles(int desiredParticleCount) {
+        if (desiredParticleCount <= 0 || particles.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<Particle> rankedParticles = snapshotParticlesForTesting();
+        rankedParticles.sort((left, right) -> Double.compare(
+                sanitizeWeight(right.getWeight()),
+                sanitizeWeight(left.getWeight())
+        ));
+        int boundedCount = Math.min(desiredParticleCount, rankedParticles.size());
+        List<Particle> selectedParticles = new ArrayList<>(boundedCount);
+        for (int i = 0; i < boundedCount; i++) {
+            selectedParticles.add(new Particle(rankedParticles.get(i)));
+        }
+        return selectedParticles;
+    }
+
+    private void updateCloudTrapState() {
+        int particleCount = particles.size();
+        lastPredictWallRejectRatio = particleCount <= 0
+                ? 0.0
+                : (double) lastPredictWallRejectCount / particleCount;
+        if (particleCount > 0 && lastPredictWallRejectRatio > CLOUD_TRAP_WALL_REJECT_RATIO_THRESHOLD) {
+            consecutiveHighWallRejectCount++;
+            if (consecutiveHighWallRejectCount >= CLOUD_TRAP_WALL_REJECT_STREAK_THRESHOLD) {
+                cloudTrapped = true;
+            }
+            return;
+        }
+        consecutiveHighWallRejectCount = 0;
+        cloudTrapped = false;
     }
 
     private double sanitizeAccuracyMeters(double accuracyMeters) {
@@ -1008,15 +1296,13 @@ public class ParticleFilterEngine {
             return floorPrior;
         }
         if (allowRecoveryOverride
-                && spawnValidator.isValid(fixX, fixY, floorPrior)
-                && canFailSoftRecoverToRequestedFloor(currentPose, fixX, fixY, currentFloor, floorPrior)) {
+                && canOverrideRejectedFloorGateForRecovery(fixX, fixY, currentFloor, floorPrior)) {
             return floorPrior;
         }
         return null;
     }
 
-    private boolean canFailSoftRecoverToRequestedFloor(
-            @Nullable FusedPose currentPose,
+    private boolean canOverrideRejectedFloorGateForRecovery(
             double fixX,
             double fixY,
             int currentFloor,
@@ -1025,17 +1311,9 @@ public class ParticleFilterEngine {
         if (!spawnValidator.isValid(fixX, fixY, requestedFloor)) {
             return false;
         }
-        if (!spawnValidator.isValid(fixX, fixY, currentFloor)) {
-            return true;
-        }
-        if (currentPose == null) {
-            return true;
-        }
-        if (currentPose.getFloor() != requestedFloor) {
-            return true;
-        }
-        double distanceMeters = Math.hypot(currentPose.getX() - fixX, currentPose.getY() - fixY);
-        return Double.isFinite(distanceMeters) && distanceMeters >= MIN_SOFT_RECOVERY_DISTANCE_M;
+        // 只有当 fix 在当前锁定楼层已经不合法时，才允许恢复逻辑越过楼层 gate。
+        // 否则必须尊重楼层 gate，避免把被拒绝的跨层 fix 误当成已获批楼层。
+        return !spawnValidator.isValid(fixX, fixY, currentFloor);
     }
 
     private int resolveAbsoluteFixValidationFloor(
@@ -1224,6 +1502,7 @@ public class ParticleFilterEngine {
             }
         }
         lastTimestampMs = timestampMs;
+        resetTrapRecoveryState();
         lastAbsoluteFixReanchored = false;
         lastAbsoluteFixRejectedByConstraints = false;
         lastAbsoluteFixAcceptedWithLimitedSupport = false;
@@ -1248,10 +1527,16 @@ public class ParticleFilterEngine {
                 lastTimestampMs,
                 lastPredictWallRejectCount,
                 lastPredictFloorConstraintRejectCount,
+                lastPredictWallRejectRatio,
+                consecutiveHighWallRejectCount,
+                cloudTrapped,
+                stepsSinceLastAbsoluteFix,
+                blindBreakoutStepsRemaining,
                 lastAbsoluteFixReanchored,
                 lastAbsoluteFixRejectedByConstraints,
                 lastAbsoluteFixAcceptedWithLimitedSupport,
-                lastAbsoluteFixCloudRecovered
+                lastAbsoluteFixCloudRecovered,
+                recentRecoveryCluster
         );
     }
 
@@ -1261,10 +1546,24 @@ public class ParticleFilterEngine {
         lastTimestampMs = snapshot.lastTimestampMs;
         lastPredictWallRejectCount = snapshot.lastPredictWallRejectCount;
         lastPredictFloorConstraintRejectCount = snapshot.lastPredictFloorConstraintRejectCount;
+        lastPredictWallRejectRatio = snapshot.lastPredictWallRejectRatio;
+        consecutiveHighWallRejectCount = snapshot.consecutiveHighWallRejectCount;
+        cloudTrapped = snapshot.cloudTrapped;
+        stepsSinceLastAbsoluteFix = snapshot.stepsSinceLastAbsoluteFix;
+        blindBreakoutStepsRemaining = snapshot.blindBreakoutStepsRemaining;
         lastAbsoluteFixReanchored = snapshot.lastAbsoluteFixReanchored;
         lastAbsoluteFixRejectedByConstraints = snapshot.lastAbsoluteFixRejectedByConstraints;
         lastAbsoluteFixAcceptedWithLimitedSupport = snapshot.lastAbsoluteFixAcceptedWithLimitedSupport;
         lastAbsoluteFixCloudRecovered = snapshot.lastAbsoluteFixCloudRecovered;
+        recentRecoveryCluster = snapshot.recentRecoveryCluster == null
+                ? null
+                : new RecoveryCluster(
+                snapshot.recentRecoveryCluster.x,
+                snapshot.recentRecoveryCluster.y,
+                snapshot.recentRecoveryCluster.floor,
+                snapshot.recentRecoveryCluster.accuracyMeters,
+                snapshot.recentRecoveryCluster.timestampMs
+        );
     }
 
     boolean hasParticles() {
@@ -1287,6 +1586,10 @@ public class ParticleFilterEngine {
         return lastPredictWallRejectCount;
     }
 
+    double getLastPredictWallRejectRatio() {
+        return lastPredictWallRejectRatio;
+    }
+
     int getLastPredictFloorConstraintRejectCount() {
         return lastPredictFloorConstraintRejectCount;
     }
@@ -1305,5 +1608,9 @@ public class ParticleFilterEngine {
 
     boolean wasLastAbsoluteFixCloudRecovered() {
         return lastAbsoluteFixCloudRecovered;
+    }
+
+    boolean isCloudTrapped() {
+        return cloudTrapped;
     }
 }

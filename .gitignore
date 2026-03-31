@@ -18,5 +18,8 @@ local.properties
 # local-only docs
 _local_docs/
 .agentdocs/
-AGENTS.mdartifacts/
+AGENTS.md
+artifacts/
+test_artifacts/
+.vscode/
 secrets.properties

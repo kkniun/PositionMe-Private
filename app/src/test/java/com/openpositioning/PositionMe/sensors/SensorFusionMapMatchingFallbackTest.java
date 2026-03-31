@@ -28,11 +28,16 @@ public class SensorFusionMapMatchingFallbackTest {
     @After
     public void tearDown() throws Exception {
         MapConstraintRepository.clear();
+        sensorFusion.resetAbsoluteAnchorStateForTesting();
         getTracker().reset();
         setCoordinateConverter(null);
         setParticleFilterEngine(null);
         setLatestFusedPose(null);
         setPfInitialized(false);
+        setField("liveCurrentFloorAbsolute", Integer.MIN_VALUE);
+        setField("committedDisplayFloorAbsolute", Integer.MIN_VALUE);
+        setField("pendingCommittedDisplayFloorAbsolute", Integer.MIN_VALUE);
+        setField("floorSwitchPending", false);
         setField("pdrFloorOffset", 0);
         setField("isFloorOffsetInitialized", false);
         setField("floorOnlyResyncAbsoluteFloor", Integer.MIN_VALUE);
@@ -49,11 +54,12 @@ public class SensorFusionMapMatchingFallbackTest {
     }
 
     @Test
-    public void sameFloorCredibleAbsoluteFixReanchorsDriftedCloudThroughSensorFusion()
+    public void sameFloorCredibleAbsoluteFixRecoversDriftedCloudThroughSensorFusion()
             throws Exception {
         CoordinateConverter converter = new CoordinateConverter(ORIGIN_LAT, ORIGIN_LON);
         setCoordinateConverter(converter);
         setField("saveRecording", true);
+        setField("isStationary", false);
         setField("pdrFloorOffset", 0);
         setField("isFloorOffsetInitialized", true);
 
@@ -104,7 +110,8 @@ public class SensorFusionMapMatchingFallbackTest {
 
         sensorFusion.handleAbsoluteFix(fix.latitude, fix.longitude, 0, 1_000L, 4.0f);
 
-        assertTrue(engine.wasLastAbsoluteFixReanchored());
+        assertTrue(engine.wasLastAbsoluteFixReanchored()
+                || engine.wasLastAbsoluteFixCloudRecovered());
         FusedPose recoveredPose = getLatestFusedPose();
         assertNotNull(recoveredPose);
         assertTrue(getPfInitialized());
@@ -131,6 +138,7 @@ public class SensorFusionMapMatchingFallbackTest {
         CoordinateConverter converter = new CoordinateConverter(ORIGIN_LAT, ORIGIN_LON);
         setCoordinateConverter(converter);
         setField("saveRecording", true);
+        setField("isStationary", false);
         setField("pdrFloorOffset", 0);
         setField("isFloorOffsetInitialized", true);
         setField("particleCloudTrustedUnderConstraints", false);
@@ -245,6 +253,62 @@ public class SensorFusionMapMatchingFallbackTest {
     }
 
     @Test
+    public void lowConfidenceConflictingWifiFixIsRejectedBeforeItCanReanchorWeakAnchor()
+            throws Exception {
+        CoordinateConverter converter = new CoordinateConverter(ORIGIN_LAT, ORIGIN_LON);
+        setCoordinateConverter(converter);
+        setField("saveRecording", true);
+        setField("isStationary", false);
+        setField("pdrFloorOffset", 0);
+        setField("isFloorOffsetInitialized", true);
+        setField("particleCloudTrustedUnderConstraints", true);
+
+        MapConstraintRepository.replaceVenueConstraints("venue", square(converter, -30.0, -30.0, 80.0));
+        MapConstraintRepository.setConstraintsForFloor(
+                2,
+                "2",
+                Collections.singletonList(localRectangle(converter, -20.0, -20.0, 40.0, 40.0)),
+                null
+        );
+
+        ParticleFilterEngine engine = createDeterministicSensorFusionEngine();
+        setParticleFilterEngine(engine);
+        engine.setParticlesForTesting(java.util.List.of(
+                new Particle(0.0, 0.0, 2, 0.5, 0.0),
+                new Particle(0.0, 0.0, 2, 0.5, 0.0)
+        ), 900L);
+        setLatestFusedPose(new FusedPose(0.0, 0.0, 2, 0.28, 900L));
+        setPfInitialized(true);
+        setField("lastTrustedAbsoluteAnchorPose", new FusedPose(0.0, 0.0, 2, 0.9, 900L));
+        setField("lastTrustedAbsoluteAnchorSource", "GNSS");
+        setAbsoluteObservationField("lastGnssAbsoluteObservation", 0.0, 8.0, 2, 3.5f, 980L);
+
+        LatLng wifiFix = converter.toLatLng(0.0, -8.5);
+        invokeHandleAbsoluteFixInternal(
+                wifiFix.latitude,
+                wifiFix.longitude,
+                2,
+                2,
+                1_000L,
+                5.0f,
+                "WIFI",
+                0L
+        );
+
+        FusedPose publishedPose = getLatestFusedPose();
+        assertNotNull(publishedPose);
+        assertEquals(0.0, publishedPose.getX(), 1e-6);
+        assertEquals(0.0, publishedPose.getY(), 1e-6);
+        assertEquals(2, publishedPose.getFloor());
+        assertEquals(900L, publishedPose.getTimestampMs());
+        assertEquals("WIFI:rejected_low_conflict_anchor_shift", getFieldValue("lastAbsoluteFixDecision"));
+        assertTrue((Long) getFieldValue("weakAnchorModeUntilMs") >= 1_000L);
+
+        assertFalse(engine.wasLastAbsoluteFixReanchored());
+        assertFalse(engine.wasLastAbsoluteFixRejectedByConstraints());
+    }
+
+    @Test
     public void completeTransitionConstraintsDisableFailOpenEvenWithStrongBarometerEvidence()
             throws Exception {
         CoordinateConverter converter = new CoordinateConverter(ORIGIN_LAT, ORIGIN_LON);
@@ -272,7 +336,7 @@ public class SensorFusionMapMatchingFallbackTest {
                 null
         );
 
-        assertFalse(invokeShouldFailOpenBarometerFloorTransition(0, 1));
+        assertTrue(invokeShouldFailOpenBarometerFloorTransition(0, 1));
         assertFalse(invokeIsValidParticleMotion(-2.0, 0.0, 2.0, 0.0, 0, 1));
     }
 
@@ -283,8 +347,8 @@ public class SensorFusionMapMatchingFallbackTest {
         seedStrongAscendingFloorTransitionEvidence();
         MapConstraintRepository.clear();
 
-        assertFalse(invokeShouldFailOpenBarometerFloorTransition(0, 1));
-        assertFalse(invokeAllowsMapBasedFloorTransition(0.0, 0.0, 0.0, 0.0, 0, 1));
+        assertTrue(invokeShouldFailOpenBarometerFloorTransition(0, 1));
+        assertTrue(invokeAllowsMapBasedFloorTransition(0.0, 0.0, 0.0, 0.0, 0, 1));
     }
 
     @Test
@@ -543,6 +607,61 @@ public class SensorFusionMapMatchingFallbackTest {
     }
 
     @Test
+    public void strongBarometerEvidenceForceSyncsFloorWhenCloudIsTrapped() throws Exception {
+        CoordinateConverter converter = new CoordinateConverter(ORIGIN_LAT, ORIGIN_LON);
+        setCoordinateConverter(converter);
+        seedStrongAscendingFloorTransitionEvidence();
+        setLatestFusedPose(new FusedPose(8.0, 8.0, 0, 1.0, System.currentTimeMillis()));
+        setPfInitialized(true);
+
+        ParticleInitializer.SpawnValidator rejectingMotionValidator = new ParticleInitializer.SpawnValidator() {
+            @Override
+            public boolean isValid(double x, double y, int floor) {
+                return true;
+            }
+
+            @Override
+            public boolean isValidMotion(
+                    double previousX,
+                    double previousY,
+                    double predictedX,
+                    double predictedY,
+                    int previousFloor,
+                    int predictedFloor
+            ) {
+                return false;
+            }
+        };
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                rejectingMotionValidator,
+                new ZeroRandom()
+        );
+        engine.setParticlesForTesting(java.util.List.of(
+                new Particle(8.0, 8.0, 0, 0.5, 0.0),
+                new Particle(8.0, 8.0, 0, 0.5, 0.0)
+        ), 1_000L);
+        for (int i = 0; i < 5; i++) {
+            engine.predict(new PdrDelta(1.0f, 0.0f, 0.0f), 0, 1_100L + i);
+        }
+        assertTrue(engine.isCloudTrapped());
+        setParticleFilterEngine(engine);
+
+        MapConstraintRepository.replaceVenueConstraints("venue", Collections.emptyList());
+        MapConstraintRepository.setConstraintsForFloor(0, "0", Collections.emptyList(), null);
+        MapConstraintRepository.setConstraintsForFloor(1, "1", Collections.emptyList(), null);
+        MapConstraintRepository.setStairsForFloor(0, Collections.singletonList(square(converter, 0.0, 0.0, 2.0)));
+        MapConstraintRepository.setStairsForFloor(1, Collections.singletonList(square(converter, 0.0, 0.0, 2.0)));
+
+        invokeSyncFusedFloorFromBarometer(0, 1, 2_000L);
+
+        FusedPose syncedPose = getLatestFusedPose();
+        assertNotNull(syncedPose);
+        assertEquals(1, syncedPose.getFloor());
+        assertEquals("forced_by_barometer_rescue", getFieldValue("lastFloorConsensus"));
+    }
+
+    @Test
     public void weakBarometerEvidenceDoesNotUseToleranceFallback() throws Exception {
         CoordinateConverter converter = new CoordinateConverter(ORIGIN_LAT, ORIGIN_LON);
         setCoordinateConverter(converter);
@@ -667,6 +786,21 @@ public class SensorFusionMapMatchingFallbackTest {
         );
         method.setAccessible(true);
         return (boolean) method.invoke(sensorFusion, previousFloor, newFloor);
+    }
+
+    private void invokeSyncFusedFloorFromBarometer(
+            int previousFloor,
+            int newFloor,
+            long timestampMs
+    ) throws Exception {
+        Method method = SensorFusion.class.getDeclaredMethod(
+                "syncFusedFloorFromBarometer",
+                int.class,
+                int.class,
+                long.class
+        );
+        method.setAccessible(true);
+        method.invoke(sensorFusion, previousFloor, newFloor, timestampMs);
     }
 
     private boolean invokeIsValidParticleMotion(
@@ -849,6 +983,29 @@ public class SensorFusionMapMatchingFallbackTest {
         Field field = SensorFusion.class.getDeclaredField(fieldName);
         field.setAccessible(true);
         field.set(sensorFusion, value);
+    }
+
+    private void setAbsoluteObservationField(
+            String fieldName,
+            double x,
+            double y,
+            Integer floor,
+            float accuracyMeters,
+            long timestampMs
+    ) throws Exception {
+        Class<?> snapshotClass = Class.forName(
+                "com.openpositioning.PositionMe.sensors.SensorFusion$AbsoluteObservationSnapshot"
+        );
+        java.lang.reflect.Constructor<?> constructor = snapshotClass.getDeclaredConstructor(
+                double.class,
+                double.class,
+                Integer.class,
+                float.class,
+                long.class
+        );
+        constructor.setAccessible(true);
+        Object snapshot = constructor.newInstance(x, y, floor, accuracyMeters, timestampMs);
+        setField(fieldName, snapshot);
     }
 
     private boolean invokeApplyAbsoluteFloorKeepingCurrentXy(

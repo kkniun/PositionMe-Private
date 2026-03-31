@@ -22,7 +22,12 @@ public class SensorFusionVenueTest {
 
     @After
     public void tearDown() throws Exception {
+        sensorFusion.resetAbsoluteAnchorStateForTesting();
         setField("collectionVenue", "default");
+        setField("liveCurrentFloorAbsolute", Integer.MIN_VALUE);
+        setField("committedDisplayFloorAbsolute", Integer.MIN_VALUE);
+        setField("pendingCommittedDisplayFloorAbsolute", Integer.MIN_VALUE);
+        setField("floorSwitchPending", false);
         setField("pdrFloorOffset", 0);
         setField("isFloorOffsetInitialized", false);
         setField("blockHistoricalPoseFloorSeedUntilTrustedFix", false);

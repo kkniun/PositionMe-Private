@@ -1,4 +1,5 @@
 package com.openpositioning.PositionMe.sensors;
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import android.content.Context;
@@ -6,12 +7,15 @@ import android.util.Log;
 
 import com.android.volley.Request;
 import com.android.volley.RequestQueue;
+import com.android.volley.VolleyError;
 import com.android.volley.toolbox.JsonObjectRequest;
 import com.android.volley.toolbox.Volley;
 import com.google.android.gms.maps.model.LatLng;
 
 import org.json.JSONException;
 import org.json.JSONObject;
+
+import java.util.Locale;
 /**
  * Class for creating and handling POST requests for obtaining the current position using
  * WiFi positioning API from https://openpositioning.org/api/position/fine
@@ -103,19 +107,11 @@ public class WiFiPositioning {
                 },
                 // Handles the errors obtained from the POST request
                 error -> {
-                    // Validation Error
-                    if (error.networkResponse!=null && error.networkResponse.statusCode==422){
-                        Log.e("WiFiPositioning", "Validation Error "+ error.getMessage());
-                    }
-                    // Other Errors
-                    else{
-                        // When Response code is available
-                        if (error.networkResponse!=null) {
-                            Log.e("WiFiPositioning","Response Code: " + error.networkResponse.statusCode + ", " + error.getMessage());
-                        }
-                        else{
-                            Log.e("WiFiPositioning","Error message: " + error.getMessage());
-                        }
+                    String errorMessage = formatVolleyErrorMessage(error);
+                    if (isLikelyOfflineErrorMessage(errorMessage)) {
+                        Log.w("WiFiPositioning", "Offline WiFi positioning request: " + errorMessage);
+                    } else {
+                        Log.e("WiFiPositioning", errorMessage);
                     }
                 }
         );
@@ -155,27 +151,66 @@ public class WiFiPositioning {
                     }
                 },
                 error -> {
-                    // Validation Error
-                    if (error.networkResponse!=null && error.networkResponse.statusCode==422){
-                        Log.e("WiFiPositioning", "Validation Error "+ error.getMessage());
-                        callback.onError( "Validation Error (422): "+ error.getMessage());
+                    String errorMessage = formatVolleyErrorMessage(error);
+                    if (isLikelyOfflineErrorMessage(errorMessage)) {
+                        Log.w("WiFiPositioning", "Offline WiFi positioning request: " + errorMessage);
+                    } else {
+                        Log.e("WiFiPositioning", errorMessage);
                     }
-                    // Other Errors
-                    else{
-                        // When Response code is available
-                        if (error.networkResponse!=null) {
-                            Log.e("WiFiPositioning","Response Code: " + error.networkResponse.statusCode + ", " + error.getMessage());
-                            callback.onError("Response Code: " + error.networkResponse.statusCode + ", " + error.getMessage());
-                        }
-                        else{
-                            Log.e("WiFiPositioning","Error message: " + error.getMessage());
-                            callback.onError("Error message: " + error.getMessage());
-                        }
-                    }
+                    callback.onError(errorMessage);
                 }
         );
         // Adds the request to the request queue
         requestQueue.add(jsonObjectRequest);
+    }
+
+    @NonNull
+    static String formatVolleyErrorMessage(@Nullable VolleyError error) {
+        if (error == null) {
+            return "Error message: unknown_error";
+        }
+        if (error.networkResponse != null && error.networkResponse.statusCode == 422) {
+            return "Validation Error (422): " + safeVolleyErrorDetail(error);
+        }
+        if (error.networkResponse != null) {
+            return "Response Code: " + error.networkResponse.statusCode + ", " + safeVolleyErrorDetail(error);
+        }
+        return "Error message: " + safeVolleyErrorDetail(error);
+    }
+
+    static boolean isLikelyOfflineErrorMessage(@Nullable String message) {
+        if (message == null) {
+            return false;
+        }
+        String normalized = message.toLowerCase(Locale.US);
+        return normalized.contains("unknownhostexception")
+                || normalized.contains("unable to resolve host")
+                || normalized.contains("no address associated with hostname")
+                || normalized.contains("network is unreachable")
+                || normalized.contains("failed to connect")
+                || normalized.contains("connectexception")
+                || normalized.contains("sockettimeoutexception")
+                || normalized.contains("timeout");
+    }
+
+    @NonNull
+    private static String safeVolleyErrorDetail(@Nullable VolleyError error) {
+        if (error == null) {
+            return "unknown_error";
+        }
+        Throwable cause = error.getCause();
+        if (cause != null) {
+            String causeDetail = cause.toString();
+            if (causeDetail != null && !causeDetail.trim().isEmpty()) {
+                return causeDetail;
+            }
+        }
+        String message = error.getMessage();
+        if (message != null && !message.trim().isEmpty()) {
+            return message;
+        }
+        String fallback = error.toString();
+        return (fallback == null || fallback.trim().isEmpty()) ? "unknown_error" : fallback;
     }
 
     @Nullable

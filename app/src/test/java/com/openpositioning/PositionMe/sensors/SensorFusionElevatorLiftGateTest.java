@@ -6,8 +6,10 @@ import com.openpositioning.PositionMe.utils.MapConstraintRepository;
 import org.junit.After;
 import org.junit.Test;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayDeque;
 import java.util.Collections;
 
 import static org.junit.Assert.assertEquals;
@@ -24,7 +26,9 @@ public class SensorFusionElevatorLiftGateTest {
     @After
     public void tearDown() throws Exception {
         MapConstraintRepository.clear();
+        sensorFusion.resetAbsoluteAnchorStateForTesting();
         invokeResetElevatorState();
+        getRecentAcceptedStepTimestamps().clear();
         setField("coordinateConverter", null);
         setField("latestFusedPose", null);
         setField("pdrFloorOffset", 0);
@@ -84,6 +88,21 @@ public class SensorFusionElevatorLiftGateTest {
     }
 
     @Test
+    public void acceptedWifiFallbackCanRecoverLiftContextWhenFusedPoseIsUnreliable()
+            throws Exception {
+        seedLiftZone();
+        setField("isFloorOffsetInitialized", true);
+        setField("latestFusedPose", new FusedPose(8.0, 8.0, 0, 0.85, 1_000L));
+        setField("consecutiveAbsoluteConstraintRejects", 3);
+        setField(
+                "lastAcceptedWifiAbsoluteObservation",
+                createAbsoluteObservationSnapshot(1.0, 1.0, 0, 2.0f, 5_500L)
+        );
+
+        assertTrue(invokeIsCurrentPositionNearLiftZone(6_000L));
+    }
+
+    @Test
     public void weakStaticElevatorSignalDoesNotStartElevatorSession() throws Exception {
         seedLiftZone();
         setField("isFloorOffsetInitialized", true);
@@ -97,6 +116,43 @@ public class SensorFusionElevatorLiftGateTest {
 
         assertFalse(sensorFusion.getElevator());
         assertFalse("passed_barometer_and_lift_zone".equals(sensorFusion.getMotionDebugSnapshot().elevatorGate));
+        assertEquals("inactive", sensorFusion.getMotionDebugSnapshot().liftTransferState);
+    }
+
+    @Test
+    public void rawElevatorSignalWithoutBarometerOrLiftContextNeverPromotesVisibleState()
+            throws Exception {
+        seedLiftZone();
+        setField("isFloorOffsetInitialized", true);
+        setField("latestFusedPose", new FusedPose(8.0, 8.0, 0, 0.8, 1_000L));
+        clearBarometerEvidence();
+
+        invokeUpdateElevatorState(true, 5_000L);
+        invokeUpdateElevatorState(true, 6_000L);
+
+        assertFalse(sensorFusion.getElevator());
+        assertEquals(
+                "blocked_by_not_near_lift",
+                sensorFusion.getMotionDebugSnapshot().elevatorGate
+        );
+        assertEquals("inactive", sensorFusion.getMotionDebugSnapshot().liftTransferState);
+    }
+
+    @Test
+    public void rawElevatorSignalNearLiftWithoutBarometerStillStaysInvisible() throws Exception {
+        seedLiftZone();
+        setField("isFloorOffsetInitialized", true);
+        setField("latestFusedPose", new FusedPose(1.0, 1.0, 0, 0.8, 1_000L));
+        clearBarometerEvidence();
+
+        invokeUpdateElevatorState(true, 5_000L);
+        invokeUpdateElevatorState(true, 6_700L);
+
+        assertFalse(sensorFusion.getElevator());
+        assertEquals(
+                "blocked_by_missing_barometer",
+                sensorFusion.getMotionDebugSnapshot().elevatorGate
+        );
         assertEquals("inactive", sensorFusion.getMotionDebugSnapshot().liftTransferState);
     }
 
@@ -122,6 +178,36 @@ public class SensorFusionElevatorLiftGateTest {
                 "cleared_by_no_motion_or_no_lift_context",
                 sensorFusion.getMotionDebugSnapshot().elevatorGate
         );
+    }
+
+    @Test
+    public void strongBarometerLowStepVerticalDropDoesNotUseStairsToleranceFallback()
+            throws Exception {
+        CoordinateConverter converter = new CoordinateConverter(ORIGIN_LAT, ORIGIN_LON);
+        MapConstraintRepository.replaceVenueConstraints("venue", Collections.emptyList());
+        MapConstraintRepository.setConstraintsForFloor(0, "0", Collections.emptyList(), null);
+        MapConstraintRepository.setConstraintsForFloor(1, "1", Collections.emptyList(), null);
+        MapConstraintRepository.setStairsForFloor(
+                0,
+                Collections.singletonList(square(converter, 3.0, -1.0, 2.0))
+        );
+        MapConstraintRepository.setStairsForFloor(
+                1,
+                Collections.singletonList(square(converter, 3.0, -1.0, 2.0))
+        );
+        setField("coordinateConverter", converter);
+        setField("recentBarometerVerticalWindowStartMs", 5_000L);
+        setField("lastElevatorBarometerTimestampMs", 6_000L);
+        getRecentAcceptedStepTimestamps().clear();
+
+        assertFalse(invokeIsTransitionSatisfied(
+                SensorFusion.TransitionPreference.STAIRS_ONLY,
+                converter.toLatLng(0.0, 0.0),
+                converter.toLatLng(0.5, 0.0),
+                0,
+                1,
+                true
+        ));
     }
 
     private CoordinateConverter seedLiftZone() throws Exception {
@@ -173,6 +259,35 @@ public class SensorFusionElevatorLiftGateTest {
         return (boolean) method.invoke(sensorFusion, timestampMs);
     }
 
+    private boolean invokeIsTransitionSatisfied(
+            SensorFusion.TransitionPreference transitionPreference,
+            com.google.android.gms.maps.model.LatLng previousLatLng,
+            com.google.android.gms.maps.model.LatLng nextLatLng,
+            int previousFloor,
+            int newFloor,
+            boolean strongBarometerEvidence
+    ) throws Exception {
+        Method method = SensorFusion.class.getDeclaredMethod(
+                "isTransitionSatisfied",
+                SensorFusion.TransitionPreference.class,
+                com.google.android.gms.maps.model.LatLng.class,
+                com.google.android.gms.maps.model.LatLng.class,
+                int.class,
+                int.class,
+                boolean.class
+        );
+        method.setAccessible(true);
+        return (boolean) method.invoke(
+                sensorFusion,
+                transitionPreference,
+                previousLatLng,
+                nextLatLng,
+                previousFloor,
+                newFloor,
+                strongBarometerEvidence
+        );
+    }
+
     private void invokeMarkWeakElevatorSuppressionState(long timestampMs, String reason)
             throws Exception {
         Method method = SensorFusion.class.getDeclaredMethod(
@@ -188,6 +303,34 @@ public class SensorFusionElevatorLiftGateTest {
         Method method = SensorFusion.class.getDeclaredMethod("resetElevatorState");
         method.setAccessible(true);
         method.invoke(sensorFusion);
+    }
+
+    @SuppressWarnings("unchecked")
+    private ArrayDeque<Long> getRecentAcceptedStepTimestamps() throws Exception {
+        Field field = SensorFusion.class.getDeclaredField("recentAcceptedStepTimestampsMs");
+        field.setAccessible(true);
+        return (ArrayDeque<Long>) field.get(sensorFusion);
+    }
+
+    private Object createAbsoluteObservationSnapshot(
+            double x,
+            double y,
+            Integer floor,
+            float accuracyMeters,
+            long timestampMs
+    ) throws Exception {
+        Class<?> snapshotClass = Class.forName(
+                "com.openpositioning.PositionMe.sensors.SensorFusion$AbsoluteObservationSnapshot"
+        );
+        Constructor<?> constructor = snapshotClass.getDeclaredConstructor(
+                double.class,
+                double.class,
+                Integer.class,
+                float.class,
+                long.class
+        );
+        constructor.setAccessible(true);
+        return constructor.newInstance(x, y, floor, accuracyMeters, timestampMs);
     }
 
     private java.util.List<com.google.android.gms.maps.model.LatLng> square(

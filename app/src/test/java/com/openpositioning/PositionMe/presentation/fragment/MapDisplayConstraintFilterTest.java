@@ -59,6 +59,42 @@ public class MapDisplayConstraintFilterTest {
     }
 
     @Test
+    public void observationPointRendersWhenLegalOnDisplayedFloor() {
+        MapConstraintRepository.replaceVenueConstraints("venue", Collections.emptyList());
+        MapConstraintRepository.setConstraintsForFloor(
+                2,
+                Collections.singletonList(square(0.0, 0.0, 0.0001)),
+                null
+        );
+
+        assertTrue(MapDisplayConstraintFilter.isRenderableObservationPoint(
+                new LatLng(-0.00005, -0.00005),
+                2,
+                2
+        ));
+    }
+
+    @Test
+    public void observationPointOutsideVenueOutlineIsHidden() {
+        MapConstraintRepository.replaceVenueConstraints("venue", square(0.0, 0.0, 0.0001));
+
+        assertFalse(MapDisplayConstraintFilter.isRenderableObservationPoint(
+                new LatLng(0.0002, 0.0002),
+                null,
+                0
+        ));
+    }
+
+    @Test
+    public void observationPointOnDifferentFloorThanDisplayedFloorIsHidden() {
+        assertFalse(MapDisplayConstraintFilter.isRenderableObservationPoint(
+                new LatLng(55.9444, -3.1878),
+                2,
+                1
+        ));
+    }
+
+    @Test
     public void constrainsSameFloorShortCorrectionToLastLegalPoint() {
         MapConstraintRepository.replaceVenueConstraints("venue", Collections.emptyList());
         MapConstraintRepository.setConstraintsForFloor(

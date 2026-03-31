@@ -19,13 +19,21 @@ public class SensorFusionFloorLockGateTest {
     @After
     public void tearDown() throws Exception {
         MapConstraintRepository.clear();
+        sensorFusion.resetAbsoluteAnchorStateForTesting();
         setField("pendingStableAbsoluteFloorCandidate", null);
         setField("pendingStableAbsoluteFloorCount", 0);
         setField("pendingStableAbsoluteFloorFirstTimestampMs", Long.MIN_VALUE);
         setField("pendingStableAbsoluteFloorLastTimestampMs", Long.MIN_VALUE);
         setField("pendingWifiBootstrapFloor", null);
         setField("pendingWifiBootstrapCount", 0);
+        setField("pendingWifiBootstrapFirstTimestampMs", Long.MIN_VALUE);
         setField("lastWifiBootstrapCandidateTimestampMs", Long.MIN_VALUE);
+        setField("lastFloorCalibrationInvalidatedTimestampMs", Long.MIN_VALUE);
+        setField("lastFloorCalibrationInvalidationReason", "none");
+        setField("committedDisplayFloorAbsolute", Integer.MIN_VALUE);
+        setField("pendingCommittedDisplayFloorAbsolute", Integer.MIN_VALUE);
+        setField("liveCurrentFloorAbsolute", Integer.MIN_VALUE);
+        setField("floorSwitchPending", false);
         setField("pdrFloorOffset", 0);
         setField("pfInitialized", false);
         setField("isFloorOffsetInitialized", false);
@@ -69,6 +77,22 @@ public class SensorFusionFloorLockGateTest {
 
         assertNull(invokeResolveAcceptedAbsoluteFloorPrior(1, 1_000L));
         assertEquals(Integer.valueOf(1), invokeResolveAcceptedAbsoluteFloorPrior(1, 2_000L));
+        assertEquals("initial_lock_acquired", getFieldValue("lastFloorConsensus"));
+    }
+
+    @Test
+    public void recentInvalidationAllowsAcceptedWifiBootstrapToLockImmediately() throws Exception {
+        seedKnownFloors();
+        setField("pfInitialized", true);
+        setField("isFloorOffsetInitialized", false);
+        setField("pendingWifiBootstrapFloor", 1);
+        setField("pendingWifiBootstrapCount", SensorFusion.resolveWifiBootstrapRequiredConfirmations(1));
+        setField("pendingWifiBootstrapFirstTimestampMs", 1_000L);
+        setField("lastWifiBootstrapCandidateTimestampMs", 2_000L);
+        setField("lastFloorCalibrationInvalidatedTimestampMs", 2_000L);
+        setField("lastFloorCalibrationInvalidationReason", "venue_switch");
+
+        assertEquals(Integer.valueOf(1), invokeResolveAcceptedAbsoluteFloorPrior(1, 2_500L));
         assertEquals("initial_lock_acquired", getFieldValue("lastFloorConsensus"));
     }
 

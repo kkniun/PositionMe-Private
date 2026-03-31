@@ -19,6 +19,27 @@ final class MapDisplayConstraintFilter {
         return point != null && MapConstraintRepository.isPointLegal(point, floor);
     }
 
+    static boolean isRenderableObservationPoint(
+            @Nullable LatLng point,
+            @Nullable Integer observationFloor,
+            @Nullable Integer displayedFloor
+    ) {
+        if (point == null) {
+            return false;
+        }
+        if (observationFloor != null && displayedFloor != null && !observationFloor.equals(displayedFloor)) {
+            return false;
+        }
+        if (observationFloor != null) {
+            return isRenderablePoint(point, observationFloor);
+        }
+        if (displayedFloor != null) {
+            return isRenderablePoint(point, displayedFloor);
+        }
+        return !MapConstraintRepository.hasVenueOutline()
+                || MapConstraintRepository.isPointInsideVenueOutline(point);
+    }
+
     static boolean isRenderableSegment(
             @Nullable LatLng start,
             @Nullable LatLng end,
@@ -40,8 +61,27 @@ final class MapDisplayConstraintFilter {
             int currentFloor,
             int candidateFloor
     ) {
+        return shouldHoldPositionForIllegalTransition(
+                currentLocation,
+                candidateLocation,
+                currentFloor,
+                candidateFloor,
+                false
+        );
+    }
+
+    static boolean shouldHoldPositionForIllegalTransition(
+            @Nullable LatLng currentLocation,
+            @Nullable LatLng candidateLocation,
+            int currentFloor,
+            int candidateFloor,
+            boolean forceAcceptTransition
+    ) {
         if (!isRenderablePoint(candidateLocation, candidateFloor)) {
             return true;
+        }
+        if (forceAcceptTransition) {
+            return false;
         }
         if (currentLocation == null) {
             return false;
@@ -57,10 +97,30 @@ final class MapDisplayConstraintFilter {
             int currentFloor,
             int candidateFloor
     ) {
+        return constrainToRenderableSegmentPrefix(
+                currentLocation,
+                candidateLocation,
+                currentFloor,
+                candidateFloor,
+                false
+        );
+    }
+
+    @Nullable
+    static LatLng constrainToRenderableSegmentPrefix(
+            @Nullable LatLng currentLocation,
+            @Nullable LatLng candidateLocation,
+            int currentFloor,
+            int candidateFloor,
+            boolean forceAcceptTransition
+    ) {
         if (currentLocation == null
                 || candidateLocation == null
                 || currentFloor != candidateFloor) {
             return null;
+        }
+        if (forceAcceptTransition && isRenderablePoint(candidateLocation, candidateFloor)) {
+            return candidateLocation;
         }
         double distanceMeters = UtilFunctions.distanceBetweenPoints(currentLocation, candidateLocation);
         if (!Double.isFinite(distanceMeters)
@@ -110,10 +170,39 @@ final class MapDisplayConstraintFilter {
             int candidateFloor,
             @Nullable LatLng crossFloorLandingLocation
     ) {
+        return resolveBestRenderableDisplayLocation(
+                currentDisplayedLocation,
+                rawCandidateLocation,
+                displayCandidateLocation,
+                currentFloor,
+                candidateFloor,
+                crossFloorLandingLocation,
+                false
+        );
+    }
+
+    @Nullable
+    static LatLng resolveBestRenderableDisplayLocation(
+            @Nullable LatLng currentDisplayedLocation,
+            @NonNull LatLng rawCandidateLocation,
+            @Nullable LatLng displayCandidateLocation,
+            int currentFloor,
+            int candidateFloor,
+            @Nullable LatLng crossFloorLandingLocation,
+            boolean forceAcceptTransition
+    ) {
         if (currentDisplayedLocation != null && currentFloor != candidateFloor) {
             if (isRenderablePoint(crossFloorLandingLocation, candidateFloor)) {
                 return crossFloorLandingLocation;
             }
+            if (displayCandidateLocation != null && isRenderablePoint(displayCandidateLocation, candidateFloor)) {
+                return displayCandidateLocation;
+            }
+            return isRenderablePoint(rawCandidateLocation, candidateFloor)
+                    ? rawCandidateLocation
+                    : null;
+        }
+        if (forceAcceptTransition) {
             if (displayCandidateLocation != null && isRenderablePoint(displayCandidateLocation, candidateFloor)) {
                 return displayCandidateLocation;
             }
@@ -127,7 +216,8 @@ final class MapDisplayConstraintFilter {
                 currentDisplayedLocation,
                 displayCandidateLocation,
                 currentFloor,
-                candidateFloor
+                candidateFloor,
+                false
         )) {
             return displayCandidateLocation;
         }
@@ -136,7 +226,8 @@ final class MapDisplayConstraintFilter {
                 currentDisplayedLocation,
                 rawCandidateLocation,
                 currentFloor,
-                candidateFloor
+                candidateFloor,
+                false
         )) {
             return rawCandidateLocation;
         }
@@ -144,7 +235,8 @@ final class MapDisplayConstraintFilter {
                 currentDisplayedLocation,
                 rawCandidateLocation,
                 currentFloor,
-                candidateFloor
+                candidateFloor,
+                false
         );
     }
 

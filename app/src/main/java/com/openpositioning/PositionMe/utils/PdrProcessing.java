@@ -39,6 +39,19 @@ public class PdrProcessing {
     // Threshold under which movement is considered non-existent
     private static final float epsilon = 0.30f;
     private static final int MIN_REQUIRED_SAMPLES = 2;
+    private static final long STEP_INTERVAL_FAST_MS = 650L;
+    private static final long STEP_INTERVAL_NORMAL_MS = 850L;
+    private static final long STEP_INTERVAL_SLOW_MS = 1_100L;
+    private static final long STEP_INTERVAL_VERY_SLOW_MS = 1_400L;
+    private static final long STEP_INTERVAL_IDLE_RESET_MS = 2_200L;
+    private static final float STEP_SCALE_FAST = 1.0f;
+    private static final float STEP_SCALE_NORMAL = 0.88f;
+    private static final float STEP_SCALE_SLOW = 0.72f;
+    private static final float STEP_SCALE_VERY_SLOW = 0.58f;
+    private static final float STEP_MAX_FAST_M = 1.15f;
+    private static final float STEP_MAX_NORMAL_M = 0.95f;
+    private static final float STEP_MAX_SLOW_M = 0.80f;
+    private static final float STEP_MAX_VERY_SLOW_M = 0.72f;
     //endregion
 
     //region Instance variables
@@ -150,7 +163,16 @@ public class PdrProcessing {
             float deltaHeadingRad,
             float heightDeltaMeters
     ) {
-        float computedStepLength = computeStepLength(accelMagnitudeOvertime);
+        return buildStepDelta(accelMagnitudeOvertime, deltaHeadingRad, heightDeltaMeters, -1L);
+    }
+
+    public PdrDelta buildStepDelta(
+            List<Double> accelMagnitudeOvertime,
+            float deltaHeadingRad,
+            float heightDeltaMeters,
+            long stepIntervalMs
+    ) {
+        float computedStepLength = computeStepLength(accelMagnitudeOvertime, stepIntervalMs);
         if (computedStepLength > 0f) {
             sumStepLength += computedStepLength;
             stepCount++;
@@ -281,7 +303,7 @@ public class PdrProcessing {
         return bounce * K * 2;
     }
 
-    private float computeStepLength(List<Double> accelMagnitudeOvertime) {
+    private float computeStepLength(List<Double> accelMagnitudeOvertime, long stepIntervalMs) {
         if (useManualStep) {
             return this.stepLength;
         }
@@ -291,8 +313,112 @@ public class PdrProcessing {
         if (accelMagnitudeOvertime.isEmpty()) {
             return 0f;
         }
-        this.stepLength = weibergMinMax(accelMagnitudeOvertime);
+        this.stepLength = applyCadenceAwareStepLength(
+                weibergMinMax(accelMagnitudeOvertime),
+                stepIntervalMs
+        );
         return this.stepLength;
+    }
+
+    static float applyCadenceAwareStepLength(float baseStepLengthMeters, long stepIntervalMs) {
+        if (baseStepLengthMeters <= 0f || stepIntervalMs <= 0L) {
+            return baseStepLengthMeters;
+        }
+        long sanitizedIntervalMs = stepIntervalMs >= STEP_INTERVAL_IDLE_RESET_MS
+                ? STEP_INTERVAL_SLOW_MS
+                : stepIntervalMs;
+        float cadenceScale = interpolateCadenceScale(sanitizedIntervalMs);
+        float longStepSeverity = clamp01((baseStepLengthMeters - 0.55f) / 0.65f);
+        float blendedScale = 1.0f - ((1.0f - cadenceScale) * (0.35f + (0.65f * longStepSeverity)));
+        float cappedLength = baseStepLengthMeters * blendedScale;
+        return Math.min(cappedLength, resolveCadenceAwareStepLengthLimit(sanitizedIntervalMs));
+    }
+
+    private static float interpolateCadenceScale(long stepIntervalMs) {
+        if (stepIntervalMs <= STEP_INTERVAL_FAST_MS) {
+            return STEP_SCALE_FAST;
+        }
+        if (stepIntervalMs <= STEP_INTERVAL_NORMAL_MS) {
+            return interpolate(
+                    STEP_INTERVAL_FAST_MS,
+                    STEP_SCALE_FAST,
+                    STEP_INTERVAL_NORMAL_MS,
+                    STEP_SCALE_NORMAL,
+                    stepIntervalMs
+            );
+        }
+        if (stepIntervalMs <= STEP_INTERVAL_SLOW_MS) {
+            return interpolate(
+                    STEP_INTERVAL_NORMAL_MS,
+                    STEP_SCALE_NORMAL,
+                    STEP_INTERVAL_SLOW_MS,
+                    STEP_SCALE_SLOW,
+                    stepIntervalMs
+            );
+        }
+        if (stepIntervalMs <= STEP_INTERVAL_VERY_SLOW_MS) {
+            return interpolate(
+                    STEP_INTERVAL_SLOW_MS,
+                    STEP_SCALE_SLOW,
+                    STEP_INTERVAL_VERY_SLOW_MS,
+                    STEP_SCALE_VERY_SLOW,
+                    stepIntervalMs
+            );
+        }
+        return STEP_SCALE_VERY_SLOW;
+    }
+
+    private static float resolveCadenceAwareStepLengthLimit(long stepIntervalMs) {
+        if (stepIntervalMs <= STEP_INTERVAL_FAST_MS) {
+            return STEP_MAX_FAST_M;
+        }
+        if (stepIntervalMs <= STEP_INTERVAL_NORMAL_MS) {
+            return interpolate(
+                    STEP_INTERVAL_FAST_MS,
+                    STEP_MAX_FAST_M,
+                    STEP_INTERVAL_NORMAL_MS,
+                    STEP_MAX_NORMAL_M,
+                    stepIntervalMs
+            );
+        }
+        if (stepIntervalMs <= STEP_INTERVAL_SLOW_MS) {
+            return interpolate(
+                    STEP_INTERVAL_NORMAL_MS,
+                    STEP_MAX_NORMAL_M,
+                    STEP_INTERVAL_SLOW_MS,
+                    STEP_MAX_SLOW_M,
+                    stepIntervalMs
+            );
+        }
+        if (stepIntervalMs <= STEP_INTERVAL_VERY_SLOW_MS) {
+            return interpolate(
+                    STEP_INTERVAL_SLOW_MS,
+                    STEP_MAX_SLOW_M,
+                    STEP_INTERVAL_VERY_SLOW_MS,
+                    STEP_MAX_VERY_SLOW_M,
+                    stepIntervalMs
+            );
+        }
+        return STEP_MAX_VERY_SLOW_M;
+    }
+
+    private static float interpolate(
+            long x0,
+            float y0,
+            long x1,
+            float y1,
+            long x
+    ) {
+        if (x1 <= x0) {
+            return y1;
+        }
+        float ratio = (float) (x - x0) / (float) (x1 - x0);
+        ratio = clamp01(ratio);
+        return y0 + ((y1 - y0) * ratio);
+    }
+
+    private static float clamp01(float value) {
+        return Math.max(0f, Math.min(1f, value));
     }
 
     /**

@@ -41,6 +41,7 @@ import com.openpositioning.PositionMe.sensors.FusedPose;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.utils.BuildingPolygon;
 import com.openpositioning.PositionMe.utils.IndoorMapManager;
+import com.openpositioning.PositionMe.utils.LiveMotionGate;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
 
 import java.util.ArrayDeque;
@@ -51,6 +52,7 @@ import java.util.Locale;
 import java.util.Map;
 
 public class TrajectoryMapFragment extends Fragment {
+    private static final String STATE_AUTO_FLOOR_ENABLED = "state_auto_floor_enabled";
     private static final String ARROW_DBG_TAG = "ARROW_DBG";
     private static final String DISPLAY_DIAG_TAG = "DISPLAY_DIAG";
     private static final String FLOOR_DIAG_TAG = "FloorDiag";
@@ -64,6 +66,7 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double RAW_POINT_DUPLICATE_THRESHOLD_M = 0.25;
     private static final double TRAJECTORY_STATIONARY_HINT_THRESHOLD_M = 0.45;
     private static final long MARKER_FAST_FOLLOW_WINDOW_MS = 1_500L;
+    private static final int DISPLAY_TELEPORT_RECOVERY_REJECT_THRESHOLD = 5;
     private static final double HEADING_FREEZE_LOW_CONFIDENCE_THRESHOLD = 0.40;
     // 地图 marker 的视觉基准当前比期望“尖头朝上”右偏约 90 度，只在显示层做常量修正。
     private static final float FUSED_MARKER_VISUAL_OFFSET_DEG = 0f;
@@ -152,6 +155,8 @@ public class TrajectoryMapFragment extends Fragment {
     private boolean isPdrOn = true;
     private boolean displaySmoothingEnabled = true;
     private boolean venueSelectionEnabled;
+    private boolean autoFloorEnabledState;
+    private boolean autoFloorStateInitialized;
 
     private final List<LatLng> fusedTrajectoryRawPoints = new ArrayList<>();
     private final List<Integer> fusedTrajectoryFloors = new ArrayList<>();
@@ -179,6 +184,7 @@ public class TrajectoryMapFragment extends Fragment {
     private long lastMarkerMoveTimestampMs = Long.MIN_VALUE;
     private boolean lastDisplayMarkerMoved;
     private double lastDisplayMarkerMoveDistanceMeters = Double.NaN;
+    private int consecutiveDisplayRejects;
     @NonNull
     private String lastDisplayDecision = "init";
     @NonNull
@@ -244,6 +250,22 @@ public class TrajectoryMapFragment extends Fragment {
         isWifiOn = wifiSwitch.isChecked();
         isPdrOn = pdrSwitch.isChecked();
         displaySmoothingEnabled = displaySmoothingSwitch.isChecked();
+        Boolean savedAutoFloorState = savedInstanceState != null
+                && savedInstanceState.containsKey(STATE_AUTO_FLOOR_ENABLED)
+                ? Boolean.valueOf(savedInstanceState.getBoolean(STATE_AUTO_FLOOR_ENABLED))
+                : null;
+        Boolean restoredAutoFloorState = MapUiStateResolver.resolveSavedOrRememberedAutoFloorState(
+                savedAutoFloorState,
+                autoFloorStateInitialized,
+                autoFloorEnabledState
+        );
+        autoFloorEnabledState = MapUiStateResolver.resolveRestoredAutoFloorState(
+                restoredAutoFloorState,
+                autoFloorSwitch.isChecked()
+        );
+        autoFloorStateInitialized = true;
+        autoFloorSwitch.setChecked(autoFloorEnabledState);
+        MapUiStateResolver.rememberAutoFloorState(autoFloorEnabledState);
 
         setFloorControlsVisibility(View.GONE);
         if (!venueSelectionEnabled && selectedVenueText != null) {
@@ -310,9 +332,11 @@ public class TrajectoryMapFragment extends Fragment {
                 if (displayFloor == null) {
                     return;
                 }
+                Integer renderedFloorBaseline = resolveRenderedFloorBaseline();
                 LatLng displayedLocation = resolveDisplayLocation(
                         currentRawLocation,
                         displayFloor,
+                        renderedFloorBaseline == null ? displayFloor : renderedFloorBaseline,
                         System.currentTimeMillis()
                 );
                 currentLocation = displayedLocation;
@@ -329,6 +353,9 @@ public class TrajectoryMapFragment extends Fragment {
         });
 
         autoFloorSwitch.setOnCheckedChangeListener((compoundButton, isChecked) -> {
+            autoFloorEnabledState = isChecked;
+            autoFloorStateInitialized = true;
+            MapUiStateResolver.rememberAutoFloorState(isChecked);
             if (!isChecked || indoorMapManager == null) {
                 return;
             }
@@ -374,6 +401,15 @@ public class TrajectoryMapFragment extends Fragment {
 
         recenterButton.setOnClickListener(v -> recenterOnCurrentLocation());
         updateWaitingStateUi();
+    }
+
+    @Override
+    public void onSaveInstanceState(@NonNull Bundle outState) {
+        super.onSaveInstanceState(outState);
+        boolean autoFloorChecked = autoFloorSwitch != null
+                ? autoFloorSwitch.isChecked()
+                : autoFloorEnabledState;
+        outState.putBoolean(STATE_AUTO_FLOOR_ENABLED, autoFloorChecked);
     }
 
     private void initMapSettings(@NonNull GoogleMap map) {
@@ -513,7 +549,14 @@ public class TrajectoryMapFragment extends Fragment {
             );
             return;
         }
-        boolean crossFloorDisplayUpdate = DisplayFloorResetGate.requiresResetToken(lastRenderedFusedFloor, floor);
+        Integer renderedFloorBaseline = resolveRenderedFloorBaseline();
+        int renderedFloorForConstraints = renderedFloorBaseline == null
+                ? lastRenderedFusedFloor
+                : renderedFloorBaseline;
+        boolean crossFloorDisplayUpdate = DisplayFloorResetGate.requiresResetToken(
+                renderedFloorForConstraints,
+                floor
+        );
         boolean authorizedFloorReset = crossFloorDisplayUpdate
                 && sensorFusion != null
                 && sensorFusion.isDisplayFloorChangeReady(floor, timestampMs);
@@ -524,7 +567,7 @@ public class TrajectoryMapFragment extends Fragment {
                 ? sensorFusion.peekPendingDisplayFloorResetLanding(floor, timestampMs)
                 : null;
         if (DisplayFloorResetGate.shouldHoldCrossFloorUpdate(
-                lastRenderedFusedFloor,
+                renderedFloorForConstraints,
                 floor,
                 authorizedFloorReset
         )) {
@@ -547,20 +590,23 @@ public class TrajectoryMapFragment extends Fragment {
         LatLng previousDisplayedLocation = currentLocation;
         boolean rawPoseConstrained = false;
         boolean usedCrossFloorLandingCorrection = false;
+        boolean usedForcedDisplayTeleport = false;
+        boolean heldIllegalTransitionThisFrame = false;
+        String displayTeleportRecoveryReason = resolveDisplayTeleportRecoveryReason(timestampMs);
         if (!MapDisplayConstraintFilter.isRenderablePoint(newLocation, floor)) {
             LatLng constrainedRawLocation = crossFloorDisplayUpdate
                     ? MapDisplayConstraintFilter.resolveBestRenderableDisplayLocation(
                     currentLocation,
                     newLocation,
                     crossFloorLandingLocation,
-                    lastRenderedFusedFloor,
+                    renderedFloorForConstraints,
                     floor,
                     crossFloorLandingLocation
             )
                     : MapDisplayConstraintFilter.constrainToRenderableSegmentPrefix(
                     currentRawLocation,
                     newLocation,
-                    lastRenderedFusedFloor,
+                    renderedFloorForConstraints,
                     floor
             );
             if (constrainedRawLocation == null) {
@@ -586,24 +632,51 @@ public class TrajectoryMapFragment extends Fragment {
                     && crossFloorLandingLocation.equals(constrainedRawLocation);
         }
 
-        LatLng renderedRawLocation = !crossFloorDisplayUpdate && shouldHoldStationaryDisplayPosition(newLocation)
+        LatLng renderedRawLocation = !crossFloorDisplayUpdate
+                && shouldHoldPassivePoseUpdate(newLocation, timestampMs)
                 ? currentRawLocation
                 : newLocation;
         boolean usedConstrainedCorrection = rawPoseConstrained;
         boolean usedRawDisplayFallback = false;
+        boolean forceRawTeleportRecovery = !crossFloorDisplayUpdate
+                && displayTeleportRecoveryReason != null
+                && currentRawLocation != null
+                && renderedRawLocation != null
+                && MapDisplayConstraintFilter.isRenderablePoint(renderedRawLocation, floor)
+                && MapDisplayConstraintFilter.shouldHoldPositionForIllegalTransition(
+                currentRawLocation,
+                renderedRawLocation,
+                renderedFloorForConstraints,
+                floor
+        );
+        if (forceRawTeleportRecovery) {
+            usedForcedDisplayTeleport = true;
+            Log.i(
+                    "TrajectoryMapFragment",
+                    "DISPLAY:force_teleport_recovery stage=raw"
+                            + " reason=" + displayTeleportRecoveryReason
+                            + " rejectStreak=" + consecutiveDisplayRejects
+            );
+        }
         if (!crossFloorDisplayUpdate && MapDisplayConstraintFilter.shouldHoldPositionForIllegalTransition(
                 currentRawLocation,
                 renderedRawLocation,
-                lastRenderedFusedFloor,
-                floor
+                renderedFloorForConstraints,
+                floor,
+                forceRawTeleportRecovery
         )) {
             LatLng constrainedRawLocation = MapDisplayConstraintFilter.constrainToRenderableSegmentPrefix(
                     currentRawLocation,
                     renderedRawLocation,
-                    lastRenderedFusedFloor,
-                    floor
+                    renderedFloorForConstraints,
+                    floor,
+                    forceRawTeleportRecovery
             );
             if (constrainedRawLocation == null) {
+                if (!heldIllegalTransitionThisFrame) {
+                    consecutiveDisplayRejects++;
+                    heldIllegalTransitionThisFrame = true;
+                }
                 recordDisplayDecision(
                         internalPoseUpdated,
                         false,
@@ -648,16 +721,41 @@ public class TrajectoryMapFragment extends Fragment {
                 || (sensorFusion != null && sensorFusion.shouldFastFollowDisplayedMarker(timestampMs))) {
             markerDisplayFilter.armFastFollowWindow(timestampMs, MARKER_FAST_FOLLOW_WINDOW_MS);
         }
-        LatLng displayedLocation = resolveDisplayLocation(renderedRawLocation, floor, timestampMs);
+        LatLng displayedLocation = resolveDisplayLocation(
+                renderedRawLocation,
+                floor,
+                renderedFloorForConstraints,
+                timestampMs
+        );
         LatLng smoothedDisplayedLocation = displayedLocation;
         boolean displayPointRenderable =
                 MapDisplayConstraintFilter.isRenderablePoint(displayedLocation, floor);
+        boolean forceDisplayTeleportRecovery = !crossFloorDisplayUpdate
+                && displayTeleportRecoveryReason != null
+                && displayPointRenderable
+                && currentLocation != null
+                && MapDisplayConstraintFilter.shouldHoldPositionForIllegalTransition(
+                currentLocation,
+                displayedLocation,
+                renderedFloorForConstraints,
+                floor
+        );
+        if (forceDisplayTeleportRecovery) {
+            usedForcedDisplayTeleport = true;
+            Log.i(
+                    "TrajectoryMapFragment",
+                    "DISPLAY:force_teleport_recovery stage=display"
+                            + " reason=" + displayTeleportRecoveryReason
+                            + " rejectStreak=" + consecutiveDisplayRejects
+            );
+        }
         boolean displayTransitionIllegal = !crossFloorDisplayUpdate
                 && MapDisplayConstraintFilter.shouldHoldPositionForIllegalTransition(
                 currentLocation,
                 displayedLocation,
-                lastRenderedFusedFloor,
-                floor
+                renderedFloorForConstraints,
+                floor,
+                forceDisplayTeleportRecovery
         );
         if (!displayPointRenderable || displayTransitionIllegal) {
             String rejectReason = !displayPointRenderable
@@ -667,11 +765,16 @@ public class TrajectoryMapFragment extends Fragment {
                     currentLocation,
                     renderedRawLocation,
                     displayedLocation,
-                    lastRenderedFusedFloor,
+                    renderedFloorForConstraints,
                     floor,
-                    crossFloorLandingLocation
+                    crossFloorLandingLocation,
+                    forceDisplayTeleportRecovery
             );
             if (resolvedDisplayLocation == null) {
+                if (!heldIllegalTransitionThisFrame && "display_transition_illegal".equals(rejectReason)) {
+                    consecutiveDisplayRejects++;
+                    heldIllegalTransitionThisFrame = true;
+                }
                 recordDisplayDecision(
                         internalPoseUpdated,
                         false,
@@ -716,6 +819,9 @@ public class TrajectoryMapFragment extends Fragment {
                     );
                 }
             }
+        }
+        if (usedForcedDisplayTeleport) {
+            markerDisplayFilter.armFastFollowWindow(timestampMs, MARKER_FAST_FOLLOW_WINDOW_MS);
         }
         boolean floorSwitchCommitted = false;
         if (crossFloorDisplayUpdate && authorizedFloorReset && sensorFusion != null) {
@@ -762,13 +868,18 @@ public class TrajectoryMapFragment extends Fragment {
                 : UtilFunctions.distanceBetweenPoints(previousDisplayedLocation, displayedLocation);
         boolean markerMoved = previousDisplayedLocation == null
                 || moveDistanceMeters > 0.01;
+        if (usedForcedDisplayTeleport || !heldIllegalTransitionThisFrame) {
+            consecutiveDisplayRejects = 0;
+        }
         recordDisplayDecision(
                 internalPoseUpdated,
                 true,
                 timestampMs,
                 markerMoved,
                 moveDistanceMeters,
-                usedConstrainedCorrection
+                usedForcedDisplayTeleport
+                        ? "accepted_forced_display_teleport"
+                        : usedConstrainedCorrection
                         ? "accepted_constrained_correction"
                         : usedCrossFloorLandingCorrection
                         ? "accepted_cross_floor_landing_correction"
@@ -781,7 +892,7 @@ public class TrajectoryMapFragment extends Fragment {
                         : "accepted_same_floor",
                 "none"
         );
-        maybeAppendFusedTrajectory(renderedRawLocation, floor, timestampMs);
+        maybeAppendFusedTrajectory(renderedRawLocation, floor, timestampMs, usedForcedDisplayTeleport);
 
         if (!hasAutoCenteredOnFirstFix) {
             gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(displayedLocation, 19f));
@@ -825,6 +936,17 @@ public class TrajectoryMapFragment extends Fragment {
         );
     }
 
+    @Nullable
+    private String resolveDisplayTeleportRecoveryReason(long timestampMs) {
+        if (sensorFusion != null && sensorFusion.shouldBypassDisplayTransitionConstraints(timestampMs)) {
+            return "backend_teleport_hint";
+        }
+        if (consecutiveDisplayRejects > DISPLAY_TELEPORT_RECOVERY_REJECT_THRESHOLD) {
+            return "reject_streak";
+        }
+        return null;
+    }
+
     private void recordDisplayDecision(
             boolean internalPoseUpdated,
             boolean displayPoseApplied,
@@ -866,6 +988,7 @@ public class TrajectoryMapFragment extends Fragment {
                         : sensorFusion.getLatestFusedPose().getFloor())
                         + " TRUSTED_FLOOR=" + (sensorFusion == null ? Integer.MIN_VALUE : sensorFusion.getUserVisibleFloor())
                         + " DISPLAY_FLOOR=" + (indoorMapManager == null ? Integer.MIN_VALUE : indoorMapManager.getCurrentFloor())
+                        + " displayRejectStreak=" + consecutiveDisplayRejects
         );
     }
 
@@ -889,19 +1012,39 @@ public class TrajectoryMapFragment extends Fragment {
         );
     }
 
-    private boolean shouldHoldStationaryDisplayPosition(@NonNull LatLng newLocation) {
-        return MapPointerDisplayFilter.shouldHoldStationaryDisplayPosition(
+    private boolean shouldHoldPassivePoseUpdate(@NonNull LatLng newLocation, long timestampMs) {
+        SensorFusion.MotionDebugSnapshot motionDebug = sensorFusion == null
+                ? null
+                : sensorFusion.getMotionDebugSnapshot();
+        return LiveMotionGate.shouldHoldPoseForPassiveUpdate(
                 currentRawLocation,
                 newLocation,
-                sensorFusion != null && sensorFusion.isStationary()
+                sensorFusion != null && sensorFusion.isStationary(),
+                motionDebug != null && motionDebug.motionResumeActive,
+                motionDebug == null ? "none" : motionDebug.lastPoseAdvanceSource,
+                timestampMs,
+                motionDebug == null ? Long.MIN_VALUE : motionDebug.lastAcceptedStepTimestampMs
+        );
+    }
+
+    private boolean hasTranslationalMotionEvidence(long timestampMs) {
+        SensorFusion.MotionDebugSnapshot motionDebug = sensorFusion == null
+                ? null
+                : sensorFusion.getMotionDebugSnapshot();
+        return motionDebug != null && LiveMotionGate.hasTranslationalMotionEvidence(
+                motionDebug.motionResumeActive,
+                motionDebug.lastPoseAdvanceSource,
+                timestampMs,
+                motionDebug.lastAcceptedStepTimestampMs
         );
     }
 
     public void updateGNSS(@NonNull LatLng gnssLocation) {
-        addObservationMarker(
+        boolean rendered = addObservationMarker(
                 gnssObservationMarkers,
                 lastGnssObservation,
                 gnssLocation,
+                null,
                 "Device Location",
                 null,
                 getGnssObservationIcon(),
@@ -909,16 +1052,19 @@ public class TrajectoryMapFragment extends Fragment {
                 1f
         );
         logUiObservationTrace("GNSS", gnssLocation, null);
-        lastGnssObservation = gnssLocation;
+        if (rendered) {
+            lastGnssObservation = gnssLocation;
+        }
         maybeRefreshIndoorMapContext(gnssLocation);
         updateWaitingStateUi();
     }
 
     public void updateWifiFix(@NonNull LatLng wifiLocation, @Nullable Integer floor) {
-        addObservationMarker(
+        boolean rendered = addObservationMarker(
                 wifiObservationMarkers,
                 lastWifiObservation,
                 wifiLocation,
+                floor,
                 "WiFi Position",
                 floor == null ? null : "Floor " + floor,
                 getWifiObservationIcon(),
@@ -926,16 +1072,19 @@ public class TrajectoryMapFragment extends Fragment {
                 1.2f
         );
         logUiObservationTrace("WIFI", wifiLocation, floor);
-        lastWifiObservation = wifiLocation;
+        if (rendered) {
+            lastWifiObservation = wifiLocation;
+        }
         maybeRefreshIndoorMapContext(wifiLocation);
         updateWaitingStateUi();
     }
 
     public void updatePdrObservation(@NonNull LatLng pdrLocation) {
-        addObservationMarker(
+        boolean rendered = addObservationMarker(
                 pdrObservationMarkers,
                 lastPdrObservation,
                 pdrLocation,
+                null,
                 "PDR Position",
                 null,
                 getPdrObservationIcon(),
@@ -943,7 +1092,9 @@ public class TrajectoryMapFragment extends Fragment {
                 1.15f
         );
         logUiObservationTrace("PDR", pdrLocation, null);
-        lastPdrObservation = pdrLocation;
+        if (rendered) {
+            lastPdrObservation = pdrLocation;
+        }
     }
 
     public void clearGNSS() {
@@ -966,7 +1117,7 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     public boolean isAutoFloorEnabled() {
-        return autoFloorSwitch != null && autoFloorSwitch.isChecked();
+        return autoFloorSwitch != null ? autoFloorSwitch.isChecked() : autoFloorEnabledState;
     }
 
     public boolean isMappedVenueActive() {
@@ -1057,6 +1208,7 @@ public class TrajectoryMapFragment extends Fragment {
         lastMarkerMoveTimestampMs = Long.MIN_VALUE;
         lastDisplayMarkerMoved = false;
         lastDisplayMarkerMoveDistanceMeters = Double.NaN;
+        consecutiveDisplayRejects = 0;
         lastDisplayDecision = "reset";
         lastDisplayRejectReason = "none";
         currentLocation = null;
@@ -1301,7 +1453,12 @@ public class TrajectoryMapFragment extends Fragment {
         return normalized < 0.0 ? normalized + 360.0 : normalized;
     }
 
-    private void maybeAppendFusedTrajectory(@NonNull LatLng rawLocation, int floor, long timestampMs) {
+    private void maybeAppendFusedTrajectory(
+            @NonNull LatLng rawLocation,
+            int floor,
+            long timestampMs,
+            boolean forceAcceptTransition
+    ) {
         if (!isFusedTrajectoryRenderingArmed()) {
             lastFusedTrajectoryRawLocation = rawLocation;
             lastFusedTrajectoryFloor = floor;
@@ -1332,8 +1489,12 @@ public class TrajectoryMapFragment extends Fragment {
         if (distanceMeters < TRAJECTORY_DUPLICATE_SUPPRESS_THRESHOLD_M) {
             return;
         }
+        if (!hasTranslationalMotionEvidence(timestampMs)) {
+            return;
+        }
         if (lastFusedTrajectoryRawLocation != null
                 && lastFusedTrajectoryFloor == floor
+                && !forceAcceptTransition
                 && !MapDisplayConstraintFilter.isRenderableSegment(
                 lastFusedTrajectoryRawLocation,
                 rawLocation,
@@ -1420,14 +1581,34 @@ public class TrajectoryMapFragment extends Fragment {
         fusedTrajectoryPolyline.setVisible(isFusedOn);
     }
 
+    @Nullable
+    private Integer resolveRenderedFloorBaseline() {
+        if (indoorMapManager != null && isAutoFloorEnabled()) {
+            int currentMapFloor = indoorMapManager.getCurrentFloor();
+            if (lastRenderedFusedFloor == Integer.MIN_VALUE || currentMapFloor != lastRenderedFusedFloor) {
+                // 视图重建或地图/UI 状态失配时，优先拿“当前真正显示中的楼层”做基线。
+                return currentMapFloor;
+            }
+        }
+        if (lastRenderedFusedFloor != Integer.MIN_VALUE) {
+            return lastRenderedFusedFloor;
+        }
+        return null;
+    }
+
     @NonNull
-    private LatLng resolveDisplayLocation(@NonNull LatLng rawLocation, int floor, long timestampMs) {
+    private LatLng resolveDisplayLocation(
+            @NonNull LatLng rawLocation,
+            int floor,
+            int renderedFloorBaseline,
+            long timestampMs
+    ) {
         LatLng currentDisplayedLocation = markerDisplayFilter.getFilteredPosition();
         boolean bypassFilter = currentDisplayedLocation != null
                 && MapDisplayConstraintFilter.shouldBypassSmoothing(
                 currentDisplayedLocation,
                 rawLocation,
-                lastRenderedFusedFloor,
+                renderedFloorBaseline,
                 floor
         );
         return markerDisplayFilter.updatePosition(
@@ -1488,6 +1669,34 @@ public class TrajectoryMapFragment extends Fragment {
                         + " source=" + (resolvedFloor == null ? "null" : "trusted_sensor_floor")
         );
         return resolvedFloor;
+    }
+
+    private void maybeSyncTrustedAutoFloor(@NonNull String source) {
+        if (sensorFusion == null
+                || indoorMapManager == null
+                || !isAutoFloorEnabled()
+                || !indoorMapManager.hasSelectedVenue()) {
+            return;
+        }
+        Integer trustedFloor = FloorDisplayGate.resolveTrustedFloorForDisplay(
+                sensorFusion.isFloorCalibrated(),
+                sensorFusion.getUserVisibleFloor()
+        );
+        if (trustedFloor == null) {
+            return;
+        }
+        int currentMapFloor = indoorMapManager.getCurrentFloor();
+        if (currentMapFloor == trustedFloor) {
+            return;
+        }
+        logFloorDiag(
+                "event=map_auto_floor_sync source=" + source
+                        + " floor=" + trustedFloor
+                        + " currentMapFloor=" + currentMapFloor
+                        + " trustedSensorFloor=true"
+                        + " immediate=false"
+        );
+        indoorMapManager.setCurrentFloor(trustedFloor, true);
     }
 
     @Nullable
@@ -1555,10 +1764,19 @@ public class TrajectoryMapFragment extends Fragment {
         );
     }
 
-    private void addObservationMarker(
+    @Nullable
+    private Integer resolveObservationDisplayFloor() {
+        if (indoorMapManager != null) {
+            return indoorMapManager.getCurrentFloor();
+        }
+        return lastRenderedFusedFloor == Integer.MIN_VALUE ? null : lastRenderedFusedFloor;
+    }
+
+    private boolean addObservationMarker(
             @NonNull ArrayDeque<Marker> markers,
             @Nullable LatLng previousLocation,
             @NonNull LatLng newLocation,
+            @Nullable Integer observationFloor,
             @NonNull String title,
             @Nullable String snippet,
             @NonNull BitmapDescriptor icon,
@@ -1566,11 +1784,27 @@ public class TrajectoryMapFragment extends Fragment {
             float zIndex
     ) {
         if (gMap == null) {
-            return;
+            return false;
         }
         if (previousLocation != null
                 && UtilFunctions.distanceBetweenPoints(previousLocation, newLocation) < RAW_POINT_DUPLICATE_THRESHOLD_M) {
-            return;
+            return false;
+        }
+        Integer displayedFloor = resolveObservationDisplayFloor();
+        if (!MapDisplayConstraintFilter.isRenderableObservationPoint(
+                newLocation,
+                observationFloor,
+                displayedFloor
+        )) {
+            logFloorDiag(
+                    "event=raw_observation_hidden"
+                            + " title=" + title
+                            + " observationFloor=" + observationFloor
+                            + " displayedFloor=" + displayedFloor
+                            + " lat=" + newLocation.latitude
+                            + " lng=" + newLocation.longitude
+            );
+            return false;
         }
         Marker marker = gMap.addMarker(new MarkerOptions()
                 .position(newLocation)
@@ -1581,13 +1815,14 @@ public class TrajectoryMapFragment extends Fragment {
                 .icon(icon)
                 .visible(visible));
         if (marker == null) {
-            return;
+            return false;
         }
         markers.addLast(marker);
         while (markers.size() > MAX_RAW_OBSERVATIONS) {
             Marker oldest = markers.removeFirst();
             oldest.remove();
         }
+        return true;
     }
 
     private void clearObservationMarkers(@NonNull ArrayDeque<Marker> markers) {
@@ -1730,12 +1965,16 @@ public class TrajectoryMapFragment extends Fragment {
         if (indoorMapManager == null) {
             return;
         }
-        LatLng requestLocation = seedLocation != null ? seedLocation : getBestAvailableMapAnchor();
+        LatLng requestLocation = getBestAvailableMapAnchor();
+        if (requestLocation == null) {
+            requestLocation = seedLocation;
+        }
         if (requestLocation == null) {
             return;
         }
         indoorMapManager.setCurrentLocation(requestLocation);
         indoorMapManager.refreshNearbyVenues(requestLocation, sensorFusion.getWifiList());
+        maybeSyncTrustedAutoFloor("indoor_map_context");
         setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
         updateVenueLabel();
     }

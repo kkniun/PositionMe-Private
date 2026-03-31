@@ -1,11 +1,17 @@
 package com.openpositioning.PositionMe.presentation.fragment;
 
+import org.junit.After;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 
 public class TrajectoryMapFragmentFloorDisplayTest {
+
+    @After
+    public void tearDown() {
+        MapUiStateResolver.clearRememberedAutoFloorStateForTesting();
+    }
 
     @Test
     public void mapAutoFloorDoesNotSwitchToDefaultGroundFloorBeforeCalibration() {
@@ -39,6 +45,14 @@ public class TrajectoryMapFragmentFloorDisplayTest {
     }
 
     @Test
+    public void reverseTransitionTrustedFloorOverridesStaleMapAndRenderedFloor() {
+        assertEquals(
+                Integer.valueOf(1),
+                FloorDisplayGate.resolveDisplayFloor(1, 2, 2)
+        );
+    }
+
+    @Test
     public void untrustedVenueLabelNeverShowsGroundFloorToUser() {
         assertNull(FloorDisplayGate.resolveTrustedFloorForVenueLabel(false, 0));
     }
@@ -57,6 +71,59 @@ public class TrajectoryMapFragmentFloorDisplayTest {
         assertEquals(
                 Integer.valueOf(2),
                 FloorDisplayGate.resolveTrustedFloorForVenueLabel(true, 2)
+        );
+    }
+
+    @Test
+    public void autoFloorStateRestoresAcrossNonUserRefresh() {
+        assertEquals(
+                true,
+                MapUiStateResolver.resolveRestoredAutoFloorState(Boolean.TRUE, false)
+        );
+        assertEquals(
+                false,
+                MapUiStateResolver.resolveRestoredAutoFloorState(Boolean.FALSE, true)
+        );
+        assertEquals(
+                true,
+                MapUiStateResolver.resolveRestoredAutoFloorState(null, true)
+        );
+    }
+
+    @Test
+    public void freshRecordingEntryDoesNotAutoUnboxNullAutoFloorState() {
+        assertNull(
+                MapUiStateResolver.resolveSavedOrRememberedAutoFloorState(null, false, false)
+        );
+    }
+
+    @Test
+    public void initializedAutoFloorStateIsReusedWithoutSavedBundle() {
+        assertEquals(
+                Boolean.TRUE,
+                MapUiStateResolver.resolveSavedOrRememberedAutoFloorState(null, true, true)
+        );
+        assertEquals(
+                Boolean.FALSE,
+                MapUiStateResolver.resolveSavedOrRememberedAutoFloorState(null, true, false)
+        );
+    }
+
+    @Test
+    public void savedBundleAutoFloorStateOverridesTransientState() {
+        assertEquals(
+                Boolean.FALSE,
+                MapUiStateResolver.resolveSavedOrRememberedAutoFloorState(Boolean.FALSE, true, true)
+        );
+    }
+
+    @Test
+    public void rememberedAutoFloorStateSurvivesViewRecreationWithoutBundle() {
+        MapUiStateResolver.rememberAutoFloorState(true);
+
+        assertEquals(
+                Boolean.TRUE,
+                MapUiStateResolver.resolveSavedOrRememberedAutoFloorState(null, false, false)
         );
     }
 }

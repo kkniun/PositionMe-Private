@@ -14,6 +14,7 @@ public class SensorFusionTrustedFloorGuardTest {
 
     @After
     public void tearDown() throws Exception {
+        sensorFusion.resetAbsoluteAnchorStateForTesting();
         setField("pdrFloorOffset", 0);
         setField("isFloorOffsetInitialized", false);
         setField("latestFusedPose", null);

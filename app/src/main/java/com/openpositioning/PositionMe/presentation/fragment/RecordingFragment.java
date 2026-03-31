@@ -38,6 +38,7 @@ import com.openpositioning.PositionMe.sensors.FusedPose;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.sensors.SensorTypes;
 import com.openpositioning.PositionMe.utils.IndoorMapManager;
+import com.openpositioning.PositionMe.utils.LiveMotionGate;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
 import com.google.android.gms.maps.model.LatLng;
 
@@ -118,11 +119,38 @@ public class RecordingFragment extends Fragment {
     private long lastObservedHeadingSampleTimestampMs = Long.MIN_VALUE;
     private String lastUiPoseDiagnosticState = "";
 
-    static int resolveMapUpdateFloor(
+    @Nullable
+    static Integer resolveMapUpdateFloor(
             @Nullable Integer preferredDisplayFloor,
             @NonNull FusedPose fusedPose
     ) {
-        return preferredDisplayFloor != null ? preferredDisplayFloor : fusedPose.getFloor();
+        if (preferredDisplayFloor != null) {
+            return preferredDisplayFloor;
+        }
+        return fusedPose.getFloor();
+    }
+
+    static int resolveMapUpdateFloor(@NonNull FusedPose fusedPose) {
+        Integer resolvedFloor = resolveMapUpdateFloor(null, fusedPose);
+        return resolvedFloor == null ? fusedPose.getFloor() : resolvedFloor;
+    }
+
+    static boolean shouldAccumulateTrackedDistance(
+            boolean hasFreshFusedPose,
+            double fusedDisplacementMeters,
+            boolean motionResumeActive,
+            @NonNull String poseAdvanceSource,
+            long poseTimestampMs,
+            long lastAcceptedStepTimestampMs
+    ) {
+        return LiveMotionGate.shouldAccumulateTrackedDistance(
+                hasFreshFusedPose,
+                fusedDisplacementMeters,
+                motionResumeActive,
+                poseAdvanceSource,
+                poseTimestampMs,
+                lastAcceptedStepTimestampMs
+        );
     }
 
     // Distance tracking
@@ -388,11 +416,16 @@ public class RecordingFragment extends Fragment {
                 fusedPose.getX() - previousLocalX,
                 fusedPose.getY() - previousLocalY
         );
-        boolean shouldSuppressDistanceIncrement = sensorFusion.isStationary()
-                && fusedDisplacementMeters < MapPointerDisplayFilter.STATIONARY_VISUAL_POSITION_DEADBAND_M;
 
         // Distance
-        if (hasFreshFusedPose && !shouldSuppressDistanceIncrement) {
+        if (shouldAccumulateTrackedDistance(
+                hasFreshFusedPose,
+                fusedDisplacementMeters,
+                motionDebug.motionResumeActive,
+                motionDebug.lastPoseAdvanceSource,
+                fusedPose.getTimestampMs(),
+                motionDebug.lastAcceptedStepTimestampMs
+        )) {
             distance += fusedDisplacementMeters;
         }
         distanceTravelled.setText(getString(R.string.travelled_distance_value, String.format("%.2f", distance)));
@@ -447,7 +480,7 @@ public class RecordingFragment extends Fragment {
                     trajectoryMapFragment.updateUserLocation(
                             newLocation,
                             orientationDeg,
-                            resolveMapUpdateFloor(Integer.valueOf(bestKnownFloor), fusedPose),
+                            resolveMapUpdateFloor(trustedFloor, fusedPose),
                             fusedPose.getTimestampMs()
                     );
                 } else if (hasFreshHeading) {

@@ -25,10 +25,13 @@ public class SensorFusionInitialFloorBootstrapTest {
     @After
     public void tearDown() throws Exception {
         MapConstraintRepository.clear();
+        sensorFusion.resetAbsoluteAnchorStateForTesting();
         setField("pendingWifiBootstrapFloor", null);
         setField("pendingWifiBootstrapCount", 0);
         setField("pendingWifiBootstrapFirstTimestampMs", Long.MIN_VALUE);
         setField("lastWifiBootstrapCandidateTimestampMs", Long.MIN_VALUE);
+        setField("lastFloorCalibrationInvalidatedTimestampMs", Long.MIN_VALUE);
+        setField("lastFloorCalibrationInvalidationReason", "none");
         setField("pendingStableAbsoluteFloorCandidate", null);
         setField("pendingStableAbsoluteFloorCount", 0);
         setField("pendingStableAbsoluteFloorFirstTimestampMs", Long.MIN_VALUE);
@@ -80,6 +83,21 @@ public class SensorFusionInitialFloorBootstrapTest {
     @Test
     public void highConfidenceWifiFixStillRequiresBootstrapConsensus() {
         assertFalse(SensorFusion.shouldForceWifiFloorBootstrap("WIFI", 1, true, false, 1, 4.5f));
+    }
+
+    @Test
+    public void recentFloorInvalidationFastTracksHighConfidenceWifiBootstrap() throws Exception {
+        MapConstraintRepository.replaceVenueConstraints("venue", Collections.emptyList());
+        MapConstraintRepository.setConstraintsForFloor(2, "2", Collections.emptyList(), null);
+        setField("lastFloorCalibrationInvalidatedTimestampMs", 1_000L);
+        setField("lastFloorCalibrationInvalidationReason", "venue_switch");
+
+        assertEquals(Integer.valueOf(2), invokeResolveBootstrapReadyFloorPrior(2, 5.0f, 2_000L));
+        assertEquals(2, getField("pendingWifiBootstrapFloor"));
+        assertEquals(
+                SensorFusion.resolveWifiBootstrapRequiredConfirmations(2),
+                getField("pendingWifiBootstrapCount")
+        );
     }
 
     @Test
@@ -218,6 +236,21 @@ public class SensorFusionInitialFloorBootstrapTest {
 
         assertNull(invokeResolveAcceptedAbsoluteFloorPrior(1, 6_000L));
         assertEquals("initial_lock_pending", getField("lastFloorConsensus"));
+    }
+
+    @Test
+    public void recentFloorInvalidationFastTracksInitialLockWhenSeedMatchesReportedFloor() throws Exception {
+        MapConstraintRepository.replaceVenueConstraints("venue", Collections.emptyList());
+        MapConstraintRepository.setConstraintsForFloor(0, "0", Collections.emptyList(), null);
+        MapConstraintRepository.setConstraintsForFloor(2, "2", Collections.emptyList(), null);
+        MapConstraintRepository.setActiveFloor(2);
+        setField("pfInitialized", true);
+        setField("isFloorOffsetInitialized", false);
+        setField("lastFloorCalibrationInvalidatedTimestampMs", 1_000L);
+        setField("lastFloorCalibrationInvalidationReason", "venue_switch");
+
+        assertEquals(Integer.valueOf(2), invokeResolveAcceptedAbsoluteFloorPrior(2, 2_000L));
+        assertEquals("initial_lock_acquired", getField("lastFloorConsensus"));
     }
 
     @Test

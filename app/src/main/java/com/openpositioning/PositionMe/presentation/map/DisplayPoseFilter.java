@@ -85,34 +85,34 @@ public final class DisplayPoseFilter {
     @NonNull
     public static Config defaultMarkerConfig() {
         return new Config(
-                0.45,
-                2.2,
+                0.20,
+                1.1,
                 6.0,
                 0.14,
                 0.30,
-                0.34,
-                0.82,
-                1.5f,
+                0.56,
+                0.92,
+                1.0f,
                 0.28f,
-                0.42f,
-                24.0f
+                0.58f,
+                18.0f
         );
     }
 
     @NonNull
     public static Config defaultTrajectoryConfig() {
         return new Config(
-                0.30,
-                1.6,
+                0.22,
+                1.2,
                 6.0,
                 0.12,
                 0.24,
-                0.24,
-                0.56,
-                4.0f,
+                0.34,
+                0.68,
+                3.0f,
                 0.18f,
-                0.35f,
-                50.0f
+                0.44f,
+                40.0f
         );
     }
 

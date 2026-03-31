@@ -4,6 +4,7 @@ import com.openpositioning.PositionMe.utils.PdrProcessing;
 
 import org.junit.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
@@ -325,7 +326,7 @@ public class ParticleFilterEngineUpdateTest {
     }
 
     @Test
-    public void reanchorDoesNotSeedIllegalParticlesWhenNoMotionValidSamplesExist() {
+    public void endpointLockedRecoveryUsesExactLegalFixWithoutSeedingIllegalParticles() {
         ParticleInitializer.SpawnValidator validator = new ParticleInitializer.SpawnValidator() {
             @Override
             public boolean isValid(double x, double y, int floor) {
@@ -367,9 +368,104 @@ public class ParticleFilterEngineUpdateTest {
 
         engine.updateWithAbsoluteFix(0.0, 0.0, 0, 1100L, 1.0);
 
-        assertFalse(engine.wasLastAbsoluteFixReanchored());
-        assertTrue(engine.wasLastAbsoluteFixRejectedByConstraints());
-        assertParticlesStayAtX(engine.snapshotParticlesForTesting(), -20.0);
+        assertTrue(engine.wasLastAbsoluteFixReanchored());
+        assertFalse(engine.wasLastAbsoluteFixRejectedByConstraints());
+        assertParticlesStayAtX(engine.snapshotParticlesForTesting(), 0.0);
+    }
+
+    @Test
+    public void repeatedWallRejectsMarkCloudTrappedAndRecoveryHintInjectsRescueParticles() {
+        ParticleInitializer.SpawnValidator validator = new ParticleInitializer.SpawnValidator() {
+            @Override
+            public boolean isValid(double x, double y, int floor) {
+                return true;
+            }
+
+            @Override
+            public boolean isValidMotion(
+                    double previousX,
+                    double previousY,
+                    double predictedX,
+                    double predictedY,
+                    int previousFloor,
+                    int predictedFloor
+            ) {
+                double distanceMeters = Math.hypot(predictedX - previousX, predictedY - previousY);
+                if (previousX < 10.0) {
+                    return distanceMeters < 0.1;
+                }
+                if (previousX >= 40.0) {
+                    return distanceMeters <= 5.0;
+                }
+                return false;
+            }
+        };
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                validator,
+                new ZeroRandom()
+        );
+        List<Particle> trappedParticles = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            trappedParticles.add(new Particle(0.0, 0.0, 0, 0.1, 0.0));
+        }
+        engine.setParticlesForTesting(trappedParticles, 1_000L);
+
+        for (int i = 0; i < 5; i++) {
+            engine.predict(new PdrDelta(1.0f, 0.0f, 0.0f), 0, 1_100L + i);
+        }
+
+        assertTrue(engine.isCloudTrapped());
+        assertTrue(engine.getLastPredictWallRejectRatio() > 0.85);
+
+        engine.updateWithAbsoluteFix(50.0, 0.0, Integer.valueOf(0), 2_000L, 4.5, true);
+
+        assertTrue(engine.wasLastAbsoluteFixCloudRecovered());
+        assertFalse(engine.wasLastAbsoluteFixRejectedByConstraints());
+        FusedPose pose = engine.estimatePose();
+        assertTrue(pose.getX() >= 49.0);
+        assertEquals(0, pose.getFloor());
+    }
+
+    @Test
+    public void trappedCloudWithoutAbsoluteFixesUsesBlindBreakoutToResumePdr() {
+        ParticleInitializer.SpawnValidator validator = new ParticleInitializer.SpawnValidator() {
+            @Override
+            public boolean isValid(double x, double y, int floor) {
+                return true;
+            }
+
+            @Override
+            public boolean isValidMotion(
+                    double previousX,
+                    double previousY,
+                    double predictedX,
+                    double predictedY,
+                    int previousFloor,
+                    int predictedFloor
+            ) {
+                return previousX >= 2.5 || predictedX <= previousX;
+            }
+        };
+        ParticleFilterEngine engine = new ParticleFilterEngine(
+                new ParticleInitializer(new ZeroRandom()),
+                validator,
+                new ZeroRandom()
+        );
+        engine.setParticlesForTesting(Arrays.asList(
+                new Particle(0.0, 0.0, 0, 0.5, Math.PI / 2.0),
+                new Particle(0.0, 0.0, 0, 0.5, Math.PI / 2.0)
+        ), 1_000L);
+
+        for (int i = 0; i < 16; i++) {
+            engine.predict(new PdrDelta(1.0f, 0.0f, 0.0f), 0, 1_100L + i);
+        }
+
+        FusedPose pose = engine.estimatePose();
+        assertTrue(pose.getX() >= 4.0);
+        assertEquals(0.0, pose.getY(), 1e-6);
+        assertFalse(engine.isCloudTrapped());
+        assertTrue(engine.getLastPredictWallRejectRatio() < 0.85);
     }
 
     private ParticleFilterEngine createDeterministicEngine() {

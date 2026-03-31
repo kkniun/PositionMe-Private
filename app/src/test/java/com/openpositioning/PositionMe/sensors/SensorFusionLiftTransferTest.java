@@ -28,6 +28,7 @@ public class SensorFusionLiftTransferTest {
     @After
     public void tearDown() throws Exception {
         MapConstraintRepository.clear();
+        sensorFusion.resetAbsoluteAnchorStateForTesting();
         invokeResetElevatorState();
         getTracker().reset();
         setField("coordinateConverter", null);
@@ -108,7 +109,7 @@ public class SensorFusionLiftTransferTest {
 
         FusedPose fusedPose = getLatestFusedPose();
         assertEquals(2, sensorFusion.getCurrentFloor());
-        assertEquals(1, sensorFusion.getUserVisibleFloor());
+        assertEquals(2, sensorFusion.getUserVisibleFloor());
         assertEquals(11.0, fusedPose.getX(), 1e-6);
         assertEquals(11.0, fusedPose.getY(), 1e-6);
         assertEquals("reseeded_destination_lift", getStringField("lastLiftTransferState"));
