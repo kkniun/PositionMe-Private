@@ -31,7 +31,7 @@ public class ParticleFilterEngine {
     private static final int MAX_TAIL_SIZE = 5;
     private static final int MAX_HISTORY_SIZE = 600;
     private static final long MIN_HISTORY_INTERVAL_MS = 1_000L;
-    private static final double MIN_HISTORY_DISTANCE_METERS = 0.6;
+    private static final double MIN_HISTORY_DISTANCE_METERS = 0.85;
     private static final double MAX_STEP_METERS = 2.5;
     private static final double MIN_INIT_CONFIDENCE = 0.40;
     private static final double RESAMPLE_THRESHOLD_RATIO = 0.48;
@@ -628,14 +628,9 @@ public class ParticleFilterEngine {
 
         LatLng lastPoint = fusedHistory.peekLast();
         boolean shouldAppend = lastPoint == null
-                || timestampMillis - lastHistoryTimestamp >= MIN_HISTORY_INTERVAL_MS
                 || UtilFunctions.distanceBetweenPoints(lastPoint, point) >= MIN_HISTORY_DISTANCE_METERS;
 
         if (!shouldAppend) {
-            if (!fusedHistory.isEmpty()) {
-                fusedHistory.removeLast();
-                fusedHistory.addLast(point);
-            }
             return;
         }
 

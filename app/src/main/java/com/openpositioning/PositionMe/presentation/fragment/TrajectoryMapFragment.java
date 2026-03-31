@@ -82,9 +82,6 @@ public class TrajectoryMapFragment extends Fragment {
     private Polyline polyline; // Polyline representing user's movement path
     private boolean isGnssOn = true; // GNSS display stays enabled during recording
 
-    private Polyline gnssPolyline; // Polyline for GNSS path
-    private LatLng lastGnssLocation = null; // Stores the last GNSS location
-
     private LatLng pendingCameraPosition = null; // Stores pending camera movement
     private boolean hasPendingCameraMove = false; // Tracks if camera needs to move
 
@@ -219,8 +216,7 @@ public class TrajectoryMapFragment extends Fragment {
      * Initialize the map settings with the provided GoogleMap instance.
      * <p>
      *     The method sets basic map settings, initializes the indoor map manager,
-     *     and creates an empty polyline for user movement tracking.
-     *     The method also initializes the GNSS polyline for tracking GNSS path.
+     *     and creates an empty polyline for fused movement tracking.
      *     The method sets the map type to Hybrid and initializes the map with these settings.
      *
      * @param map
@@ -240,13 +236,6 @@ public class TrajectoryMapFragment extends Fragment {
         // Initialize an empty polyline
         polyline = map.addPolyline(new PolylineOptions()
                 .color(Color.RED)
-                .width(5f)
-                .add() // start empty
-        );
-
-        // GNSS path in blue
-        gnssPolyline = map.addPolyline(new PolylineOptions()
-                .color(Color.BLUE)
                 .width(5f)
                 .add() // start empty
         );
@@ -340,10 +329,7 @@ public class TrajectoryMapFragment extends Fragment {
         // Update indoor map overlay
         if (indoorMapManager != null) {
             indoorMapManager.setCurrentLocation(newLocation);
-            if (sensorFusion != null && sensorFusion.isIndoorContextActive()) {
-                indoorMapManager.setCurrentFloor(sensorFusion.getCurrentLogicalFloor(), true);
-                updateFloorLabel();
-            }
+            syncDisplayedFloor();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
         }
         return newLocation;
@@ -400,37 +386,12 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
 
-    /**
-     * Called when we want to set or update the GNSS marker position
-     */
     public void updateGNSS(@NonNull LatLng gnssLocation) {
-        if (gMap == null) return;
-        if (!isGnssOn) return;
-
-        if (lastGnssLocation == null) {
-            List<LatLng> gnssPoints = new ArrayList<>(gnssPolyline.getPoints());
-            gnssPoints.add(gnssLocation);
-            gnssPolyline.setPoints(gnssPoints);
-            lastGnssLocation = gnssLocation;
-        } else {
-            if (lastGnssLocation != null && !lastGnssLocation.equals(gnssLocation)) {
-                List<LatLng> gnssPoints = new ArrayList<>(gnssPolyline.getPoints());
-                gnssPoints.add(gnssLocation);
-                gnssPolyline.setPoints(gnssPoints);
-            }
-            lastGnssLocation = gnssLocation;
-        }
+        // GNSS is rendered as recent observation dots only.
     }
 
-
-    /**
-     * Remove GNSS marker if user toggles it off
-     */
     public void clearGNSS() {
-        if (gnssPolyline != null) {
-            gnssPolyline.setPoints(Collections.emptyList());
-        }
-        lastGnssLocation = null;
+        // GNSS is rendered as recent observation dots only.
     }
 
     /**
@@ -527,12 +488,12 @@ public class TrajectoryMapFragment extends Fragment {
         if (floorLabel == null) {
             return;
         }
-        if (sensorFusion != null && sensorFusion.isIndoorContextActive()) {
-            floorLabel.setText(sensorFusion.getCurrentFloorDisplayName());
+        if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
+            floorLabel.setText(indoorMapManager.getCurrentFloorDisplayName());
             return;
         }
-        if (indoorMapManager != null) {
-            floorLabel.setText(indoorMapManager.getCurrentFloorDisplayName());
+        if (sensorFusion != null && sensorFusion.isIndoorContextActive()) {
+            floorLabel.setText(sensorFusion.getCurrentFloorDisplayName());
         }
     }
 
@@ -542,15 +503,10 @@ public class TrajectoryMapFragment extends Fragment {
             polyline.remove();
             polyline = null;
         }
-        if (gnssPolyline != null) {
-            gnssPolyline.remove();
-            gnssPolyline = null;
-        }
         if (directionMarker != null) {
             directionMarker.remove();
             directionMarker = null;
         }
-        lastGnssLocation = null;
         currentLocation  = null;
         lastDirectionDegrees = 0f;
         lastCameraLocation = null;
@@ -574,10 +530,6 @@ public class TrajectoryMapFragment extends Fragment {
         if (gMap != null) {
             polyline = gMap.addPolyline(new PolylineOptions()
                     .color(Color.RED)
-                    .width(5f)
-                    .add());
-            gnssPolyline = gMap.addPolyline(new PolylineOptions()
-                    .color(Color.BLUE)
                     .width(5f)
                     .add());
         }
@@ -645,7 +597,7 @@ public class TrajectoryMapFragment extends Fragment {
         if (sensorFusion == null || indoorMapManager == null) return;
         if (!indoorMapManager.getIsIndoorMapSet()) return;
 
-        int resolvedFloor = sensorFusion.getCurrentLogicalFloor();
+        int resolvedFloor = sensorFusion.getPreferredDisplayLogicalFloor();
         indoorMapManager.setCurrentFloor(resolvedFloor, true);
         updateFloorLabel();
     }
@@ -677,7 +629,9 @@ public class TrajectoryMapFragment extends Fragment {
         if (resolvedFloor != null) {
             indoorMapManager.setCurrentFloor(resolvedFloor, true);
             updateFloorLabel();
+            return;
         }
+        syncDisplayedFloor();
     }
 
     //endregion
@@ -704,6 +658,18 @@ public class TrajectoryMapFragment extends Fragment {
                     .fillColor(fillColor)
                     .zIndex(3f)));
         }
+    }
+
+    private void syncDisplayedFloor() {
+        if (sensorFusion == null || indoorMapManager == null) {
+            return;
+        }
+        if (!indoorMapManager.getIsIndoorMapSet()) {
+            return;
+        }
+        int preferredFloor = sensorFusion.getPreferredDisplayLogicalFloor();
+        indoorMapManager.setCurrentFloor(preferredFloor, true);
+        updateFloorLabel();
     }
 
     private void clearCircles(List<Circle> circles) {

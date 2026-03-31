@@ -79,6 +79,7 @@ public class SensorFusion implements SensorEventListener {
     private MovementSensor magnetometerSensor;
     private MovementSensor stepDetectionSensor;
     private MovementSensor rotationSensor;
+    private MovementSensor gameRotationSensor;
     private MovementSensor gravitySensor;
     private MovementSensor linearAccelerationSensor;
 
@@ -148,6 +149,7 @@ public class SensorFusion implements SensorEventListener {
         this.magnetometerSensor = new MovementSensor(context, Sensor.TYPE_MAGNETIC_FIELD);
         this.stepDetectionSensor = new MovementSensor(context, Sensor.TYPE_STEP_DETECTOR);
         this.rotationSensor = new MovementSensor(context, Sensor.TYPE_ROTATION_VECTOR);
+        this.gameRotationSensor = new MovementSensor(context, Sensor.TYPE_GAME_ROTATION_VECTOR);
         this.gravitySensor = new MovementSensor(context, Sensor.TYPE_GRAVITY);
         this.linearAccelerationSensor = new MovementSensor(context, Sensor.TYPE_LINEAR_ACCELERATION);
 
@@ -176,6 +178,12 @@ public class SensorFusion implements SensorEventListener {
                 new WifiPositionManager.PositionUpdateListener() {
                     @Override
                     public void onWifiPositionUpdate(LatLng wifiLocation, int floor) {
+                        if (eventHandler != null) {
+                            eventHandler.updateHeadingCalibrationFromWifi(
+                                    wifiLocation,
+                                    System.currentTimeMillis()
+                            );
+                        }
                         if (particleFilterEngine != null) {
                             particleFilterEngine.onWifiObservation(
                                     wifiLocation,
@@ -270,6 +278,10 @@ public class SensorFusion implements SensorEventListener {
                 stepDetectionSensor.sensor, SensorManager.SENSOR_DELAY_NORMAL);
         rotationSensor.sensorManager.registerListener(this,
                 rotationSensor.sensor, (int) 1e6);
+        if (gameRotationSensor != null && gameRotationSensor.sensor != null) {
+            gameRotationSensor.sensorManager.registerListener(this,
+                    gameRotationSensor.sensor, (int) 1e6);
+        }
         // Foreground service owns WiFi/BLE scanning during recording.
         if (!recorder.isRecording()) {
             startWirelessCollectors();
@@ -292,6 +304,9 @@ public class SensorFusion implements SensorEventListener {
             magnetometerSensor.sensorManager.unregisterListener(this);
             stepDetectionSensor.sensorManager.unregisterListener(this);
             rotationSensor.sensorManager.unregisterListener(this);
+            if (gameRotationSensor != null && gameRotationSensor.sensorManager != null) {
+                gameRotationSensor.sensorManager.unregisterListener(this);
+            }
             linearAccelerationSensor.sensorManager.unregisterListener(this);
             gravitySensor.sensorManager.unregisterListener(this);
             stopWirelessCollectors();
@@ -572,6 +587,22 @@ public class SensorFusion implements SensorEventListener {
 
     public String getCurrentFloorDisplayName() {
         return particleFilterEngine == null ? "0" : particleFilterEngine.getCurrentFloorDisplayName();
+    }
+
+    public int getPreferredDisplayLogicalFloor() {
+        int fusedFloor = getCurrentLogicalFloor();
+        if (getLatLngWifiPositioning() == null) {
+            return fusedFloor;
+        }
+
+        int wifiFloor = getWifiFloor();
+        if (!isIndoorContextActive()) {
+            return wifiFloor;
+        }
+        if (fusedFloor == 0 && wifiFloor != 0) {
+            return wifiFloor;
+        }
+        return fusedFloor;
     }
 
     public boolean isNearIndoorFeature(LatLng position, String indoorType, double radiusMeters) {
@@ -874,6 +905,9 @@ public class SensorFusion implements SensorEventListener {
             state.latitude = (float) location.getLatitude();
             state.longitude = (float) location.getLongitude();
             recorder.addGnssData(location);
+            if (eventHandler != null) {
+                eventHandler.updateHeadingCalibrationFromGnss(location);
+            }
             if (particleFilterEngine != null) {
                 particleFilterEngine.onGnssObservation(location, state.orientation[0]);
             }
