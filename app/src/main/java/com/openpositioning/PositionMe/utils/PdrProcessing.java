@@ -29,6 +29,9 @@ public class PdrProcessing {
     //region Static variables
     // Weiberg algorithm coefficient for stride calculations
     private static final float K = 0.364f;
+    private static final float MIN_STEP_LENGTH_METERS = 0.35f;
+    private static final float MAX_STEP_LENGTH_METERS = 0.95f;
+    private static final float STEP_LENGTH_BLEND = 0.35f;
     // Number of samples (seconds) to keep as memory for elevation calculation
     private static final int elevationSeconds = 4;
     // Number of samples (0.01 seconds)
@@ -158,7 +161,13 @@ public class PdrProcessing {
         if(!useManualStep) {
             //ArrayList<Double> accelMagnitudeFiltered = filter(accelMagnitudeOvertime);
             // Estimate stride
-            this.stepLength = weibergMinMax(accelMagnitudeOvertime);
+            float estimatedStepLength = clampStepLength(weibergMinMax(accelMagnitudeOvertime));
+            if (this.stepLength <= 0f) {
+                this.stepLength = estimatedStepLength;
+            } else {
+                this.stepLength = STEP_LENGTH_BLEND * estimatedStepLength
+                        + (1f - STEP_LENGTH_BLEND) * this.stepLength;
+            }
             // System.err.println("Step Length" + stepLength);
         }
 
@@ -259,6 +268,10 @@ public class PdrProcessing {
         }
 
         return bounce * K * 2;
+    }
+
+    private float clampStepLength(float stepLengthMeters) {
+        return Math.max(MIN_STEP_LENGTH_METERS, Math.min(MAX_STEP_LENGTH_METERS, stepLengthMeters));
     }
 
     /**

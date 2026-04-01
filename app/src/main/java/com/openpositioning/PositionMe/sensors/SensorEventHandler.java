@@ -34,6 +34,7 @@ public class SensorEventHandler {
     private static final float STABILIZED_HEADING_BLEND = 0.35f;
     private static final float OFFSET_BLEND_GNSS = 0.22f;
     private static final float OFFSET_BLEND_WIFI = 0.12f;
+    private static final long MIN_STEP_INTERVAL_MS = 280L;
     private static final float MAGNETIC_SPIKE_REJECTION_RAD = (float) Math.toRadians(35.0);
     private static final float GYRO_TURN_CONFIRM_RAD_PER_SEC = 0.55f;
     private static final double CALIBRATION_MIN_DISTANCE_METERS = 1.6;
@@ -183,7 +184,7 @@ public class SensorEventHandler {
             case Sensor.TYPE_STEP_DETECTOR:
                 long stepTime = SystemClock.uptimeMillis() - bootTime;
 
-                if (currentTime - lastStepTime < 20) {
+                if (currentTime - lastStepTime < MIN_STEP_INTERVAL_MS) {
                     Log.e("SensorFusion", "Ignoring step event, too soon after last step event:"
                             + (currentTime - lastStepTime) + " ms");
                     break;
