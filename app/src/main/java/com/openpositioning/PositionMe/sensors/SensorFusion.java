@@ -779,6 +779,37 @@ public class SensorFusion implements SensorEventListener {
     }
 
     /**
+     * 地图显示专用朝向：以稳定传感器朝向为主，粒子滤波朝向为辅，避免箭头与融合轨迹脱节。
+     */
+    public float getMapHeadingRad() {
+        float sensorHeading = passOrientation();
+        if (Float.isNaN(sensorHeading) || particleFilterEngine == null) {
+            return sensorHeading;
+        }
+
+        double particleHeading = particleFilterEngine.getWeightedMeanHeadingRad();
+        if (Double.isNaN(particleHeading)) {
+            return sensorHeading;
+        }
+
+        final double sensorWeight = 0.62d;
+        final double particleWeight = 0.38d;
+        double x = sensorWeight * Math.sin(sensorHeading) + particleWeight * Math.sin(particleHeading);
+        double y = sensorWeight * Math.cos(sensorHeading) + particleWeight * Math.cos(particleHeading);
+        return normalizeHeadingRad((float) Math.atan2(x, y));
+    }
+
+    private float normalizeHeadingRad(float headingRad) {
+        float normalized = headingRad % ((float) (2d * Math.PI));
+        if (normalized > Math.PI) {
+            normalized -= (float) (2d * Math.PI);
+        } else if (normalized < -Math.PI) {
+            normalized += (float) (2d * Math.PI);
+        }
+        return normalized;
+    }
+
+    /**
      * Return most recent sensor readings.
      *
      * @return Map of {@link SensorTypes} to float array of most recent values.

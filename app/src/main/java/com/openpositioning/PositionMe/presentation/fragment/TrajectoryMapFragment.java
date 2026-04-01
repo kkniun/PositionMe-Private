@@ -68,7 +68,13 @@ import java.util.Map;
 public class TrajectoryMapFragment extends Fragment {
 
     private static final float DIRECTION_MARKER_SIZE_DP = 18f;
-    private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
+    private static final double MIN_DIRECTION_DISTANCE_METERS = 0.20;
+    private static final double DISPLAY_SMOOTHING_ALPHA = 0.18;
+    private static final double MAX_DISPLAY_STEP_METERS = 1.0;
+    private static final double DISPLAY_SNAP_JUMP_METERS = 10.0;
+    private static final double HEADING_MOVEMENT_MIN_DISTANCE_METERS = 0.80;
+    private static final float HEADING_SENSOR_SMOOTH_ALPHA = 0.16f;
+    private static final float HEADING_COURSE_BLEND_ALPHA = 0.18f;
     private static final double CAMERA_RECENTER_DISTANCE_METERS = 4.0;
     private static final long CAMERA_RECENTER_INTERVAL_MS = 1_500L;
     private static final int MAX_TRACK_HISTORY_POINTS = 600;
@@ -76,8 +82,13 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double TRACK_REPLACE_DISTANCE_METERS = 0.03;
     private static final double MAX_TRACK_APPEND_DISTANCE_METERS = 6.0;
     private static final double TRACK_SEGMENT_INTERPOLATION_METERS = 3.0;
+    private static final double MAP_CORRECTION_MIN_METERS = 0.12;
+    private static final double MAP_CORRECTION_MAX_METERS = 12.0;
+    private static final double HISTORY_POINT_MATCH_TOLERANCE_METERS = 0.08;
     private GoogleMap gMap; // Google Maps instance
     private LatLng currentLocation; // Stores the user's current location
+    private LatLng currentRawLocation;
+    private LatLng smoothedDisplayLocation;
     private Marker directionMarker; // Current user direction arrow
     // Keep test point markers so they can be cleared when recording ends
     private final List<com.google.android.gms.maps.model.Marker> testPointMarkers = new ArrayList<>();
@@ -94,6 +105,8 @@ public class TrajectoryMapFragment extends Fragment {
     private IndoorMapManager indoorMapManager; // Manages indoor mapping
     private SensorFusion sensorFusion;
     private float lastDirectionDegrees = 0f;
+    private float filteredHeadingDegrees = Float.NaN;
+    private LatLng lastHeadingLocation;
     private LatLng lastCameraLocation;
     private long lastCameraUpdateMs;
     private final Map<Integer, List<LatLng>> userTrackHistoryByFloor = new HashMap<>();
@@ -301,26 +314,33 @@ public class TrajectoryMapFragment extends Fragment {
     public LatLng updateUserLocation(@NonNull LatLng newLocation, float orientation) {
         if (gMap == null) return newLocation;
 
-        LatLng oldLocation = this.currentLocation;
-        LatLng displayLocation = newLocation;
+        LatLng previousRawLocation = currentRawLocation != null ? currentRawLocation : currentLocation;
+        LatLng displaySourceLocation = newLocation;
         if (indoorMapManager != null) {
             indoorMapManager.setCurrentLocation(newLocation);
             syncDisplayedFloor();
             syncActiveTrackFloorWithDisplayedFloor();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
-            displayLocation = indoorMapManager.constrainPositionToLegalSpace(oldLocation, newLocation);
-            indoorMapManager.setCurrentLocation(displayLocation);
+            displaySourceLocation = indoorMapManager.constrainPositionToLegalSpace(
+                    previousRawLocation,
+                    newLocation
+            );
+            maybeApplyMapCorrection(newLocation, displaySourceLocation);
+            indoorMapManager.setCurrentLocation(displaySourceLocation);
         }
 
-        float resolvedDirection = resolveDisplayDirection(oldLocation, displayLocation, orientation);
-        boolean insignificantMove = oldLocation != null
-                && UtilFunctions.distanceBetweenPoints(oldLocation, displayLocation) < 0.18;
+        currentRawLocation = displaySourceLocation;
+        LatLng previousDisplayLocation = currentLocation;
+        LatLng displayLocation = resolveDisplayLocation(displaySourceLocation);
+        float resolvedDirection = resolveDisplayHeading(displayLocation, orientation);
+        boolean insignificantMove = previousDisplayLocation != null
+                && UtilFunctions.distanceBetweenPoints(previousDisplayLocation, displayLocation) < 0.18;
         boolean insignificantRotation = directionMarker != null
                 && absoluteBearingDelta(lastDirectionDegrees, resolvedDirection) < 2.5f;
         this.currentLocation = displayLocation;
 
         if (insignificantMove && insignificantRotation) {
-            updateTrackHistory(displayLocation);
+            updateTrackHistory(displaySourceLocation);
             return displayLocation;
         }
 
@@ -342,7 +362,7 @@ public class TrajectoryMapFragment extends Fragment {
             }
         }
 
-        updateTrackHistory(displayLocation);
+        updateTrackHistory(displaySourceLocation);
         return displayLocation;
     }
 
@@ -426,6 +446,24 @@ public class TrajectoryMapFragment extends Fragment {
             clearTrackHistory();
             return;
         }
+
+        List<LatLng> normalizedHistory = normalizeHistory(fusedHistory);
+        if (normalizedHistory.isEmpty()) {
+            clearTrackHistory();
+            return;
+        }
+
+        rebuildTrackHistory(normalizedHistory);
+        if (currentLocation == null) {
+            LatLng lastPoint = normalizedHistory.get(normalizedHistory.size() - 1);
+            currentRawLocation = lastPoint;
+            smoothedDisplayLocation = lastPoint;
+            currentLocation = lastPoint;
+        }
+        if (directionMarker != null && Float.isNaN(filteredHeadingDegrees)) {
+            updateDirectionFromHistory(normalizedHistory);
+        }
+        refreshDisplayedTrackPolyline();
     }
 
     public void renderObservationTails(@Nullable List<LatLng> gnssTrail,
@@ -478,7 +516,11 @@ public class TrajectoryMapFragment extends Fragment {
             directionMarker = null;
         }
         currentLocation  = null;
+        currentRawLocation = null;
+        smoothedDisplayLocation = null;
         lastDirectionDegrees = 0f;
+        filteredHeadingDegrees = Float.NaN;
+        lastHeadingLocation = null;
         lastCameraLocation = null;
         lastCameraUpdateMs = 0L;
         userTrackHistoryByFloor.clear();
@@ -643,6 +685,19 @@ public class TrajectoryMapFragment extends Fragment {
         updateFloorLabel();
     }
 
+    private void maybeApplyMapCorrection(@NonNull LatLng fusedLocation,
+                                         @NonNull LatLng constrainedLocation) {
+        if (sensorFusion == null) {
+            return;
+        }
+        double correctionMeters = UtilFunctions.distanceBetweenPoints(fusedLocation, constrainedLocation);
+        if (correctionMeters < MAP_CORRECTION_MIN_METERS || correctionMeters > MAP_CORRECTION_MAX_METERS) {
+            return;
+        }
+        // 将地图上的合法化修正回灌到融合状态，避免显示位置与滤波状态持续漂移。
+        sensorFusion.applyMapConstrainedPosition(constrainedLocation);
+    }
+
     private void clearCircles(List<Circle> circles) {
         for (Circle circle : circles) {
             circle.remove();
@@ -677,6 +732,12 @@ public class TrajectoryMapFragment extends Fragment {
             return;
         }
 
+        if (!Float.isNaN(filteredHeadingDegrees)) {
+            lastDirectionDegrees = normalizeDegrees(filteredHeadingDegrees);
+            directionMarker.setRotation(lastDirectionDegrees);
+            return;
+        }
+
         LatLng last = fusedHistory.get(fusedHistory.size() - 1);
         for (int i = fusedHistory.size() - 2; i >= 0; i--) {
             LatLng candidate = fusedHistory.get(i);
@@ -697,31 +758,91 @@ public class TrajectoryMapFragment extends Fragment {
         return Bitmap.createScaledBitmap(base, sizePx, sizePx, true);
     }
 
-    private float resolveDisplayDirection(@Nullable LatLng previousLocation,
-                                          @NonNull LatLng currentLocation,
-                                          float fallbackOrientationDegrees) {
-        if (previousLocation != null
-                && UtilFunctions.distanceBetweenPoints(previousLocation, currentLocation)
-                >= MIN_DIRECTION_DISTANCE_METERS) {
-            lastDirectionDegrees = computeHeadingDegrees(previousLocation, currentLocation);
+    private float resolveDisplayHeading(@NonNull LatLng currentDisplayLocation,
+                                          float sensorOrientationDegrees) {
+        if (isValidOrientation(sensorOrientationDegrees)) {
+            float normalizedSensorDegrees = normalizeDegrees(sensorOrientationDegrees);
+            if (Float.isNaN(filteredHeadingDegrees)) {
+                filteredHeadingDegrees = normalizedSensorDegrees;
+            } else {
+                filteredHeadingDegrees = blendDegrees(
+                        filteredHeadingDegrees,
+                        normalizedSensorDegrees,
+                        HEADING_SENSOR_SMOOTH_ALPHA
+                );
+            }
+        }
+
+        if (lastHeadingLocation != null) {
+            double movementMeters = UtilFunctions.distanceBetweenPoints(
+                    lastHeadingLocation,
+                    currentDisplayLocation
+            );
+            if (movementMeters >= HEADING_MOVEMENT_MIN_DISTANCE_METERS) {
+                float courseHeading = computeHeadingDegrees(lastHeadingLocation, currentDisplayLocation);
+                if (Float.isNaN(filteredHeadingDegrees)) {
+                    filteredHeadingDegrees = courseHeading;
+                } else {
+                    filteredHeadingDegrees = blendDegrees(
+                            filteredHeadingDegrees,
+                            courseHeading,
+                            HEADING_COURSE_BLEND_ALPHA
+                    );
+                }
+                lastHeadingLocation = currentDisplayLocation;
+            }
+        } else {
+            lastHeadingLocation = currentDisplayLocation;
+        }
+
+        if (Float.isNaN(filteredHeadingDegrees)) {
             return lastDirectionDegrees;
         }
 
-        if (!Float.isNaN(fallbackOrientationDegrees) && directionMarker == null) {
-            lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
-            return lastDirectionDegrees;
-        }
-
-        if (directionMarker != null) {
-            return lastDirectionDegrees;
-        }
-
-        if (!Float.isNaN(fallbackOrientationDegrees)) {
-            lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
-            return lastDirectionDegrees;
-        }
-
+        lastDirectionDegrees = normalizeDegrees(filteredHeadingDegrees);
         return lastDirectionDegrees;
+    }
+
+    private boolean isValidOrientation(float orientationDegrees) {
+        return !Float.isNaN(orientationDegrees) && !Float.isInfinite(orientationDegrees);
+    }
+
+    private LatLng resolveDisplayLocation(@NonNull LatLng rawLocation) {
+        if (smoothedDisplayLocation == null) {
+            smoothedDisplayLocation = rawLocation;
+            return rawLocation;
+        }
+
+        double distanceMeters = UtilFunctions.distanceBetweenPoints(smoothedDisplayLocation, rawLocation);
+        if (distanceMeters >= DISPLAY_SNAP_JUMP_METERS) {
+            smoothedDisplayLocation = rawLocation;
+            return rawLocation;
+        }
+
+        double alpha = DISPLAY_SMOOTHING_ALPHA;
+        if (distanceMeters > MAX_DISPLAY_STEP_METERS && distanceMeters > 1e-6) {
+            alpha = Math.min(alpha, MAX_DISPLAY_STEP_METERS / distanceMeters);
+        }
+
+        smoothedDisplayLocation = new LatLng(
+                smoothedDisplayLocation.latitude
+                        + (rawLocation.latitude - smoothedDisplayLocation.latitude) * alpha,
+                smoothedDisplayLocation.longitude
+                        + (rawLocation.longitude - smoothedDisplayLocation.longitude) * alpha
+        );
+        return smoothedDisplayLocation;
+    }
+
+    private float blendDegrees(float fromDegrees, float toDegrees, float alpha) {
+        float from = normalizeDegrees(fromDegrees);
+        float to = normalizeDegrees(toDegrees);
+        float delta = to - from;
+        if (delta > 180f) {
+            delta -= 360f;
+        } else if (delta < -180f) {
+            delta += 360f;
+        }
+        return normalizeDegrees(from + alpha * delta);
     }
 
     private float computeHeadingDegrees(@NonNull LatLng from, @NonNull LatLng to) {
@@ -793,6 +914,57 @@ public class TrajectoryMapFragment extends Fragment {
         while (userTrackHistory.size() > MAX_TRACK_HISTORY_POINTS) {
             userTrackHistory.remove(0);
         }
+    }
+
+    private void rebuildTrackHistory(@NonNull List<LatLng> fusedHistory) {
+        int historyFloor = resolveHistoryFloor();
+        List<LatLng> existingHistory = userTrackHistoryByFloor.get(historyFloor);
+        if (userTrackHistoryByFloor.size() == 1
+                && activeTrackFloor == historyFloor
+                && historiesMatch(existingHistory, fusedHistory)) {
+            return;
+        }
+
+        userTrackHistoryByFloor.clear();
+        userTrackHistoryByFloor.put(historyFloor, new ArrayList<>(fusedHistory));
+        activeTrackFloor = historyFloor;
+    }
+
+    private int resolveHistoryFloor() {
+        if (indoorMapManager != null && indoorMapManager.getIsIndoorMapSet()) {
+            return indoorMapManager.getCurrentLogicalFloor();
+        }
+        if (sensorFusion != null && sensorFusion.isIndoorContextActive()) {
+            return sensorFusion.getCurrentLogicalFloor();
+        }
+        return 0;
+    }
+
+    private boolean historiesMatch(@Nullable List<LatLng> first,
+                                   @NonNull List<LatLng> second) {
+        if (first == null || first.size() != second.size()) {
+            return false;
+        }
+        for (int i = 0; i < second.size(); i++) {
+            if (UtilFunctions.distanceBetweenPoints(first.get(i), second.get(i))
+                    > HISTORY_POINT_MATCH_TOLERANCE_METERS) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @NonNull
+    private List<LatLng> normalizeHistory(@NonNull List<LatLng> fusedHistory) {
+        int startIndex = Math.max(0, fusedHistory.size() - MAX_TRACK_HISTORY_POINTS);
+        ArrayList<LatLng> normalized = new ArrayList<>(fusedHistory.size() - startIndex);
+        for (int i = startIndex; i < fusedHistory.size(); i++) {
+            LatLng point = fusedHistory.get(i);
+            if (point != null) {
+                normalized.add(point);
+            }
+        }
+        return normalized;
     }
 
     private void clearTrackHistory() {

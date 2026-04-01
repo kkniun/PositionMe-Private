@@ -33,7 +33,6 @@ import com.openpositioning.PositionMe.presentation.fragment.SettingsFragment;
 import com.openpositioning.PositionMe.sensors.Observer;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
 import com.openpositioning.PositionMe.service.SensorCollectionService;
-import com.openpositioning.PositionMe.utils.PermissionManager;
 
 
 import java.util.Objects;
@@ -66,16 +65,11 @@ public class MainActivity extends AppCompatActivity implements Observer {
 
     //region Instance variables
     private NavController navController;
-    private ActivityResultLauncher<String> locationPermissionLauncher;
     private ActivityResultLauncher<String[]> multiplePermissionsLauncher;
 
     private SharedPreferences settings;
     private SensorFusion sensorFusion;
     private Handler httpResponseHandler;
-
-    private PermissionManager permissionManager;
-
-    private static final int PERMISSION_REQUEST_CODE = 100;
 
     //endregion
 
@@ -142,6 +136,21 @@ public class MainActivity extends AppCompatActivity implements Observer {
                             Toast.makeText(this,
                                     "Bluetooth permission denied. BLE scanning will be unavailable.",
                                     Toast.LENGTH_SHORT).show();
+                        }
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                            && getPackageManager().hasSystemFeature(PackageManager.FEATURE_WIFI_RTT)) {
+                        boolean nearbyWifiGranted = result.getOrDefault(
+                                Manifest.permission.NEARBY_WIFI_DEVICES,
+                                true
+                        );
+                        if (!nearbyWifiGranted) {
+                            Toast.makeText(
+                                    this,
+                                    "Nearby WiFi Devices permission denied. WiFi RTT will be unavailable.",
+                                    Toast.LENGTH_SHORT
+                            ).show();
                         }
                     }
                 }
@@ -214,8 +223,17 @@ public class MainActivity extends AppCompatActivity implements Observer {
                             MainActivity.this, Manifest.permission.POST_NOTIFICATIONS
                     ) == PackageManager.PERMISSION_GRANTED;
                 }
+                boolean nearbyWifiGranted = true;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                        && getPackageManager().hasSystemFeature(PackageManager.FEATURE_WIFI_RTT)) {
+                    nearbyWifiGranted = ContextCompat.checkSelfPermission(
+                            MainActivity.this,
+                            Manifest.permission.NEARBY_WIFI_DEVICES
+                    ) == PackageManager.PERMISSION_GRANTED;
+                }
 
-                if (!locationGranted || !activityGranted || !bleGranted || !notifGranted) {
+                if (!locationGranted || !activityGranted || !bleGranted
+                        || !notifGranted || !nearbyWifiGranted) {
                     // Build a list of permissions that still need to be requested
                     java.util.List<String> permsToRequest = new java.util.ArrayList<>();
                     if (!locationGranted) permsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION);
@@ -226,6 +244,11 @@ public class MainActivity extends AppCompatActivity implements Observer {
                     }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notifGranted) {
                         permsToRequest.add(Manifest.permission.POST_NOTIFICATIONS);
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                            && !nearbyWifiGranted
+                            && getPackageManager().hasSystemFeature(PackageManager.FEATURE_WIFI_RTT)) {
+                        permsToRequest.add(Manifest.permission.NEARBY_WIFI_DEVICES);
                     }
                     multiplePermissionsLauncher.launch(permsToRequest.toArray(new String[0]));
                 } else {

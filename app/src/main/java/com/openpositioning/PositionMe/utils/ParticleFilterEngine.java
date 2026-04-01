@@ -162,6 +162,24 @@ public class ParticleFilterEngine {
         return currentLatLng;
     }
 
+    public synchronized double getWeightedMeanHeadingRad() {
+        if (!initialized || particles.isEmpty()) {
+            return Double.NaN;
+        }
+
+        double sinSum = 0d;
+        double cosSum = 0d;
+        for (Particle particle : particles) {
+            sinSum += Math.sin(particle.headingRad) * particle.weight;
+            cosSum += Math.cos(particle.headingRad) * particle.weight;
+        }
+
+        if (Math.abs(sinSum) < 1e-9 && Math.abs(cosSum) < 1e-9) {
+            return Double.NaN;
+        }
+        return normalizeRad(Math.atan2(sinSum, cosSum));
+    }
+
     public synchronized int getLatestWifiFloor() {
         return latestWifiFloor;
     }

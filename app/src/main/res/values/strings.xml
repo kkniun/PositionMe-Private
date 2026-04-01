@@ -154,11 +154,14 @@
     <string name="indoor_mode_hint">Entering Indoor Positioning mode</string>
 
     <!-- Trajectory validation -->
+    <string name="validation_clean_title">Trajectory Ready</string>
+    <string name="validation_clean_message">Validation passed. Do you want to upload this trajectory now?</string>
     <string name="validation_error_title">Trajectory Quality Issues</string>
     <string name="validation_error_message">The trajectory has quality problems that may cause the upload to be rejected by the server:\n\n%1$s\n\nDo you still want to upload?</string>
     <string name="validation_warning_title">Trajectory Quality Notice</string>
     <string name="validation_warning_message">The trajectory has minor quality issues:\n\n%1$s\n\nDo you still want to upload?</string>
     <string name="upload_anyway">Upload Anyway</string>
     <string name="cancel_upload">Cancel</string>
+    <string name="finish_without_upload">Finish Without Upload</string>
 
 </resources>

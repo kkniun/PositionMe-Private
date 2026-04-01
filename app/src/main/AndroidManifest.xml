@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
-    package="com.openpositioning.PositionMe">
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!--
          1. Hardware features.
@@ -36,6 +35,9 @@
     <!-- Location -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        tools:targetApi="tiramisu" />
 
     <!-- Bluetooth (BLE scanning, Android 12+ requires BLUETOOTH_SCAN and BLUETOOTH_CONNECT) -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>

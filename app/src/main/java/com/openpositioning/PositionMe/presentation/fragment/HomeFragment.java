@@ -39,7 +39,7 @@ import java.util.List;
  */
 public class HomeFragment extends Fragment {
 
-    private static final long LIVE_PREVIEW_INTERVAL_MS = 1_000L;
+    private static final long LIVE_PREVIEW_INTERVAL_MS = 250L;
     private static final double FLOORPLAN_REFRESH_DISTANCE_METERS = 15.0;
 
     private MaterialButton goToInfo;
@@ -161,7 +161,7 @@ public class HomeFragment extends Fragment {
             requestNearbyFloorplanIfNeeded(fusedPosition);
             trajectoryMapFragment.updateUserLocation(
                     fusedPosition,
-                    (float) Math.toDegrees(sensorFusion.passOrientation())
+                    (float) Math.toDegrees(sensorFusion.getMapHeadingRad())
             );
             renderMapOverlaysIfChanged();
             return;
@@ -172,7 +172,7 @@ public class HomeFragment extends Fragment {
             LatLng gnssPosition = new LatLng(gnss[0], gnss[1]);
             trajectoryMapFragment.updateUserLocation(
                     gnssPosition,
-                    (float) Math.toDegrees(sensorFusion.passOrientation())
+                    (float) Math.toDegrees(sensorFusion.getMapHeadingRad())
             );
             requestNearbyFloorplanIfNeeded(gnssPosition);
             gnssStatusTextView.setText(R.string.auto_init_waiting);
@@ -188,14 +188,12 @@ public class HomeFragment extends Fragment {
             return;
         }
 
-        long positionVersion = sensorFusion.getCurrentFusedPositionVersion();
         long fusedTrackVersion = sensorFusion.getFusedTrackVersion();
-        if (fusedTrackVersion != lastRenderedFusedTrackVersion
-                || positionVersion != lastRenderedPositionVersion) {
+        if (fusedTrackVersion != lastRenderedFusedTrackVersion) {
             trajectoryMapFragment.renderFusedHistory(sensorFusion.getFusedTrack());
-            lastRenderedPositionVersion = positionVersion;
             lastRenderedFusedTrackVersion = fusedTrackVersion;
         }
+        lastRenderedPositionVersion = sensorFusion.getCurrentFusedPositionVersion();
 
         long observationVersion = sensorFusion.getObservationTrailsVersion();
         if (observationVersion != lastRenderedObservationVersion) {

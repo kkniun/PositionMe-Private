@@ -11,7 +11,6 @@ import com.google.android.gms.maps.model.LatLng;
 import com.openpositioning.PositionMe.utils.ParticleFilterEngine;
 import com.openpositioning.PositionMe.utils.PathView;
 import com.openpositioning.PositionMe.utils.PdrProcessing;
-import com.openpositioning.PositionMe.utils.UtilFunctions;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -33,12 +32,9 @@ public class SensorEventHandler {
     private static final float MAGNETIC_HEADING_BLEND = 0.18f;
     private static final float STABILIZED_HEADING_BLEND = 0.35f;
     private static final float OFFSET_BLEND_GNSS = 0.22f;
-    private static final float OFFSET_BLEND_WIFI = 0.12f;
     private static final long MIN_STEP_INTERVAL_MS = 280L;
     private static final float MAGNETIC_SPIKE_REJECTION_RAD = (float) Math.toRadians(35.0);
     private static final float GYRO_TURN_CONFIRM_RAD_PER_SEC = 0.55f;
-    private static final double CALIBRATION_MIN_DISTANCE_METERS = 1.6;
-    private static final long CALIBRATION_MAX_GAP_MS = 12_000L;
 
     private final SensorState state;
     private final PdrProcessing pdrProcessing;
@@ -58,10 +54,6 @@ public class SensorEventHandler {
     private float relativeHeadingRad = Float.NaN;
     private float headingOffsetRad = Float.NaN;
     private float stabilizedHeadingRad = Float.NaN;
-    private LatLng lastGnssCalibrationPosition;
-    private long lastGnssCalibrationTimestampMs;
-    private LatLng lastWifiCalibrationPosition;
-    private long lastWifiCalibrationTimestampMs;
 
     /**
      * Creates a new SensorEventHandler.
@@ -118,27 +110,12 @@ public class SensorEventHandler {
                 }
                 break;
 
-            // NOTE: intentional fall-through from GYROSCOPE to LINEAR_ACCELERATION
-            // (existing behavior preserved during refactoring)
             case Sensor.TYPE_GYROSCOPE:
-                state.angularVelocity[0] = sensorEvent.values[0];
-                state.angularVelocity[1] = sensorEvent.values[1];
-                state.angularVelocity[2] = sensorEvent.values[2];
+                applyGyroscopeValues(state, sensorEvent.values);
+                break;
 
             case Sensor.TYPE_LINEAR_ACCELERATION:
-                state.filteredAcc[0] = sensorEvent.values[0];
-                state.filteredAcc[1] = sensorEvent.values[1];
-                state.filteredAcc[2] = sensorEvent.values[2];
-
-                double accelMagFiltered = Math.sqrt(
-                        Math.pow(state.filteredAcc[0], 2) +
-                                Math.pow(state.filteredAcc[1], 2) +
-                                Math.pow(state.filteredAcc[2], 2)
-                );
-                this.accelMagnitude.add(accelMagFiltered);
-
-                state.elevator = pdrProcessing.estimateElevator(
-                        state.gravity, state.filteredAcc);
+                applyLinearAccelerationValues(state, sensorEvent.values);
                 break;
 
             case Sensor.TYPE_GRAVITY:
@@ -248,10 +225,6 @@ public class SensorEventHandler {
      */
     void resetBootTime(long newBootTime) {
         this.bootTime = newBootTime;
-        lastGnssCalibrationPosition = null;
-        lastGnssCalibrationTimestampMs = 0L;
-        lastWifiCalibrationPosition = null;
-        lastWifiCalibrationTimestampMs = 0L;
         smoothedMagneticHeadingRad = Float.NaN;
         relativeHeadingRad = Float.NaN;
         headingOffsetRad = Float.NaN;
@@ -274,6 +247,34 @@ public class SensorEventHandler {
     public void updateHeadingCalibrationFromWifi(LatLng wifiLocation, long timestampMillis) {
         // Disabled for heading fusion: WiFi position jitter indoors is too noisy and can rotate
         // PDR away from the user's true walking direction.
+    }
+
+    static boolean shouldProcessLinearAcceleration(int sensorType) {
+        return sensorType == Sensor.TYPE_LINEAR_ACCELERATION;
+    }
+
+    static void applyGyroscopeValues(SensorState state, float[] values) {
+        state.angularVelocity[0] = values[0];
+        state.angularVelocity[1] = values[1];
+        state.angularVelocity[2] = values[2];
+    }
+
+    private void applyLinearAccelerationValues(SensorState state, float[] values) {
+        state.filteredAcc[0] = values[0];
+        state.filteredAcc[1] = values[1];
+        state.filteredAcc[2] = values[2];
+
+        double accelMagFiltered = Math.sqrt(
+                Math.pow(state.filteredAcc[0], 2) +
+                        Math.pow(state.filteredAcc[1], 2) +
+                        Math.pow(state.filteredAcc[2], 2)
+        );
+        accelMagnitude.add(accelMagFiltered);
+
+        state.elevator = pdrProcessing.estimateElevator(
+                state.gravity,
+                state.filteredAcc
+        );
     }
 
     private float normalizeRadians(float radians) {
@@ -314,29 +315,6 @@ public class SensorEventHandler {
             headingOffsetRad = normalizeRadians(smoothedMagneticHeadingRad - relativeHeadingRad);
         }
         updateStabilizedHeading();
-    }
-
-    private void updateHeadingCalibrationFromPosition(LatLng previousPosition,
-                                                      long previousTimestampMillis,
-                                                      LatLng currentPosition,
-                                                      long currentTimestampMillis,
-                                                      float blend) {
-        if (previousPosition == null) {
-            return;
-        }
-        if (currentTimestampMillis - previousTimestampMillis > CALIBRATION_MAX_GAP_MS) {
-            return;
-        }
-
-        double distanceMeters = UtilFunctions.distanceBetweenPoints(previousPosition, currentPosition);
-        if (distanceMeters < CALIBRATION_MIN_DISTANCE_METERS) {
-            return;
-        }
-
-        applyObservedHeading(
-                computeHeadingRadians(previousPosition, currentPosition),
-                blend
-        );
     }
 
     private void applyObservedHeading(float observedHeadingRad, float blend) {
@@ -384,13 +362,5 @@ public class SensorEventHandler {
     private float circleBlend(float from, float to, float alpha) {
         float delta = normalizeRadians(to - from);
         return from + alpha * delta;
-    }
-
-    private float computeHeadingRadians(LatLng from, LatLng to) {
-        double deltaNorth = (to.latitude - from.latitude) * 111_111d;
-        double deltaEast = (to.longitude - from.longitude)
-                * 111_111d
-                * Math.cos(Math.toRadians((from.latitude + to.latitude) * 0.5d));
-        return normalizeRadians((float) Math.atan2(deltaEast, deltaNorth));
     }
 }

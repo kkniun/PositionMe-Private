@@ -65,6 +65,8 @@ import android.widget.Toast;
 
 public class RecordingFragment extends Fragment {
 
+    private static final long LIVE_MAP_REFRESH_INTERVAL_MS = 250L;
+
     // UI elements
     private MaterialButton completeButton, cancelButton;
     private ImageView recIcon;
@@ -94,7 +96,7 @@ public class RecordingFragment extends Fragment {
         public void run() {
             updateUIandPosition();
             // Loop again
-            refreshDataHandler.postDelayed(refreshDataTask, 1_000);
+            refreshDataHandler.postDelayed(refreshDataTask, LIVE_MAP_REFRESH_INTERVAL_MS);
         }
     };
 
@@ -266,7 +268,7 @@ public class RecordingFragment extends Fragment {
         if (trajectoryMapFragment != null && fusedLocation != null) {
             LatLng displayedLocation = trajectoryMapFragment.updateUserLocation(
                     fusedLocation,
-                    (float) Math.toDegrees(sensorFusion.passOrientation())
+                    (float) Math.toDegrees(sensorFusion.getMapHeadingRad())
             );
             if (displayedLocation != null) {
                 if (previousDisplayedLocation != null) {
@@ -309,14 +311,12 @@ public class RecordingFragment extends Fragment {
             return;
         }
 
-        long positionVersion = sensorFusion.getCurrentFusedPositionVersion();
         long fusedTrackVersion = sensorFusion.getFusedTrackVersion();
-        if (fusedTrackVersion != lastRenderedFusedTrackVersion
-                || positionVersion != lastRenderedPositionVersion) {
+        if (fusedTrackVersion != lastRenderedFusedTrackVersion) {
             trajectoryMapFragment.renderFusedHistory(sensorFusion.getFusedTrack());
-            lastRenderedPositionVersion = positionVersion;
             lastRenderedFusedTrackVersion = fusedTrackVersion;
         }
+        lastRenderedPositionVersion = sensorFusion.getCurrentFusedPositionVersion();
 
         long observationVersion = sensorFusion.getObservationTrailsVersion();
         if (observationVersion != lastRenderedObservationVersion) {
@@ -351,7 +351,7 @@ public class RecordingFragment extends Fragment {
     public void onResume() {
         super.onResume();
         if(!this.settings.getBoolean("split_trajectory", false)) {
-            refreshDataHandler.postDelayed(refreshDataTask, 1_000);
+            refreshDataHandler.postDelayed(refreshDataTask, LIVE_MAP_REFRESH_INTERVAL_MS);
         }
     }
 

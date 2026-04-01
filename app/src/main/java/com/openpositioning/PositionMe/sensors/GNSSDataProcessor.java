@@ -54,13 +54,6 @@ public class GNSSDataProcessor {
         this.locationManager = (LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
         this.locationListener = locationListener;
 
-        // Turn on gps if it is currently disabled
-        if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            Toast.makeText(context, "Open GPS", Toast.LENGTH_SHORT).show();
-        }
-        if (!locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-            Toast.makeText(context, "Enable Cellular", Toast.LENGTH_SHORT).show();
-        }
         // Start location updates
         if (permissionsGranted) {
             startLocationUpdates();
@@ -98,19 +91,30 @@ public class GNSSDataProcessor {
      */
     @SuppressLint("MissingPermission")
     public void startLocationUpdates() {
-        //if (sharedPreferences.getBoolean("location", true)) {
         boolean permissionGranted = checkLocationPermissions();
-        if (permissionGranted && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) &&
-                locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)){
+        GnssStartupPolicy.Plan plan = GnssStartupPolicy.build(
+                permissionGranted,
+                locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER),
+                locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        );
 
+        if (plan.shouldRequestGps()) {
             locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, locationListener);
+        }
+        if (plan.shouldRequestNetwork()) {
             locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, locationListener);
         }
-        else if(permissionGranted && !locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)){
-            Toast.makeText(context, "Open GPS", Toast.LENGTH_LONG).show();
-        }
-        else if(permissionGranted && !locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)){
-            Toast.makeText(context, "Turn on WiFi", Toast.LENGTH_LONG).show();
+
+        switch (plan.getNotice()) {
+            case ENABLE_LOCATION_SERVICES:
+                Toast.makeText(context, "Enable GPS or network location", Toast.LENGTH_LONG).show();
+                break;
+            case ENABLE_GPS_FOR_BETTER_ACCURACY:
+                Toast.makeText(context, "Open GPS for better accuracy", Toast.LENGTH_LONG).show();
+                break;
+            case NONE:
+            default:
+                break;
         }
     }
 

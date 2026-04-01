@@ -8,6 +8,7 @@ import android.net.wifi.rtt.RangingRequest;
 import android.net.wifi.rtt.RangingResult;
 import android.net.wifi.rtt.RangingResultCallback;
 import android.net.wifi.rtt.WifiRttManager;
+import android.os.Build;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -95,6 +96,12 @@ public class RttManager implements Observer {
         if (ActivityCompat.checkSelfPermission(context,
                 Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             Log.w(TAG, "Fine location permission not granted for RTT ranging");
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && ActivityCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES)
+                != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "Nearby WiFi Devices permission not granted for RTT ranging");
             return;
         }
 

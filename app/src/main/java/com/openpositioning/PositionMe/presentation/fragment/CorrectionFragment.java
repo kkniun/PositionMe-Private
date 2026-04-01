@@ -65,9 +65,6 @@ public class CorrectionFragment extends Fragment {
         }
         View rootView = inflater.inflate(R.layout.fragment_correction, container, false);
 
-        // Validate trajectory quality before uploading
-        validateAndUpload();
-
         //Obtain start position
         float[] startPosition = sensorFusion.getGNSSLatitude(true);
 
@@ -90,9 +87,11 @@ public class CorrectionFragment extends Fragment {
                 mMap.addMarker(new MarkerOptions().position(start).title("Start Position"));
 
                 // Calculate zoom for demonstration
+                float safeScalingRatio = scalingRatio > 0f ? scalingRatio : 1.0f;
                 double zoom = Math.log(156543.03392f * Math.cos(startPosition[0] * Math.PI / 180)
-                        * scalingRatio) / Math.log(2);
-                mMap.moveCamera(CameraUpdateFactory.newLatLngZoom(start, (float) zoom));
+                        * safeScalingRatio) / Math.log(2);
+                float clampedZoom = (float) Math.max(17.0d, Math.min(20.5d, zoom));
+                mMap.moveCamera(CameraUpdateFactory.newLatLngZoom(start, clampedZoom));
             }
         });
 
@@ -146,14 +145,7 @@ public class CorrectionFragment extends Fragment {
         this.button.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                // ************* CHANGED CODE HERE *************
-                // Before:
-                //   NavDirections action = CorrectionFragmentDirections.actionCorrectionFragmentToHomeFragment();
-                //   Navigation.findNavController(view).navigate(action);
-                //   ((AppCompatActivity)getActivity()).getSupportActionBar().show();
-
-                // Now, simply tell the Activity we are done:
-                ((RecordingActivity) requireActivity()).finishFlow();
+                reviewValidationAndFinish();
             }
         });
     }
@@ -163,48 +155,50 @@ public class CorrectionFragment extends Fragment {
     }
 
     /**
-     * Runs pre-upload quality validation and either uploads directly (if clean)
-     * or shows a warning dialog letting the user choose to proceed or cancel.
+     * 统一在用户显式点击后进行校验与上传确认，避免进入页面就自动上传。
      */
-    private void validateAndUpload() {
+    private void reviewValidationAndFinish() {
         TrajectoryValidator.ValidationResult result = sensorFusion.validateTrajectory();
+        String summary = result.buildSummary();
 
         if (result.isClean()) {
-            // All checks passed — upload immediately
-            Log.i("CorrectionFragment", "Trajectory validation passed, uploading");
-            sensorFusion.sendTrajectoryToCloud();
+            new AlertDialog.Builder(requireContext())
+                    .setTitle(R.string.validation_clean_title)
+                    .setMessage(R.string.validation_clean_message)
+                    .setPositiveButton(R.string.upload_anyway, (dialog, which) -> uploadAndFinish())
+                    .setNegativeButton(R.string.finish_without_upload, (dialog, which) -> finishWithoutUpload())
+                    .setNeutralButton(R.string.cancel, (dialog, which) -> dialog.dismiss())
+                    .show();
             return;
         }
 
-        String summary = result.buildSummary();
         Log.w("CorrectionFragment", "Trajectory quality issues:\n" + summary);
 
         if (!result.isPassed()) {
-            // Blocking errors exist — warn strongly but still allow upload
             new AlertDialog.Builder(requireContext())
                     .setTitle(R.string.validation_error_title)
                     .setMessage(getString(R.string.validation_error_message, summary))
-                    .setPositiveButton(R.string.upload_anyway, (dialog, which) -> {
-                        sensorFusion.sendTrajectoryToCloud();
-                    })
-                    .setNegativeButton(R.string.cancel_upload, (dialog, which) -> {
-                        dialog.dismiss();
-                    })
-                    .setCancelable(false)
+                    .setPositiveButton(R.string.upload_anyway, (dialog, which) -> uploadAndFinish())
+                    .setNegativeButton(R.string.finish_without_upload, (dialog, which) -> finishWithoutUpload())
+                    .setNeutralButton(R.string.cancel_upload, (dialog, which) -> dialog.dismiss())
                     .show();
         } else {
-            // Only warnings — show lighter dialog
             new AlertDialog.Builder(requireContext())
                     .setTitle(R.string.validation_warning_title)
                     .setMessage(getString(R.string.validation_warning_message, summary))
-                    .setPositiveButton(R.string.upload_anyway, (dialog, which) -> {
-                        sensorFusion.sendTrajectoryToCloud();
-                    })
-                    .setNegativeButton(R.string.cancel_upload, (dialog, which) -> {
-                        dialog.dismiss();
-                    })
-                    .setCancelable(false)
+                    .setPositiveButton(R.string.upload_anyway, (dialog, which) -> uploadAndFinish())
+                    .setNegativeButton(R.string.finish_without_upload, (dialog, which) -> finishWithoutUpload())
+                    .setNeutralButton(R.string.cancel_upload, (dialog, which) -> dialog.dismiss())
                     .show();
         }
+    }
+
+    private void uploadAndFinish() {
+        sensorFusion.sendTrajectoryToCloud();
+        finishWithoutUpload();
+    }
+
+    private void finishWithoutUpload() {
+        ((RecordingActivity) requireActivity()).finishFlow();
     }
 }

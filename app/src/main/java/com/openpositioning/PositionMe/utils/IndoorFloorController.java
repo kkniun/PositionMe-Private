@@ -17,19 +17,25 @@ public class IndoorFloorController {
 
     private static final long WIFI_FLOOR_CONFIRM_MS = 1_100L;
     private static final long FLOOR_CHANGE_DEBOUNCE_MS = 900L;
-    private static final float STRONG_ABSOLUTE_SWITCH_METERS = 3.7f;
-    private static final float FLOOR_HEIGHT_RATIO_THRESHOLD = 0.78f;
-    private static final int WIFI_MULTI_FLOOR_CONFIRM_THRESHOLD = 2;
-    private static final int WIFI_ELEVATION_FLOOR_TOLERANCE = 1;
+    private static final float TRANSITION_WINDOW_START_RATIO = 0.30f;
+    private static final float TRANSITION_WINDOW_START_MIN_METERS = 1.1f;
+    private static final double STAIRS_PROXIMITY_METERS = 4.0;
+    private static final double LIFT_PROXIMITY_METERS = 3.5;
     private final IndoorSpatialConstraintModel spatialModel;
 
     private float anchorElevation = Float.NaN;
-    private int anchorLogicalFloor;
     private boolean anchorConfirmed;
+    @Nullable
+    private LatLng anchorPosition;
+    private long anchorTimestampMs;
     private int pendingWifiFloor = Integer.MIN_VALUE;
     private long pendingWifiSinceMs;
     private int pendingCandidateFloor = Integer.MIN_VALUE;
     private long pendingCandidateSinceMs;
+    private FloorTransitionHeuristics.Mode pendingCandidateMode = FloorTransitionHeuristics.Mode.NONE;
+    @Nullable
+    private LatLng transitionStartPosition;
+    private long transitionStartTimestampMs;
 
     public IndoorFloorController(IndoorSpatialConstraintModel spatialModel) {
         this.spatialModel = spatialModel;
@@ -37,12 +43,15 @@ public class IndoorFloorController {
 
     public void reset() {
         anchorElevation = Float.NaN;
-        anchorLogicalFloor = 0;
         anchorConfirmed = false;
+        anchorPosition = null;
+        anchorTimestampMs = 0L;
         pendingWifiFloor = Integer.MIN_VALUE;
         pendingWifiSinceMs = 0L;
         pendingCandidateFloor = Integer.MIN_VALUE;
         pendingCandidateSinceMs = 0L;
+        pendingCandidateMode = FloorTransitionHeuristics.Mode.NONE;
+        clearTransitionWindow();
     }
 
     public boolean hasConfirmedAnchor() {
@@ -51,11 +60,11 @@ public class IndoorFloorController {
 
     public void confirmManualFloor(float elevationMeters, int logicalFloor) {
         spatialModel.setCurrentLogicalFloor(logicalFloor);
-        anchorLogicalFloor = spatialModel.getCurrentLogicalFloor();
         anchorElevation = elevationMeters;
         anchorConfirmed = true;
         clearPendingWifiFloor();
         clearPendingCandidate();
+        clearTransitionWindow();
     }
 
     @Nullable
@@ -97,21 +106,29 @@ public class IndoorFloorController {
 
         int currentLogicalFloor = spatialModel.getCurrentLogicalFloor();
         float elevationDelta = elevationMeters - anchorElevation;
-        int candidateFloor = resolveNextFloor(
+        updateTransitionWindow(currentPosition, elevationMeters, floorHeight, timestampMillis);
+        FloorTransitionHeuristics.Decision decision = resolveNextFloor(
                 currentLogicalFloor,
                 elevationDelta,
                 floorHeight,
                 elevatorHint,
-                normalizedWifiFloor
+                normalizedWifiFloor,
+                currentPosition,
+                timestampMillis
+        );
+        int candidateFloor = spatialModel.clampLogicalFloor(
+                spatialModel.getCurrentBuildingId(),
+                decision.getTargetFloor()
         );
         if (candidateFloor == currentLogicalFloor) {
             clearPendingCandidate();
             return null;
         }
 
-        if (candidateFloor != pendingCandidateFloor) {
+        if (candidateFloor != pendingCandidateFloor || decision.getMode() != pendingCandidateMode) {
             pendingCandidateFloor = candidateFloor;
             pendingCandidateSinceMs = timestampMillis;
+            pendingCandidateMode = decision.getMode();
             return null;
         }
 
@@ -120,6 +137,7 @@ public class IndoorFloorController {
         }
 
         spatialModel.setCurrentLogicalFloor(candidateFloor);
+        seedAnchor(currentPosition, elevationMeters, timestampMillis);
         clearPendingCandidate();
         return spatialModel.getCurrentLogicalFloor();
     }
@@ -151,7 +169,7 @@ public class IndoorFloorController {
 
         if (!anchorConfirmed) {
             spatialModel.setCurrentLogicalFloor(normalizedWifiFloor);
-            seedAnchor(currentPosition, elevationMeters, spatialModel.getCurrentLogicalFloor());
+            seedAnchor(currentPosition, elevationMeters, timestampMillis);
             anchorConfirmed = true;
             clearPendingWifiFloor();
             clearPendingCandidate();
@@ -162,46 +180,76 @@ public class IndoorFloorController {
         return null;
     }
 
-    private int resolveNextFloor(int currentLogicalFloor,
-                                 float elevationDelta,
-                                 float floorHeight,
-                                 boolean elevatorHint,
-                                 @Nullable Integer normalizedWifiFloor) {
-        float floorChangeThreshold = Math.max(
-                STRONG_ABSOLUTE_SWITCH_METERS,
-                floorHeight * FLOOR_HEIGHT_RATIO_THRESHOLD
+    private FloorTransitionHeuristics.Decision resolveNextFloor(int currentLogicalFloor,
+                                                                float elevationDelta,
+                                                                float floorHeight,
+                                                                boolean elevatorHint,
+                                                                @Nullable Integer normalizedWifiFloor,
+                                                                @NonNull LatLng currentPosition,
+                                                                long timestampMillis) {
+        int direction = elevationDelta >= 0f ? 1 : -1;
+        int adjacentFloor = clampRelativeFloor(currentLogicalFloor, direction);
+        int estimatedLiftTargetFloor = clampRelativeFloor(
+                currentLogicalFloor,
+                direction * estimateMovedFloors(elevationDelta, floorHeight)
         );
-        float absoluteDelta = Math.abs(elevationDelta);
-        if (absoluteDelta < floorChangeThreshold) {
-            return anchorLogicalFloor;
+        boolean nearStairs = isNearTransitionFeature(
+                currentPosition,
+                "stairs",
+                STAIRS_PROXIMITY_METERS,
+                currentLogicalFloor,
+                adjacentFloor
+        );
+        boolean nearLift = isNearTransitionFeature(
+                currentPosition,
+                "lift",
+                LIFT_PROXIMITY_METERS,
+                currentLogicalFloor,
+                adjacentFloor,
+                estimatedLiftTargetFloor
+        );
+        double horizontalTravel = getTransitionHorizontalTravelMeters(currentPosition);
+        long transitionDurationMs = getTransitionDurationMillis(timestampMillis);
+        FloorTransitionHeuristics.Decision decision = FloorTransitionHeuristics.evaluate(
+                currentLogicalFloor,
+                elevationDelta,
+                floorHeight,
+                horizontalTravel,
+                transitionDurationMs,
+                nearStairs,
+                nearLift,
+                elevatorHint,
+                normalizedWifiFloor
+        );
+        if (!decision.shouldTransition(currentLogicalFloor)) {
+            return decision;
         }
 
-        boolean wifiSuggestsMultiFloor = normalizedWifiFloor != null
-                && Math.abs(normalizedWifiFloor - currentLogicalFloor)
-                >= WIFI_MULTI_FLOOR_CONFIRM_THRESHOLD;
-        boolean allowMultiFloorJump = elevatorHint || wifiSuggestsMultiFloor;
-        int movedFloors = allowMultiFloorJump
-                ? Math.max(1, Math.round(absoluteDelta / floorHeight))
-                : 1 + (int) Math.floor((absoluteDelta - floorChangeThreshold) / floorHeight);
-        int direction = elevationDelta > 0f ? 1 : -1;
-        int elevationCandidate = spatialModel.clampLogicalFloor(
+        int candidateFloor = spatialModel.clampLogicalFloor(
                 spatialModel.getCurrentBuildingId(),
-                anchorLogicalFloor + direction * movedFloors
+                decision.getTargetFloor()
         );
-
-        if (normalizedWifiFloor != null
-                && Math.abs(normalizedWifiFloor - elevationCandidate) <= WIFI_ELEVATION_FLOOR_TOLERANCE) {
-            return spatialModel.clampLogicalFloor(
-                    spatialModel.getCurrentBuildingId(),
-                    normalizedWifiFloor
+        if (!hasSemanticSupportForDecision(
+                currentPosition,
+                decision.getMode(),
+                currentLogicalFloor,
+                candidateFloor
+        )) {
+            return new FloorTransitionHeuristics.Decision(
+                    currentLogicalFloor,
+                    FloorTransitionHeuristics.Mode.NONE
             );
         }
-        return elevationCandidate;
+        return new FloorTransitionHeuristics.Decision(candidateFloor, decision.getMode());
     }
 
-    private void seedAnchor(LatLng currentPosition, float elevationMeters, int logicalFloor) {
-        anchorLogicalFloor = logicalFloor;
+    private void seedAnchor(LatLng currentPosition,
+                            float elevationMeters,
+                            long timestampMillis) {
         anchorElevation = elevationMeters;
+        anchorPosition = currentPosition;
+        anchorTimestampMs = timestampMillis;
+        clearTransitionWindow();
     }
 
     private void clearPendingWifiFloor() {
@@ -212,5 +260,98 @@ public class IndoorFloorController {
     private void clearPendingCandidate() {
         pendingCandidateFloor = Integer.MIN_VALUE;
         pendingCandidateSinceMs = 0L;
+        pendingCandidateMode = FloorTransitionHeuristics.Mode.NONE;
+    }
+
+    private void updateTransitionWindow(@NonNull LatLng currentPosition,
+                                        float elevationMeters,
+                                        float floorHeight,
+                                        long timestampMillis) {
+        float activationThreshold = Math.max(
+                TRANSITION_WINDOW_START_MIN_METERS,
+                floorHeight * TRANSITION_WINDOW_START_RATIO
+        );
+        float absoluteDelta = Math.abs(elevationMeters - anchorElevation);
+        if (absoluteDelta < activationThreshold) {
+            if (pendingCandidateFloor == Integer.MIN_VALUE) {
+                clearTransitionWindow();
+            }
+            return;
+        }
+
+        if (transitionStartPosition == null) {
+            transitionStartPosition = currentPosition;
+            transitionStartTimestampMs = timestampMillis;
+        }
+    }
+
+    private void clearTransitionWindow() {
+        transitionStartPosition = null;
+        transitionStartTimestampMs = 0L;
+    }
+
+    private double getTransitionHorizontalTravelMeters(@NonNull LatLng currentPosition) {
+        if (transitionStartPosition != null) {
+            return UtilFunctions.distanceBetweenPoints(transitionStartPosition, currentPosition);
+        }
+        if (anchorPosition != null) {
+            return UtilFunctions.distanceBetweenPoints(anchorPosition, currentPosition);
+        }
+        return 0d;
+    }
+
+    private long getTransitionDurationMillis(long timestampMillis) {
+        if (transitionStartTimestampMs > 0L) {
+            return Math.max(0L, timestampMillis - transitionStartTimestampMs);
+        }
+        if (anchorTimestampMs > 0L) {
+            return Math.max(0L, timestampMillis - anchorTimestampMs);
+        }
+        return 0L;
+    }
+
+    private int estimateMovedFloors(float elevationDelta, float floorHeight) {
+        float effectiveFloorHeight = Math.max(1.0f, floorHeight);
+        return Math.max(1, Math.round(Math.abs(elevationDelta) / effectiveFloorHeight));
+    }
+
+    private int clampRelativeFloor(int baseFloor, int deltaFloors) {
+        return spatialModel.clampLogicalFloor(
+                spatialModel.getCurrentBuildingId(),
+                baseFloor + deltaFloors
+        );
+    }
+
+    private boolean hasSemanticSupportForDecision(@NonNull LatLng point,
+                                                  @NonNull FloorTransitionHeuristics.Mode mode,
+                                                  int currentFloor,
+                                                  int candidateFloor) {
+        if (mode == FloorTransitionHeuristics.Mode.NONE || candidateFloor == currentFloor) {
+            return false;
+        }
+        if (mode == FloorTransitionHeuristics.Mode.STAIRS
+                && Math.abs(candidateFloor - currentFloor) != 1) {
+            return false;
+        }
+
+        String indoorType = mode == FloorTransitionHeuristics.Mode.LIFT ? "lift" : "stairs";
+        double radiusMeters = mode == FloorTransitionHeuristics.Mode.LIFT
+                ? LIFT_PROXIMITY_METERS
+                : STAIRS_PROXIMITY_METERS;
+        return isNearTransitionFeature(point, indoorType, radiusMeters, currentFloor, candidateFloor);
+    }
+
+    private boolean isNearTransitionFeature(@NonNull LatLng point,
+                                            @NonNull String indoorType,
+                                            double radiusMeters,
+                                            int... logicalFloors) {
+        String buildingId = spatialModel.getCurrentBuildingId();
+        for (int logicalFloor : logicalFloors) {
+            int clampedFloor = spatialModel.clampLogicalFloor(buildingId, logicalFloor);
+            if (spatialModel.isNearFeature(point, indoorType, radiusMeters, buildingId, clampedFloor)) {
+                return true;
+            }
+        }
+        return false;
     }
 }
