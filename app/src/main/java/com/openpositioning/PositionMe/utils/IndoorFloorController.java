@@ -19,8 +19,6 @@ public class IndoorFloorController {
     private static final long FLOOR_CHANGE_DEBOUNCE_MS = 900L;
     private static final float STRONG_ABSOLUTE_SWITCH_METERS = 3.7f;
     private static final float FLOOR_HEIGHT_RATIO_THRESHOLD = 0.78f;
-    private static final int WIFI_MULTI_FLOOR_CONFIRM_THRESHOLD = 2;
-    private static final int WIFI_ELEVATION_FLOOR_TOLERANCE = 1;
     private final IndoorSpatialConstraintModel spatialModel;
 
     private float anchorElevation = Float.NaN;
@@ -97,13 +95,7 @@ public class IndoorFloorController {
 
         int currentLogicalFloor = spatialModel.getCurrentLogicalFloor();
         float elevationDelta = elevationMeters - anchorElevation;
-        int candidateFloor = resolveNextFloor(
-                currentLogicalFloor,
-                elevationDelta,
-                floorHeight,
-                elevatorHint,
-                normalizedWifiFloor
-        );
+        int candidateFloor = resolveNextFloor(elevationDelta, floorHeight, elevatorHint);
         if (candidateFloor == currentLogicalFloor) {
             clearPendingCandidate();
             return null;
@@ -120,7 +112,9 @@ public class IndoorFloorController {
         }
 
         spatialModel.setCurrentLogicalFloor(candidateFloor);
+        seedAnchor(currentPosition, elevationMeters, spatialModel.getCurrentLogicalFloor());
         clearPendingCandidate();
+        clearPendingWifiFloor();
         return spatialModel.getCurrentLogicalFloor();
     }
 
@@ -162,11 +156,9 @@ public class IndoorFloorController {
         return null;
     }
 
-    private int resolveNextFloor(int currentLogicalFloor,
-                                 float elevationDelta,
+    private int resolveNextFloor(float elevationDelta,
                                  float floorHeight,
-                                 boolean elevatorHint,
-                                 @Nullable Integer normalizedWifiFloor) {
+                                 boolean elevatorHint) {
         float floorChangeThreshold = Math.max(
                 STRONG_ABSOLUTE_SWITCH_METERS,
                 floorHeight * FLOOR_HEIGHT_RATIO_THRESHOLD
@@ -176,27 +168,14 @@ public class IndoorFloorController {
             return anchorLogicalFloor;
         }
 
-        boolean wifiSuggestsMultiFloor = normalizedWifiFloor != null
-                && Math.abs(normalizedWifiFloor - currentLogicalFloor)
-                >= WIFI_MULTI_FLOOR_CONFIRM_THRESHOLD;
-        boolean allowMultiFloorJump = elevatorHint || wifiSuggestsMultiFloor;
-        int movedFloors = allowMultiFloorJump
+        int movedFloors = elevatorHint
                 ? Math.max(1, Math.round(absoluteDelta / floorHeight))
                 : 1 + (int) Math.floor((absoluteDelta - floorChangeThreshold) / floorHeight);
         int direction = elevationDelta > 0f ? 1 : -1;
-        int elevationCandidate = spatialModel.clampLogicalFloor(
+        return spatialModel.clampLogicalFloor(
                 spatialModel.getCurrentBuildingId(),
                 anchorLogicalFloor + direction * movedFloors
         );
-
-        if (normalizedWifiFloor != null
-                && Math.abs(normalizedWifiFloor - elevationCandidate) <= WIFI_ELEVATION_FLOOR_TOLERANCE) {
-            return spatialModel.clampLogicalFloor(
-                    spatialModel.getCurrentBuildingId(),
-                    normalizedWifiFloor
-            );
-        }
-        return elevationCandidate;
     }
 
     private void seedAnchor(LatLng currentPosition, float elevationMeters, int logicalFloor) {

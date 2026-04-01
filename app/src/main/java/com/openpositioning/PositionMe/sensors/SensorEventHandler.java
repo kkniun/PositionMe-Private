@@ -263,17 +263,44 @@ public class SensorEventHandler {
             return;
         }
 
+        long timestampMillis = location.getTime() > 0L
+                ? location.getTime()
+                : System.currentTimeMillis();
         if (location.hasBearing() && (!location.hasSpeed() || location.getSpeed() >= 0.7f)) {
             applyObservedHeading(
                     normalizeRadians((float) Math.toRadians(location.getBearing())),
                     OFFSET_BLEND_GNSS
             );
         }
+        float accuracyMeters = location.hasAccuracy() ? location.getAccuracy() : 25f;
+        float blend = accuracyMeters <= 10f
+                ? OFFSET_BLEND_GNSS
+                : accuracyMeters <= 20f
+                ? 0.16f
+                : 0.08f;
+        LatLng position = new LatLng(location.getLatitude(), location.getLongitude());
+        LatLng previous = lastGnssCalibrationPosition;
+        long previousTimestamp = lastGnssCalibrationTimestampMs;
+        lastGnssCalibrationPosition = position;
+        lastGnssCalibrationTimestampMs = timestampMillis;
+        updateHeadingCalibrationFromPosition(previous, previousTimestamp, position, timestampMillis, blend);
     }
 
     public void updateHeadingCalibrationFromWifi(LatLng wifiLocation, long timestampMillis) {
-        // Disabled for heading fusion: WiFi position jitter indoors is too noisy and can rotate
-        // PDR away from the user's true walking direction.
+        if (wifiLocation == null) {
+            return;
+        }
+        LatLng previous = lastWifiCalibrationPosition;
+        long previousTimestamp = lastWifiCalibrationTimestampMs;
+        lastWifiCalibrationPosition = wifiLocation;
+        lastWifiCalibrationTimestampMs = timestampMillis;
+        updateHeadingCalibrationFromPosition(
+                previous,
+                previousTimestamp,
+                wifiLocation,
+                timestampMillis,
+                OFFSET_BLEND_WIFI
+        );
     }
 
     private float normalizeRadians(float radians) {
