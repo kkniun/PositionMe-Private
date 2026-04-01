@@ -30,8 +30,9 @@ public class ParticleFilterEngine {
     private static final int PARTICLE_COUNT = 240;
     private static final int MAX_TAIL_SIZE = 5;
     private static final int MAX_HISTORY_SIZE = 600;
-    private static final long MIN_HISTORY_INTERVAL_MS = 1_000L;
+    private static final long MIN_HISTORY_INTERVAL_MS = 2_000L;
     private static final long HISTORY_ACTIVE_MOTION_WINDOW_MS = 2_500L;
+    private static final long DISPLAY_WINDOW_MS = 2_000L;
     private static final double MIN_HISTORY_DISTANCE_METERS = 0.85;
     private static final double MAX_HISTORY_SEGMENT_METERS = 4.0;
     private static final double STATIONARY_REBASE_DISTANCE_METERS = 2.5;
@@ -54,6 +55,7 @@ public class ParticleFilterEngine {
     private final ArrayDeque<LatLng> gnssTail = new ArrayDeque<>();
     private final ArrayDeque<LatLng> wifiTail = new ArrayDeque<>();
     private final ArrayDeque<LatLng> pdrTail = new ArrayDeque<>();
+    private final ArrayDeque<DisplaySample> recentDisplaySamples = new ArrayDeque<>();
     private final IndoorSpatialConstraintModel spatialConstraintModel;
     private final AdaptivePlanarKalmanFilter displayKalmanFilter = new AdaptivePlanarKalmanFilter();
 
@@ -100,6 +102,7 @@ public class ParticleFilterEngine {
         gnssTail.clear();
         wifiTail.clear();
         pdrTail.clear();
+        recentDisplaySamples.clear();
         displayKalmanFilter.reset();
         reference = null;
         initialized = false;
@@ -146,7 +149,15 @@ public class ParticleFilterEngine {
 
     @Nullable
     public synchronized LatLng getCurrentLatLng() {
-        return currentLatLng;
+        return getWindowedLatLng();
+    }
+
+    public synchronized double getCurrentDisplayHeadingRad() {
+        DisplayPose pose = getWindowedDisplayPose();
+        if (pose != null) {
+            return pose.headingRad;
+        }
+        return displayHeadingRad;
     }
 
     public synchronized int getLatestWifiFloor() {
@@ -248,6 +259,7 @@ public class ParticleFilterEngine {
         currentPositionVersion++;
         appendHistory(corrected, timestampMillis, true);
         spatialConstraintModel.updatePosition(corrected);
+        recordDisplaySample(timestampMillis);
     }
 
     /**
@@ -713,6 +725,7 @@ public class ParticleFilterEngine {
         dominantParticleFloor = logicalFloor;
         clampParticlesToCurrentContext();
         appendHistory(currentLatLng, timestampMillis, false);
+        recordDisplaySample(timestampMillis);
     }
 
     private void appendHistory(LatLng point, long timestampMillis, boolean forceReplaceLastPoint) {
@@ -782,6 +795,81 @@ public class ParticleFilterEngine {
     private boolean isRecentPdrMotion(long timestampMillis) {
         return lastPdrMotionTimestamp > 0L
                 && timestampMillis - lastPdrMotionTimestamp <= HISTORY_ACTIVE_MOTION_WINDOW_MS;
+    }
+
+    @Nullable
+    private LatLng getWindowedLatLng() {
+        DisplayPose pose = getWindowedDisplayPose();
+        if (pose == null || reference == null) {
+            return currentLatLng;
+        }
+        return reference.toLatLng(pose.easting, pose.northing);
+    }
+
+    @Nullable
+    private DisplayPose getWindowedDisplayPose() {
+        if (!hasDisplayPose || reference == null) {
+            return null;
+        }
+
+        long now = recentDisplaySamples.isEmpty()
+                ? System.currentTimeMillis()
+                : recentDisplaySamples.peekLast().timestampMillis;
+        pruneDisplaySamples(now);
+        if (recentDisplaySamples.isEmpty()) {
+            return new DisplayPose(displayEasting, displayNorthing, displayHeadingRad);
+        }
+
+        double weightedEast = 0d;
+        double weightedNorth = 0d;
+        double weightedSin = 0d;
+        double weightedCos = 0d;
+        double weightSum = 0d;
+
+        DisplaySample first = recentDisplaySamples.peekFirst();
+        DisplaySample last = recentDisplaySamples.peekLast();
+        for (DisplaySample sample : recentDisplaySamples) {
+            double ageRatio = 1d - Math.max(0d,
+                    Math.min(1d, (now - sample.timestampMillis) / (double) DISPLAY_WINDOW_MS));
+            double weight = 0.35 + 0.65 * ageRatio;
+            weightedEast += sample.easting * weight;
+            weightedNorth += sample.northing * weight;
+            weightedSin += Math.sin(sample.headingRad) * weight;
+            weightedCos += Math.cos(sample.headingRad) * weight;
+            weightSum += weight;
+        }
+
+        if (weightSum <= 1e-6) {
+            return new DisplayPose(displayEasting, displayNorthing, displayHeadingRad);
+        }
+
+        double averagedEast = weightedEast / weightSum;
+        double averagedNorth = weightedNorth / weightSum;
+        double headingRad;
+        if (first != null && last != null
+                && Math.hypot(last.easting - first.easting, last.northing - first.northing) >= 0.6d) {
+            headingRad = Math.atan2(last.easting - first.easting, last.northing - first.northing);
+        } else {
+            headingRad = Math.atan2(weightedSin, weightedCos);
+        }
+        return new DisplayPose(averagedEast, averagedNorth, normalizeRad(headingRad));
+    }
+
+    private void recordDisplaySample(long timestampMillis) {
+        recentDisplaySamples.addLast(new DisplaySample(
+                displayEasting,
+                displayNorthing,
+                displayHeadingRad,
+                timestampMillis
+        ));
+        pruneDisplaySamples(timestampMillis);
+    }
+
+    private void pruneDisplaySamples(long nowMillis) {
+        while (!recentDisplaySamples.isEmpty()
+                && nowMillis - recentDisplaySamples.peekFirst().timestampMillis > DISPLAY_WINDOW_MS) {
+            recentDisplaySamples.removeFirst();
+        }
     }
 
     private double normalizeHeading(double headingRad) {
@@ -979,6 +1067,35 @@ public class ParticleFilterEngine {
             this.northing = northing;
             this.headingRad = headingRad;
             this.logicalFloor = logicalFloor;
+        }
+    }
+
+    private static final class DisplaySample {
+        private final double easting;
+        private final double northing;
+        private final double headingRad;
+        private final long timestampMillis;
+
+        private DisplaySample(double easting,
+                              double northing,
+                              double headingRad,
+                              long timestampMillis) {
+            this.easting = easting;
+            this.northing = northing;
+            this.headingRad = headingRad;
+            this.timestampMillis = timestampMillis;
+        }
+    }
+
+    private static final class DisplayPose {
+        private final double easting;
+        private final double northing;
+        private final double headingRad;
+
+        private DisplayPose(double easting, double northing, double headingRad) {
+            this.easting = easting;
+            this.northing = northing;
+            this.headingRad = headingRad;
         }
     }
 

@@ -62,6 +62,7 @@ public class StartLocationFragment extends Fragment {
     private static final double FLOORPLAN_REFRESH_DISTANCE_METERS = 15.0;
     private static final float LIVE_DIRECTION_MARKER_SIZE_DP = 18f;
     private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
+    private static final long AUTO_INIT_REFRESH_INTERVAL_MS = 2_000L;
 
     // UI elements
     private Button button;
@@ -105,7 +106,7 @@ public class StartLocationFragment extends Fragment {
         @Override
         public void run() {
             refreshAutoInitializationState();
-            autoInitHandler.postDelayed(this, 1_000L);
+            autoInitHandler.postDelayed(this, AUTO_INIT_REFRESH_INTERVAL_MS);
         }
     };
 

@@ -626,11 +626,13 @@ public class SensorFusion implements SensorEventListener {
         if (indoorFloorController == null) {
             return null;
         }
+        boolean elevatorHint = getElevator()
+                || isNearIndoorFeature(currentPosition, "lift", 3.5);
         Integer resolvedFloor = indoorFloorController.evaluate(
                 currentPosition,
                 state.elevation,
                 getLatLngWifiPositioning() != null ? getWifiFloor() : null,
-                false,
+                elevatorHint,
                 timestampMillis
         );
         if (resolvedFloor != null && particleFilterEngine != null) {
@@ -779,6 +781,9 @@ public class SensorFusion implements SensorEventListener {
      * @return orientation of device in radians.
      */
     public float passOrientation() {
+        if (particleFilterEngine != null && particleFilterEngine.isInitialized()) {
+            return (float) particleFilterEngine.getCurrentDisplayHeadingRad();
+        }
         return state.orientation[0];
     }
 

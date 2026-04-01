@@ -65,6 +65,8 @@ import android.widget.Toast;
 
 public class RecordingFragment extends Fragment {
 
+    private static final long UI_REFRESH_INTERVAL_MS = 2_000L;
+
     // UI elements
     private MaterialButton completeButton, cancelButton;
     private ImageView recIcon;
@@ -94,7 +96,7 @@ public class RecordingFragment extends Fragment {
         public void run() {
             updateUIandPosition();
             // Loop again
-            refreshDataHandler.postDelayed(refreshDataTask, 1_000);
+            refreshDataHandler.postDelayed(refreshDataTask, UI_REFRESH_INTERVAL_MS);
         }
     };
 
@@ -207,10 +209,11 @@ public class RecordingFragment extends Fragment {
             timeRemaining.setProgress(0);
             timeRemaining.setScaleY(3f);
 
-            autoStop = new CountDownTimer(limit, 1000) {
+            autoStop = new CountDownTimer(limit, UI_REFRESH_INTERVAL_MS) {
                 @Override
                 public void onTick(long millisUntilFinished) {
-                    timeRemaining.incrementProgressBy(1);
+                    int elapsedSeconds = (int) ((limit - millisUntilFinished) / 1000L);
+                    timeRemaining.setProgress(elapsedSeconds);
                     updateUIandPosition();
                 }
 
@@ -351,7 +354,7 @@ public class RecordingFragment extends Fragment {
     public void onResume() {
         super.onResume();
         if(!this.settings.getBoolean("split_trajectory", false)) {
-            refreshDataHandler.postDelayed(refreshDataTask, 1_000);
+            refreshDataHandler.postDelayed(refreshDataTask, UI_REFRESH_INTERVAL_MS);
         }
     }
 

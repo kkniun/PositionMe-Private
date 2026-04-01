@@ -100,7 +100,7 @@ public class TrajectoryMapFragment extends Fragment {
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
-    private static final long AUTO_FLOOR_CHECK_INTERVAL_MS = 1000;
+    private static final long AUTO_FLOOR_CHECK_INTERVAL_MS = 2000;
     private static final double TAIL_RADIUS_METERS = 0.45;
     private static final int GNSS_TAIL_COLOR = Color.rgb(25, 118, 210);
     private static final int WIFI_TAIL_COLOR = Color.rgb(0, 137, 123);
