@@ -46,6 +46,13 @@ public class ParticleFilterEngine {
     private static final double GNSS_OBSERVATION_PULL_MAX = 0.64;
     private static final double WIFI_OBSERVATION_PULL_MIN = 0.22;
     private static final double WIFI_OBSERVATION_PULL_MAX = 0.48;
+    private static final double WIFI_OBSERVATION_CAUTION_DISTANCE_METERS = 7.5;
+    private static final double WIFI_OBSERVATION_REJECT_DISTANCE_METERS = 13.0;
+    private static final double GNSS_OBSERVATION_CAUTION_DISTANCE_METERS = 10.0;
+    private static final double GNSS_OBSERVATION_REJECT_DISTANCE_METERS = 22.0;
+    private static final long OBSERVATION_RELOCATION_CONFIRM_WINDOW_MS = 7_000L;
+    private static final double WIFI_RELOCATION_CONFIRM_RADIUS_METERS = 4.5;
+    private static final double GNSS_RELOCATION_CONFIRM_RADIUS_METERS = 7.5;
     private static final double EARTH_RADIUS_METERS = 6_378_137.0;
 
     private final Random random = new Random();
@@ -82,6 +89,10 @@ public class ParticleFilterEngine {
     private long gnssTailVersion;
     private long wifiTailVersion;
     private long pdrTailVersion;
+    @Nullable
+    private PendingObservation pendingWifiRelocation;
+    @Nullable
+    private PendingObservation pendingGnssRelocation;
 
     public ParticleFilterEngine() {
         this(new IndoorSpatialConstraintModel());
@@ -125,6 +136,8 @@ public class ParticleFilterEngine {
         gnssTailVersion = 0L;
         wifiTailVersion = 0L;
         pdrTailVersion = 0L;
+        pendingWifiRelocation = null;
+        pendingGnssRelocation = null;
         spatialConstraintModel.reset();
     }
 
@@ -383,11 +396,9 @@ public class ParticleFilterEngine {
                                          double headingRad,
                                          long timestampMillis,
                                          @Nullable Integer floor) {
-        spatialConstraintModel.updatePosition(latLng);
         Integer normalizedFloor = floor;
         if (source == ObservationSource.WIFI && floor != null && spatialConstraintModel.hasIndoorContext()) {
             normalizedFloor = spatialConstraintModel.normalizeExternalFloorObservation(floor);
-            latestWifiFloor = normalizedFloor;
         }
 
         if (source == ObservationSource.GNSS) {
@@ -398,9 +409,33 @@ public class ParticleFilterEngine {
             if (appendTail(wifiTail, latLng)) {
                 wifiTailVersion++;
             }
-            if (normalizedFloor != null) {
-                latestWifiFloor = normalizedFloor;
+        }
+
+        double[] local = null;
+        if (initialized && reference != null) {
+            local = reference.toLocal(latLng);
+            ObservationAssessment assessment = assessAbsoluteObservation(
+                    local[0],
+                    local[1],
+                    accuracyMeters,
+                    confidence,
+                    source,
+                    normalizedFloor,
+                    timestampMillis
+            );
+            if (assessment.reject) {
+                return currentLatLng;
             }
+            accuracyMeters = assessment.adjustedAccuracyMeters;
+            confidence = assessment.adjustedConfidence;
+        }
+
+        spatialConstraintModel.updatePosition(latLng);
+        if (source == ObservationSource.WIFI && floor != null && spatialConstraintModel.hasIndoorContext()) {
+            normalizedFloor = spatialConstraintModel.normalizeExternalFloorObservation(floor);
+        }
+        if (source == ObservationSource.WIFI && normalizedFloor != null) {
+            latestWifiFloor = normalizedFloor;
         }
 
         if (!initialized) {
@@ -437,7 +472,9 @@ public class ParticleFilterEngine {
         if (source == ObservationSource.WIFI && normalizedFloor != null) {
             injectFloorHypotheses(normalizedFloor, confidence);
         }
-        double[] local = reference.toLocal(latLng);
+        if (local == null) {
+            local = reference.toLocal(latLng);
+        }
         updateWeights(local[0], local[1], accuracyMeters, confidence, source, normalizedFloor);
 
         if (effectiveParticleCount() < RESAMPLE_THRESHOLD_RATIO * particles.size()) {
@@ -466,6 +503,88 @@ public class ParticleFilterEngine {
                         : clamp(accuracyMeters * 0.46, 1.1, 6.0)
         );
         return currentLatLng;
+    }
+
+    private ObservationAssessment assessAbsoluteObservation(double observedEasting,
+                                                            double observedNorthing,
+                                                            double accuracyMeters,
+                                                            double confidence,
+                                                            ObservationSource source,
+                                                            @Nullable Integer observedFloor,
+                                                            long timestampMillis) {
+        if (!hasDisplayPose) {
+            clearPendingObservation(source);
+            return ObservationAssessment.accept(accuracyMeters, confidence);
+        }
+
+        double displayResidual = Math.hypot(observedEasting - displayEasting, observedNorthing - displayNorthing);
+        double rawResidual = Math.hypot(observedEasting - rawEasting, observedNorthing - rawNorthing);
+        double residualMeters = Math.min(displayResidual, rawResidual);
+
+        double cautionThreshold = source == ObservationSource.WIFI
+                ? clamp(accuracyMeters * 1.25, 5.5, WIFI_OBSERVATION_CAUTION_DISTANCE_METERS)
+                : clamp(accuracyMeters * 1.15, 8.0, GNSS_OBSERVATION_CAUTION_DISTANCE_METERS);
+        double rejectThreshold = source == ObservationSource.WIFI
+                ? clamp(accuracyMeters * 1.95, 8.5, WIFI_OBSERVATION_REJECT_DISTANCE_METERS)
+                : clamp(accuracyMeters * 1.75, 13.0, GNSS_OBSERVATION_REJECT_DISTANCE_METERS);
+
+        if (spatialConstraintModel.hasIndoorContext() && source == ObservationSource.GNSS) {
+            cautionThreshold *= 0.88;
+            rejectThreshold *= 0.88;
+        }
+        if (!isRecentPdrMotion(timestampMillis)) {
+            cautionThreshold *= 1.20;
+            rejectThreshold *= 1.20;
+        }
+
+        boolean relocationConfirmed = matchesPendingObservation(
+                source,
+                observedEasting,
+                observedNorthing,
+                observedFloor,
+                timestampMillis
+        );
+
+        if (residualMeters > rejectThreshold) {
+            if (!relocationConfirmed) {
+                rememberPendingObservation(
+                        source,
+                        observedEasting,
+                        observedNorthing,
+                        observedFloor,
+                        timestampMillis
+                );
+                return ObservationAssessment.reject();
+            }
+            clearPendingObservation(source);
+            return ObservationAssessment.accept(
+                    accuracyMeters * 1.45,
+                    clamp(confidence * 0.72, 0.18, confidence)
+            );
+        }
+
+        if (residualMeters > cautionThreshold) {
+            double span = Math.max(1e-6, rejectThreshold - cautionThreshold);
+            double ratio = clamp((residualMeters - cautionThreshold) / span, 0.0, 1.0);
+            if (!relocationConfirmed) {
+                rememberPendingObservation(
+                        source,
+                        observedEasting,
+                        observedNorthing,
+                        observedFloor,
+                        timestampMillis
+                );
+            } else {
+                clearPendingObservation(source);
+            }
+            return ObservationAssessment.accept(
+                    accuracyMeters * lerp(1.15, 1.80, ratio),
+                    clamp(confidence * lerp(0.82, 0.48, ratio), 0.18, confidence)
+            );
+        }
+
+        clearPendingObservation(source);
+        return ObservationAssessment.accept(accuracyMeters, confidence);
     }
 
     private void pullParticlesTowardObservation(double observedEasting,
@@ -907,6 +1026,59 @@ public class ParticleFilterEngine {
         return Math.max(0.02, Math.exp(-0.5 * floorDifference * floorDifference / sigmaSquared));
     }
 
+    private void rememberPendingObservation(ObservationSource source,
+                                            double observedEasting,
+                                            double observedNorthing,
+                                            @Nullable Integer observedFloor,
+                                            long timestampMillis) {
+        PendingObservation pending = new PendingObservation(
+                observedEasting,
+                observedNorthing,
+                observedFloor,
+                timestampMillis
+        );
+        if (source == ObservationSource.WIFI) {
+            pendingWifiRelocation = pending;
+        } else {
+            pendingGnssRelocation = pending;
+        }
+    }
+
+    private boolean matchesPendingObservation(ObservationSource source,
+                                              double observedEasting,
+                                              double observedNorthing,
+                                              @Nullable Integer observedFloor,
+                                              long timestampMillis) {
+        PendingObservation pending = source == ObservationSource.WIFI
+                ? pendingWifiRelocation
+                : pendingGnssRelocation;
+        if (pending == null) {
+            return false;
+        }
+        if (timestampMillis - pending.timestampMillis > OBSERVATION_RELOCATION_CONFIRM_WINDOW_MS) {
+            clearPendingObservation(source);
+            return false;
+        }
+        if (observedFloor != null && pending.logicalFloor != null
+                && !observedFloor.equals(pending.logicalFloor)) {
+            return false;
+        }
+        double confirmRadius = source == ObservationSource.WIFI
+                ? WIFI_RELOCATION_CONFIRM_RADIUS_METERS
+                : GNSS_RELOCATION_CONFIRM_RADIUS_METERS;
+        double deltaE = observedEasting - pending.easting;
+        double deltaN = observedNorthing - pending.northing;
+        return Math.hypot(deltaE, deltaN) <= confirmRadius;
+    }
+
+    private void clearPendingObservation(ObservationSource source) {
+        if (source == ObservationSource.WIFI) {
+            pendingWifiRelocation = null;
+        } else {
+            pendingGnssRelocation = null;
+        }
+    }
+
     private void normalizeWeights() {
         if (particles.isEmpty()) {
             return;
@@ -962,6 +1134,47 @@ public class ParticleFilterEngine {
             this.headingRad = headingRad;
             this.weight = weight;
             this.logicalFloor = logicalFloor;
+        }
+    }
+
+    private static final class PendingObservation {
+        private final double easting;
+        private final double northing;
+        @Nullable
+        private final Integer logicalFloor;
+        private final long timestampMillis;
+
+        private PendingObservation(double easting,
+                                   double northing,
+                                   @Nullable Integer logicalFloor,
+                                   long timestampMillis) {
+            this.easting = easting;
+            this.northing = northing;
+            this.logicalFloor = logicalFloor;
+            this.timestampMillis = timestampMillis;
+        }
+    }
+
+    private static final class ObservationAssessment {
+        private final boolean reject;
+        private final double adjustedAccuracyMeters;
+        private final double adjustedConfidence;
+
+        private ObservationAssessment(boolean reject,
+                                      double adjustedAccuracyMeters,
+                                      double adjustedConfidence) {
+            this.reject = reject;
+            this.adjustedAccuracyMeters = adjustedAccuracyMeters;
+            this.adjustedConfidence = adjustedConfidence;
+        }
+
+        private static ObservationAssessment reject() {
+            return new ObservationAssessment(true, 0d, 0d);
+        }
+
+        private static ObservationAssessment accept(double adjustedAccuracyMeters,
+                                                    double adjustedConfidence) {
+            return new ObservationAssessment(false, adjustedAccuracyMeters, adjustedConfidence);
         }
     }
 
