@@ -3,6 +3,7 @@
 .gradle-project-cache/
 .android-home/
 local.properties
+secrets.properties
 *.iml
 .idea/
 build/
