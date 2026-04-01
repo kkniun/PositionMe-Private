@@ -75,6 +75,7 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double TRACK_APPEND_DISTANCE_METERS = 0.06;
     private static final double TRACK_REPLACE_DISTANCE_METERS = 0.03;
     private static final double MAX_TRACK_APPEND_DISTANCE_METERS = 6.0;
+    private static final double TRACK_SEGMENT_INTERPOLATION_METERS = 3.0;
     private GoogleMap gMap; // Google Maps instance
     private LatLng currentLocation; // Stores the user's current location
     private Marker directionMarker; // Current user direction arrow
@@ -767,8 +768,26 @@ public class TrajectoryMapFragment extends Fragment {
             return;
         }
 
-        userTrackHistory.set(lastIndex, location);
+        appendInterpolatedTrackPoints(userTrackHistory, lastPoint, location, distanceMeters);
         refreshDisplayedTrackPolyline();
+    }
+
+    private void appendInterpolatedTrackPoints(@NonNull List<LatLng> userTrackHistory,
+                                               @NonNull LatLng start,
+                                               @NonNull LatLng end,
+                                               double distanceMeters) {
+        int segments = Math.max(1, (int) Math.ceil(distanceMeters / TRACK_SEGMENT_INTERPOLATION_METERS));
+        for (int i = 1; i <= segments; i++) {
+            double ratio = (double) i / segments;
+            LatLng point = new LatLng(
+                    start.latitude + (end.latitude - start.latitude) * ratio,
+                    start.longitude + (end.longitude - start.longitude) * ratio
+            );
+            userTrackHistory.add(point);
+        }
+        while (userTrackHistory.size() > MAX_TRACK_HISTORY_POINTS) {
+            userTrackHistory.remove(0);
+        }
     }
 
     private void clearTrackHistory() {
