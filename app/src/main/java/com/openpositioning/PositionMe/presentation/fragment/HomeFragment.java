@@ -39,7 +39,7 @@ import java.util.List;
  */
 public class HomeFragment extends Fragment {
 
-    private static final long LIVE_PREVIEW_INTERVAL_MS = 1_500L;
+    private static final long LIVE_PREVIEW_INTERVAL_MS = 1_000L;
     private static final double FLOORPLAN_REFRESH_DISTANCE_METERS = 15.0;
 
     private MaterialButton goToInfo;

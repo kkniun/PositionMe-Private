@@ -645,13 +645,14 @@ public class SensorFusion implements SensorEventListener {
         if (indoorFloorController == null) {
             return null;
         }
-        boolean elevatorHint = getElevator()
-                || isNearIndoorFeature(currentPosition, "lift", 3.5);
+        boolean transitionZoneHint = getElevator()
+                || isNearIndoorFeature(currentPosition, "lift", 3.5)
+                || isNearIndoorFeature(currentPosition, "stairs", 3.5);
         Integer resolvedFloor = indoorFloorController.evaluate(
                 currentPosition,
                 state.elevation,
                 getLatLngWifiPositioning() != null ? getWifiFloor() : null,
-                elevatorHint,
+                transitionZoneHint,
                 timestampMillis
         );
         if (resolvedFloor != null && particleFilterEngine != null) {

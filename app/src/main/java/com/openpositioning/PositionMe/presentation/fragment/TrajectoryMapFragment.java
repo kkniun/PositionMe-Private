@@ -73,7 +73,7 @@ public class TrajectoryMapFragment extends Fragment {
     private static final float DIRECTION_MARKER_SIZE_DP = 18f;
     private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
     private static final double CAMERA_RECENTER_DISTANCE_METERS = 4.0;
-    private static final long CAMERA_RECENTER_INTERVAL_MS = 1_500L;
+    private static final long CAMERA_RECENTER_INTERVAL_MS = 1_000L;
     private static final int MAX_TRACK_HISTORY_POINTS = 600;
     private static final double TRACK_APPEND_DISTANCE_METERS = 0.06;
     private static final double TRACK_REPLACE_DISTANCE_METERS = 0.03;
@@ -103,7 +103,7 @@ public class TrajectoryMapFragment extends Fragment {
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
-    private static final long AUTO_FLOOR_CHECK_INTERVAL_MS = 1500;
+    private static final long AUTO_FLOOR_CHECK_INTERVAL_MS = 1000;
     private static final double TAIL_RADIUS_METERS = 0.45;
     private static final int GNSS_TAIL_COLOR = Color.rgb(25, 118, 210);
     private static final int WIFI_TAIL_COLOR = Color.rgb(0, 137, 123);

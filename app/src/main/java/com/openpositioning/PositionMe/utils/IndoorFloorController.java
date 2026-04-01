@@ -68,7 +68,7 @@ public class IndoorFloorController {
     public Integer evaluate(@Nullable LatLng currentPosition,
                             float elevationMeters,
                             @Nullable Integer wifiFloor,
-                            boolean elevatorHint,
+                            boolean transitionZoneHint,
                             long timestampMillis) {
         if (currentPosition == null) {
             return null;
@@ -105,6 +105,11 @@ public class IndoorFloorController {
         float elevationDelta = elevationMeters - anchorElevation;
         int candidateFloor = resolveNextFloor(elevationDelta, floorHeight);
         if (candidateFloor == currentLogicalFloor) {
+            clearPendingCandidate();
+            return null;
+        }
+
+        if (!transitionZoneHint) {
             clearPendingCandidate();
             return null;
         }
