@@ -6,7 +6,8 @@ import androidx.annotation.NonNull;
 import com.google.android.gms.maps.model.LatLng;
 
 /**
- * Indoor floor transition controller driven by WiFi floor seeding and elevation-led switching.
+ * CW2 floor-control module: indoor floor transition controller driven by WiFi seeding and
+ * elevation-led switching.
  *
  * <p>WiFi is used only to confirm the initial floor anchor (or a manual re-anchor). Once the
  * anchor exists, automatic switching is controlled by cumulative elevation change relative to the
@@ -56,6 +57,13 @@ public class IndoorFloorController {
         clearPendingCandidate();
     }
 
+    /**
+     * Evaluates whether the logical floor should change at the current timestamp.
+     *
+     * <p>The controller first tries to confirm an initial floor anchor from WiFi. Once the anchor
+     * exists, later automatic transitions are driven by cumulative elevation change relative to
+     * that anchor, with a short debounce to avoid oscillation around thresholds.</p>
+     */
     @Nullable
     public Integer evaluate(@Nullable LatLng currentPosition,
                             float elevationMeters,
@@ -116,6 +124,10 @@ public class IndoorFloorController {
         return spatialModel.getCurrentLogicalFloor();
     }
 
+    /**
+     * Seeds the starting floor from WiFi only when the same floor has been observed consistently
+     * for a short time window.
+     */
     @Nullable
     private Integer maybeSeedFloorFromWifi(@Nullable Integer normalizedWifiFloor,
                                            @NonNull LatLng currentPosition,
@@ -154,6 +166,9 @@ public class IndoorFloorController {
         return null;
     }
 
+    /**
+     * Converts cumulative elevation change into a logical floor candidate.
+     */
     private int resolveNextFloor(float elevationDelta, float floorHeight) {
         float floorChangeThreshold = Math.max(
                 STRONG_ABSOLUTE_SWITCH_METERS,

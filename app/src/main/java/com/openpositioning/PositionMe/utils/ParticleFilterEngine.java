@@ -14,7 +14,7 @@ import java.util.Map;
 import java.util.Random;
 
 /**
- * Local EN particle-filter tracker used to combine GNSS, WiFi and PDR updates.
+ * CW2 fusion module: a local EN particle filter used to combine GNSS, WiFi and PDR updates.
  *
  * <p>The filter deliberately adapts its noise parameters to the incoming measurements instead of
  * using the design note values verbatim. GNSS accuracy, WiFi floor availability and the actual
@@ -331,7 +331,11 @@ public class ParticleFilterEngine {
     }
 
     /**
-     * Injects a PDR absolute coordinate. The filter internally converts it to a single-step delta.
+     * Injects a PDR absolute coordinate stream.
+     *
+     * <p>The PDR module publishes coordinates in its own relative frame. This method converts the
+     * absolute coordinate sequence into a single motion increment before running the prediction
+     * step, which keeps the filter interface independent from the step detector internals.</p>
      */
     @Nullable
     public synchronized LatLng onPdrAbsolute(float absoluteEast,
@@ -395,6 +399,13 @@ public class ParticleFilterEngine {
         return currentLatLng;
     }
 
+    /**
+     * Handles a new absolute observation from GNSS or WiFi.
+     *
+     * <p>Absolute observations are used both to initialise the filter and to correct drift after
+     * prediction-only motion updates. WiFi observations may also carry floor information, which is
+     * injected into the particle floor hypotheses before the position correction stage.</p>
+     */
     @Nullable
     private LatLng onAbsoluteObservation(LatLng latLng,
                                          ObservationSource source,
@@ -490,6 +501,12 @@ public class ParticleFilterEngine {
         return currentLatLng;
     }
 
+    /**
+     * Nudges particles toward the accepted absolute observation after the weight update.
+     *
+     * <p>This is a pragmatic correction step rather than a pure Bayesian update. It helps the
+     * filter recover faster from drift on phones whose inertial heading is noisy.</p>
+     */
     private void pullParticlesTowardObservation(double observedEasting,
                                                 double observedNorthing,
                                                 double accuracyMeters,
@@ -542,6 +559,12 @@ public class ParticleFilterEngine {
         }
     }
 
+    /**
+     * Applies one motion prediction step using the latest PDR increment.
+     *
+     * <p>Each particle is moved in local EN coordinates and then clipped by the indoor spatial
+     * model so wall crossings are penalised or truncated before the next observation update.</p>
+     */
     private void predict(double stepDistance, double headingRad) {
         double stepNoiseStd = clamp(0.08 + stepDistance * 0.12, 0.08, 0.22);
         double headingNoiseStd = Math.toRadians(stepDistance < 0.4 ? 14.0 : 9.0);
@@ -589,6 +612,13 @@ public class ParticleFilterEngine {
         normalizeWeights();
     }
 
+    /**
+     * Reweights the particle cloud against the latest absolute observation.
+     *
+     * <p>Besides geometric distance, the final weight also includes map-consistency and optional
+     * WiFi-floor likelihood terms. That gives the filter a soft map-matching behaviour instead of
+     * relying only on a final display-time projection.</p>
+     */
     private void updateWeights(double observedEasting,
                                double observedNorthing,
                                double accuracyMeters,
@@ -635,6 +665,12 @@ public class ParticleFilterEngine {
         return sum <= 0d ? 0d : 1d / sum;
     }
 
+    /**
+     * Performs low-variance resampling when the effective particle count collapses.
+     *
+     * <p>A small floor jitter is kept during resampling so the filter can still recover from a
+     * wrong floor hypothesis when later observations provide stronger evidence.</p>
+     */
     private void resample() {
         int count = particles.size();
         double[] cumulative = new double[count];
@@ -695,6 +731,13 @@ public class ParticleFilterEngine {
         );
     }
 
+    /**
+     * Commits the current pose estimate to both the raw state and the display state.
+     *
+     * <p>The raw estimate is the direct particle mean. The display estimate is then passed
+     * through a light planar Kalman smoother so the UI can stay responsive without showing every
+     * high-frequency fluctuation from the particle cloud.</p>
+     */
     private void commitPose(double estimatedEasting,
                             double estimatedNorthing,
                             double estimatedHeadingRad,
@@ -816,6 +859,13 @@ public class ParticleFilterEngine {
         return reference.toLatLng(pose.easting, pose.northing);
     }
 
+    /**
+     * Returns a short-term display pose averaged over the most recent UI window.
+     *
+     * <p>This windowed pose is separate from the raw particle estimate. It fuses recent display
+     * samples and recent absolute fixes so the map view remains stable while still reacting to new
+     * GNSS or WiFi observations.</p>
+     */
     @Nullable
     private DisplayPose getWindowedDisplayPose() {
         if (!hasDisplayPose || reference == null) {

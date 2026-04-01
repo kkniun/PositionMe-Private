@@ -21,7 +21,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Manages indoor floor map display for all supported buildings
+ * CW2 map-matching and rendering module. Manages indoor floor map display for all supported buildings
  * (Nucleus, Library, Murchison). Uses vector shape data from the floorplan API
  * to dynamically draw walls, rooms, and other indoor features on the Google Map.
  * Provides unified floor indexing, floor switching, and building detection.
@@ -276,6 +276,8 @@ public class IndoorMapManager {
         boolean candidateNearWall = distanceToNearestWallMeters(candidateLocation) <= 0.18d;
         if (previousLocation != null) {
             double directDistance = UtilFunctions.distanceBetweenPoints(previousLocation, candidateLocation);
+            // If the direct step is blocked, advance along the best legal detour rather than
+            // freezing the live marker on the wall boundary.
             if (directDistance >= 0.10d
                     && (isBlocked(previousLocation, candidateLocation)
                     || isInsideWall(candidateLocation))) {
@@ -365,6 +367,10 @@ public class IndoorMapManager {
         return routedPath;
     }
 
+    /**
+     * Builds a single display segment between two history points, rerouting through the indoor
+     * graph only when the direct segment is illegal.
+     */
     public List<LatLng> buildLegalDisplaySegment(@Nullable LatLng start, @Nullable LatLng end) {
         if (start == null || end == null) {
             return Collections.emptyList();
@@ -405,6 +411,10 @@ public class IndoorMapManager {
         return false;
     }
 
+    /**
+     * Appends one history segment to the rendered path, replacing wall crossings with a legal
+     * detour whenever the routing graph can provide one.
+     */
     private void appendLegalSegment(List<LatLng> routedPath, LatLng start, LatLng end) {
         if (start == null || end == null) {
             return;
@@ -430,6 +440,12 @@ public class IndoorMapManager {
         }
     }
 
+    /**
+     * Finds the shortest legal connection between two points on the current floor.
+     *
+     * <p>The method snaps both endpoints onto the routing graph and then runs a shortest-path
+     * search, falling back to clipping when the graph cannot provide a valid detour.</p>
+     */
     private List<LatLng> routeShortestLegalPath(LatLng rawStart,
                                                 LatLng rawEnd,
                                                 double directDistance) {

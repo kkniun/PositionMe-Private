@@ -39,7 +39,8 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * The SensorFusion class is the main data gathering and processing class of the application.
+ * CW2 integration hub. SensorFusion is the main data gathering and processing class of the
+ * application and ties together sensing, fusion, floor estimation and map-facing outputs.
  *
  * <p>It follows the singleton design pattern to ensure that every fragment and process has access
  * to the same data and sensor instances. Internally it delegates to specialised modules:</p>
@@ -570,6 +571,9 @@ public class SensorFusion implements SensorEventListener {
 
     /**
      * Applies a post-fusion map correction back into the filter state.
+     *
+     * <p>This is used when the UI or map-matching layer has to clip the displayed position to a
+     * legal indoor point and the particle filter should adopt that correction as its new state.</p>
      */
     public void applyMapConstrainedPosition(LatLng correctedPosition) {
         if (particleFilterEngine != null) {
@@ -584,6 +588,10 @@ public class SensorFusion implements SensorEventListener {
         return particleFilterEngine == null ? 0 : particleFilterEngine.getCurrentLogicalFloor();
     }
 
+    /**
+     * Forces the current logical floor and re-anchors the floor controller to the current
+     * elevation. This is used after a manual floor switch on the UI.
+     */
     public void setCurrentLogicalFloor(int logicalFloor) {
         if (particleFilterEngine != null) {
             particleFilterEngine.setCurrentLogicalFloor(logicalFloor);
@@ -601,6 +609,13 @@ public class SensorFusion implements SensorEventListener {
         return particleFilterEngine == null ? "0" : particleFilterEngine.getCurrentFloorDisplayName();
     }
 
+    /**
+     * Returns the floor that should currently be displayed on the map.
+     *
+     * <p>Before the floor controller confirms an elevation anchor, WiFi floor observations are
+     * allowed to drive the displayed floor so the map can show a plausible start floor earlier.
+     * After anchoring, the fused floor becomes authoritative.</p>
+     */
     public int getPreferredDisplayLogicalFloor() {
         int fusedFloor = getCurrentLogicalFloor();
         if (indoorFloorController != null && indoorFloorController.hasConfirmedAnchor()) {
@@ -622,6 +637,10 @@ public class SensorFusion implements SensorEventListener {
         return particleFilterEngine != null && particleFilterEngine.isIndoorContextActive();
     }
 
+    /**
+     * Runs the indoor floor controller and propagates any accepted floor change back to the
+     * particle filter.
+     */
     public Integer evaluateIndoorFloorChange(LatLng currentPosition, long timestampMillis) {
         if (indoorFloorController == null) {
             return null;
@@ -776,7 +795,11 @@ public class SensorFusion implements SensorEventListener {
     }
 
     /**
-     * Getter function for device orientation.
+     * Returns the orientation that should be exposed to the map layer.
+     *
+     * <p>When the particle filter has a reliable motion heading, that heading is preferred. When
+     * motion heading is weak, the method falls back to the raw sensor orientation so the UI can
+     * still react while the user rotates in place.</p>
      *
      * @return orientation of device in radians.
      */

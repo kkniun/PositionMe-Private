@@ -10,7 +10,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Core indoor spatial model shared by fusion, map matching and floor control.
+ * CW2 shared spatial model used by fusion, map matching and floor control.
  *
  * <p>This class is intentionally independent from GoogleMap rendering. It only works with cached
  * floorplan geometry and provides geometry queries needed by the particle filter and floor logic.</p>
@@ -27,6 +27,12 @@ public class IndoorSpatialConstraintModel {
         currentLogicalFloor = 0;
     }
 
+    /**
+     * Updates the active building context from a geographic position.
+     *
+     * <p>When the user enters a different building polygon, the logical floor is reset to that
+     * building's default floor so later modules start from a valid indoor context.</p>
+     */
     public void updatePosition(@Nullable LatLng position) {
         if (position == null) {
             return;
@@ -93,6 +99,12 @@ public class IndoorSpatialConstraintModel {
         return normalizeExternalFloorObservation(currentBuildingId, observedFloor);
     }
 
+    /**
+     * Normalises an external floor observation to the app's logical floor convention.
+     *
+     * <p>This compensates for APIs that encode floors as shifted indices, for example when
+     * lower-ground and ground floors are offset by one.</p>
+     */
     public int normalizeExternalFloorObservation(@Nullable String buildingId, int observedFloor) {
         Integer exactIndex = findFloorIndexByLogicalFloor(buildingId, observedFloor);
         if (exactIndex != null) {
@@ -180,6 +192,12 @@ public class IndoorSpatialConstraintModel {
         return constrainMotion(previous, candidate, currentBuildingId, currentLogicalFloor);
     }
 
+    /**
+     * Constrains a motion segment against the active floor geometry.
+     *
+     * <p>If a segment crosses a wall, the motion is clipped to the last legal point and its
+     * returned weight is reduced so the particle filter can penalise impossible movement.</p>
+     */
     public ConstraintResult constrainMotion(@Nullable LatLng previous,
                                             @Nullable LatLng candidate,
                                             @Nullable String buildingId,
@@ -226,6 +244,12 @@ public class IndoorSpatialConstraintModel {
         return scorePoint(point, currentBuildingId, currentLogicalFloor);
     }
 
+    /**
+     * Scores how plausible a point is on the requested building/floor geometry.
+     *
+     * <p>Walkable points retain a high score, while points that land inside walls or outside the
+     * expected indoor envelope are down-weighted for fusion and map matching.</p>
+     */
     public double scorePoint(@Nullable LatLng point,
                              @Nullable String buildingId,
                              int logicalFloor) {
@@ -233,6 +257,9 @@ public class IndoorSpatialConstraintModel {
         return scorePoint(point, buildingId, logicalFloor, floor);
     }
 
+    /**
+     * Infers the most likely building from the current position.
+     */
     @Nullable
     public String inferBuildingId(@Nullable LatLng position) {
         if (position == null) {

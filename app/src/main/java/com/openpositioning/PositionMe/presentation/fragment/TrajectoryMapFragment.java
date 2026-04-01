@@ -45,7 +45,10 @@ import java.util.Map;
 
 
 /**
- * A fragment responsible for displaying a trajectory map using Google Maps.
+ * CW2 display module for the indoor map. This fragment renders the fused user position, live
+ * heading, observation tails and per-floor track history on top of Google Maps.
+ *
+ * <p>A fragment responsible for displaying a trajectory map using Google Maps.
  * <p>
  * The TrajectoryMapFragment provides a map interface for visualizing movement trajectories,
  * GNSS tracking, and indoor mapping. It manages map settings, user interactions, and real-time
@@ -297,12 +300,21 @@ public class TrajectoryMapFragment extends Fragment {
      * @param newLocation The new location to plot.
      * @param orientation The user’s heading (e.g. from sensor fusion).
      */
+    /**
+     * Updates the live user marker and the visible track on the map.
+     *
+     * <p>The raw fused position is first constrained by the indoor map, then the display heading
+     * is resolved, and finally the floor-specific track history is updated. This keeps the
+     * rendered marker responsive while still respecting map-matching constraints.</p>
+     */
     public LatLng updateUserLocation(@NonNull LatLng newLocation, float orientation) {
         if (gMap == null) return newLocation;
 
         LatLng oldLocation = this.currentLocation;
         LatLng displayLocation = newLocation;
         if (indoorMapManager != null) {
+            // Update building/floor context from the fused point before clipping the visible
+            // marker to legal indoor space.
             indoorMapManager.setCurrentLocation(newLocation);
             syncDisplayedFloor();
             syncActiveTrackFloorWithDisplayedFloor();
@@ -415,6 +427,13 @@ public class TrajectoryMapFragment extends Fragment {
         return isGnssOn;
     }
 
+    /**
+     * Synchronises the rendered track container with the fusion lifecycle.
+     *
+     * <p>The actual visible history is maintained locally in this fragment so it can be split per
+     * floor and rerouted around walls. The fusion history is therefore only used as a reset signal
+     * when a session restarts.</p>
+     */
     public void renderFusedHistory(@Nullable List<LatLng> fusedHistory) {
         if (polyline == null) return;
         if (fusedHistory == null) {
@@ -427,6 +446,9 @@ public class TrajectoryMapFragment extends Fragment {
         }
     }
 
+    /**
+     * Renders the recent GNSS, WiFi and PDR observation dots used for debugging and validation.
+     */
     public void renderObservationTails(@Nullable List<LatLng> gnssTrail,
                                        @Nullable List<LatLng> wifiTrail,
                                        @Nullable List<LatLng> pdrTrail) {
@@ -629,6 +651,9 @@ public class TrajectoryMapFragment extends Fragment {
         }
     }
 
+    /**
+     * Aligns the map floor with the best floor estimate currently exposed by SensorFusion.
+     */
     private void syncDisplayedFloor() {
         if (sensorFusion == null || indoorMapManager == null) {
             return;
@@ -696,6 +721,13 @@ public class TrajectoryMapFragment extends Fragment {
         return Bitmap.createScaledBitmap(base, sizePx, sizePx, true);
     }
 
+    /**
+     * Resolves the marker direction shown on the map.
+     *
+     * <p>Movement direction takes priority whenever there is enough displacement between two
+     * rendered locations. Sensor orientation is only used as a fallback when movement direction is
+     * not observable yet.</p>
+     */
     private float resolveDisplayDirection(@Nullable LatLng previousLocation,
                                           @NonNull LatLng currentLocation,
                                           float fallbackOrientationDegrees) {
@@ -734,6 +766,12 @@ public class TrajectoryMapFragment extends Fragment {
         return value;
     }
 
+    /**
+     * Updates the per-floor user history that drives the rendered red trajectory line.
+     *
+     * <p>Very small position changes replace the last point instead of extending the path, while
+     * larger movements append either a direct point or a routed multi-point detour around walls.</p>
+     */
     private void updateTrackHistory(@NonNull LatLng location) {
         if (polyline == null) {
             return;
@@ -818,6 +856,10 @@ public class TrajectoryMapFragment extends Fragment {
         }
     }
 
+    /**
+     * Rebuilds the visible track polyline from the active floor history and reroutes it through
+     * legal map segments when needed.
+     */
     private void refreshDisplayedTrackPolyline() {
         if (polyline == null) {
             return;
@@ -834,6 +876,9 @@ public class TrajectoryMapFragment extends Fragment {
         return userTrackHistoryByFloor.computeIfAbsent(floorKey, ignored -> new ArrayList<>());
     }
 
+    /**
+     * Switches the active local history buffer to the floor currently shown on the map.
+     */
     private void syncActiveTrackFloorWithDisplayedFloor() {
         if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
             return;
