@@ -705,7 +705,24 @@ public class TrajectoryMapFragment extends Fragment {
             applyDisplayedFloor(sensorFusion.getPreferredDisplayLogicalFloor(), false, false);
             return;
         }
+        if (!hasCommittedDisplayFloorSync) {
+            alignDisplayedFloorImmediately(decision);
+        }
         maybeApplyDisplayFloorDecision(decision, SystemClock.elapsedRealtime());
+    }
+
+    private void alignDisplayedFloorImmediately(@NonNull FloorDisplaySyncPolicy.Decision decision) {
+        if (indoorMapManager == null || !indoorMapManager.getIsIndoorMapSet()) {
+            return;
+        }
+        if (indoorMapManager.getCurrentLogicalFloor() == decision.getLogicalFloor()) {
+            return;
+        }
+
+        // 首次同步时先修正地图显示层，避免右下角长时间停留在默认 GF。
+        indoorMapManager.setCurrentFloor(decision.getLogicalFloor(), true);
+        syncActiveTrackFloorWithDisplayedFloor();
+        updateFloorLabel();
     }
 
     @Nullable
