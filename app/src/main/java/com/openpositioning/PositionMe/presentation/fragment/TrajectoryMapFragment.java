@@ -700,11 +700,6 @@ public class TrajectoryMapFragment extends Fragment {
     private float resolveDisplayDirection(@Nullable LatLng previousLocation,
                                           @NonNull LatLng currentLocation,
                                           float fallbackOrientationDegrees) {
-        if (!Float.isNaN(fallbackOrientationDegrees)) {
-            lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
-            return lastDirectionDegrees;
-        }
-
         if (previousLocation != null
                 && UtilFunctions.distanceBetweenPoints(previousLocation, currentLocation)
                 >= MIN_DIRECTION_DISTANCE_METERS) {
@@ -712,7 +707,17 @@ public class TrajectoryMapFragment extends Fragment {
             return lastDirectionDegrees;
         }
 
+        if (!Float.isNaN(fallbackOrientationDegrees) && directionMarker == null) {
+            lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
+            return lastDirectionDegrees;
+        }
+
         if (directionMarker != null) {
+            return lastDirectionDegrees;
+        }
+
+        if (!Float.isNaN(fallbackOrientationDegrees)) {
+            lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
             return lastDirectionDegrees;
         }
 
