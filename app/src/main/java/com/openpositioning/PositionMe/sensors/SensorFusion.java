@@ -607,8 +607,9 @@ public class SensorFusion implements SensorEventListener {
             return fusedFloor;
         }
 
-        if (getLatLngWifiPositioning() != null) {
-            return getWifiFloor();
+        Integer wifiDisplayFloor = getImmediateWifiDisplayFloor();
+        if (wifiDisplayFloor != null) {
+            return wifiDisplayFloor;
         }
         return fusedFloor;
     }
@@ -904,12 +905,52 @@ public class SensorFusion implements SensorEventListener {
                     contextPosition = new LatLng(gnssPosition[0], gnssPosition[1]);
                 }
             }
+            String buildingId = null;
             if (contextPosition != null) {
                 indoorSpatialConstraintModel.updatePosition(contextPosition);
+                buildingId = indoorSpatialConstraintModel.getCurrentBuildingId();
+            }
+            if (buildingId == null || buildingId.isEmpty()) {
+                buildingId = getSelectedBuildingId();
+            }
+            if ((buildingId == null || buildingId.isEmpty()) && contextPosition != null) {
+                buildingId = indoorSpatialConstraintModel.inferBuildingId(contextPosition);
+            }
+            if (buildingId != null && !buildingId.isEmpty()) {
+                return indoorSpatialConstraintModel.normalizeExternalFloorObservation(
+                        buildingId,
+                        observedFloor
+                );
             }
             return indoorSpatialConstraintModel.normalizeExternalFloorObservation(observedFloor);
         }
         return observedFloor;
+    }
+
+    @Nullable
+    private Integer getImmediateWifiDisplayFloor() {
+        LatLng wifiPosition = getLatLngWifiPositioning();
+        String buildingId = getSelectedBuildingId();
+        if ((buildingId == null || buildingId.isEmpty()) && wifiPosition != null
+                && indoorSpatialConstraintModel != null) {
+            buildingId = indoorSpatialConstraintModel.inferBuildingId(wifiPosition);
+        }
+
+        if (wifiPosition == null && (buildingId == null || buildingId.isEmpty())) {
+            return null;
+        }
+
+        int observedFloor = wifiPositionManager.getWifiFloor();
+        if (indoorSpatialConstraintModel == null) {
+            return observedFloor;
+        }
+        if (buildingId != null && !buildingId.isEmpty()) {
+            return indoorSpatialConstraintModel.normalizeExternalFloorObservation(
+                    buildingId,
+                    observedFloor
+            );
+        }
+        return indoorSpatialConstraintModel.normalizeExternalFloorObservation(observedFloor);
     }
 
     /**

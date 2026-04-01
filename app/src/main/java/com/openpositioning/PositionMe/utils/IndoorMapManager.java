@@ -68,20 +68,20 @@ public class IndoorMapManager {
     private static final int LIFT_STROKE = Color.argb(220, 0, 137, 123);
     private static final int LIFT_FILL = Color.argb(70, 0, 137, 123);
     private static final int DEFAULT_STROKE = Color.argb(150, 100, 100, 100);
-    private static final double ROUTE_NODE_SNAP_METERS = 4.8;
-    private static final double MAX_ROUTE_EDGE_METERS = 20.0;
-    private static final double MAX_ROUTE_ENDPOINT_EDGE_METERS = 16.0;
+    private static final double ROUTE_NODE_SNAP_METERS = 5.5;
+    private static final double MAX_ROUTE_EDGE_METERS = 22.0;
+    private static final double MAX_ROUTE_ENDPOINT_EDGE_METERS = 18.0;
     private static final double MAX_ROUTABLE_SEGMENT_METERS = 12.0;
-    private static final double MAX_ROUTE_DETOUR_FACTOR = 2.8;
-    private static final double MAX_ROUTE_DETOUR_METERS = 22.0;
+    private static final double MAX_ROUTE_DETOUR_FACTOR = 3.2;
+    private static final double MAX_ROUTE_DETOUR_METERS = 30.0;
     private static final double INTERIOR_NODE_PULL_RATIO = 0.28;
     private static final double WALL_PROJECTION_MAX_METERS = 6.0;
     private static final double WALL_EXIT_OFFSET_METERS = 0.12;
     private static final double LIVE_ROUTE_PROGRESS_MIN_METERS = 0.45;
     private static final double LIVE_ROUTE_PROGRESS_GAIN = 1.35;
     private static final double WALL_BLOCK_SAMPLE_SPACING_METERS = 0.6;
-    private static final double ROUTE_NODE_SAMPLE_SPACING_METERS = 4.0;
-    private static final double WALL_ADJACENT_OFFSET_METERS = 0.45;
+    private static final double ROUTE_NODE_SAMPLE_SPACING_METERS = 2.6;
+    private static final double WALL_ADJACENT_OFFSET_METERS = 0.55;
     private static final int MAX_ROUTE_NODE_COUNT = 420;
 
     private int cachedRouteBuilding = BUILDING_NONE;
