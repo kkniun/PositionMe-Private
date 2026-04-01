@@ -273,13 +273,14 @@ public class IndoorMapManager {
             return candidateLocation;
         }
 
-        boolean candidateNearWall = distanceToNearestWallMeters(candidateLocation) <= 0.18d;
+        if (!isInsideWall(candidateLocation)) {
+            return candidateLocation;
+        }
+
+        LatLng corrected = candidateLocation;
         if (previousLocation != null) {
             double directDistance = UtilFunctions.distanceBetweenPoints(previousLocation, candidateLocation);
-            if (directDistance >= 0.10d
-                    && (isBlocked(previousLocation, candidateLocation)
-                    || isInsideWall(candidateLocation)
-                    || candidateNearWall)) {
+            if (directDistance >= 0.10d) {
                 List<LatLng> detour = routeShortestLegalPath(previousLocation, candidateLocation, directDistance);
                 if (detour.size() >= 2) {
                     LatLng progressed = advanceAlongPath(
@@ -287,14 +288,13 @@ public class IndoorMapManager {
                             Math.max(LIVE_ROUTE_PROGRESS_MIN_METERS, directDistance * LIVE_ROUTE_PROGRESS_GAIN)
                     );
                     if (progressed != null && !isInsideWall(progressed)) {
-                        return progressed;
+                        corrected = progressed;
                     }
                 }
             }
         }
 
-        LatLng corrected = candidateLocation;
-        if (isInsideWall(corrected) || candidateNearWall) {
+        if (isInsideWall(corrected)) {
             LatLng projected = projectToNearestWallBoundary(candidateLocation);
             if (projected != null) {
                 corrected = projected;

@@ -76,6 +76,7 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double TRACK_REPLACE_DISTANCE_METERS = 0.03;
     private static final double MAX_TRACK_APPEND_DISTANCE_METERS = 6.0;
     private static final double TRACK_SEGMENT_INTERPOLATION_METERS = 3.0;
+    private static final int TRACK_APPEND_EVERY_N_UPDATES = 2;
     private GoogleMap gMap; // Google Maps instance
     private LatLng currentLocation; // Stores the user's current location
     private Marker directionMarker; // Current user direction arrow
@@ -98,6 +99,7 @@ public class TrajectoryMapFragment extends Fragment {
     private long lastCameraUpdateMs;
     private final Map<Integer, List<LatLng>> userTrackHistoryByFloor = new HashMap<>();
     private int activeTrackFloor = Integer.MIN_VALUE;
+    private int trackUpdatesSinceAppend;
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
@@ -483,6 +485,7 @@ public class TrajectoryMapFragment extends Fragment {
         lastCameraUpdateMs = 0L;
         userTrackHistoryByFloor.clear();
         activeTrackFloor = Integer.MIN_VALUE;
+        trackUpdatesSinceAppend = 0;
 
         // Clear test point markers
         for (com.google.android.gms.maps.model.Marker m : testPointMarkers) {
@@ -744,6 +747,7 @@ public class TrajectoryMapFragment extends Fragment {
 
         if (userTrackHistory.isEmpty()) {
             userTrackHistory.add(location);
+            trackUpdatesSinceAppend = 0;
             refreshDisplayedTrackPolyline();
             return;
         }
@@ -758,9 +762,20 @@ public class TrajectoryMapFragment extends Fragment {
             return;
         }
 
+        if (distanceMeters >= TRACK_APPEND_DISTANCE_METERS) {
+            trackUpdatesSinceAppend++;
+        }
+
+        if (distanceMeters <= MAX_TRACK_APPEND_DISTANCE_METERS
+                && distanceMeters >= TRACK_APPEND_DISTANCE_METERS
+                && trackUpdatesSinceAppend < TRACK_APPEND_EVERY_N_UPDATES) {
+            return;
+        }
+
         if (distanceMeters <= MAX_TRACK_APPEND_DISTANCE_METERS
                 && distanceMeters >= TRACK_APPEND_DISTANCE_METERS) {
             userTrackHistory.add(location);
+            trackUpdatesSinceAppend = 0;
             while (userTrackHistory.size() > MAX_TRACK_HISTORY_POINTS) {
                 userTrackHistory.remove(0);
             }
@@ -769,6 +784,7 @@ public class TrajectoryMapFragment extends Fragment {
         }
 
         appendInterpolatedTrackPoints(userTrackHistory, lastPoint, location, distanceMeters);
+        trackUpdatesSinceAppend = 0;
         refreshDisplayedTrackPolyline();
     }
 
@@ -793,6 +809,7 @@ public class TrajectoryMapFragment extends Fragment {
     private void clearTrackHistory() {
         userTrackHistoryByFloor.clear();
         activeTrackFloor = Integer.MIN_VALUE;
+        trackUpdatesSinceAppend = 0;
         if (polyline != null) {
             polyline.setPoints(Collections.emptyList());
         }
@@ -823,6 +840,7 @@ public class TrajectoryMapFragment extends Fragment {
             return;
         }
         activeTrackFloor = displayedFloor;
+        trackUpdatesSinceAppend = 0;
         refreshDisplayedTrackPolyline();
         clearCircles(gnssTailCircles);
         clearCircles(wifiTailCircles);
