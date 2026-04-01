@@ -69,6 +69,11 @@ public class TrajectoryMapFragment extends Fragment {
 
     private static final float DIRECTION_MARKER_SIZE_DP = 18f;
     private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
+    private static final double TRACK_DIRECTION_LOOKBACK_METERS = 0.9;
+    private static final long RECENT_STEP_MOTION_WINDOW_MS = 1_800L;
+    private static final double STATIONARY_FREEZE_DISTANCE_METERS = 0.45;
+    private static final double STATIONARY_ALLOWED_DRIFT_METERS_PER_SECOND = 0.35;
+    private static final double STATIONARY_MAX_JUMP_METERS = 0.8;
     private static final double MAX_DISPLAY_SPEED_METERS_PER_SECOND = 2.6;
     private static final double MAX_DISPLAY_JUMP_METERS = 3.0;
     private static final double CAMERA_RECENTER_DISTANCE_METERS = 4.0;
@@ -305,7 +310,14 @@ public class TrajectoryMapFragment extends Fragment {
 
         LatLng oldLocation = this.currentLocation;
         long nowRealtime = SystemClock.elapsedRealtime();
-        LatLng rateLimitedLocation = limitDisplayedMotion(oldLocation, newLocation, nowRealtime);
+        boolean recentStepMotion = sensorFusion != null
+                && sensorFusion.hasRecentStepMotion(RECENT_STEP_MOTION_WINDOW_MS);
+        LatLng rateLimitedLocation = limitDisplayedMotion(
+                oldLocation,
+                newLocation,
+                nowRealtime,
+                recentStepMotion
+        );
         LatLng displayLocation = rateLimitedLocation;
         if (indoorMapManager != null) {
             indoorMapManager.setCurrentLocation(rateLimitedLocation);
@@ -316,7 +328,12 @@ public class TrajectoryMapFragment extends Fragment {
             indoorMapManager.setCurrentLocation(displayLocation);
         }
 
-        float resolvedDirection = resolveDisplayDirection(oldLocation, displayLocation, orientation);
+        float resolvedDirection = resolveDisplayDirection(
+                oldLocation,
+                displayLocation,
+                orientation,
+                recentStepMotion
+        );
         boolean insignificantMove = oldLocation != null
                 && UtilFunctions.distanceBetweenPoints(oldLocation, displayLocation) < 0.18;
         boolean insignificantRotation = directionMarker != null
@@ -325,7 +342,7 @@ public class TrajectoryMapFragment extends Fragment {
         this.lastLocationUpdateRealtimeMs = nowRealtime;
 
         if (insignificantMove && insignificantRotation) {
-            updateTrackHistory(displayLocation);
+            updateTrackHistory(displayLocation, recentStepMotion);
             return displayLocation;
         }
 
@@ -347,29 +364,30 @@ public class TrajectoryMapFragment extends Fragment {
             }
         }
 
-        updateTrackHistory(displayLocation);
+        updateTrackHistory(displayLocation, recentStepMotion);
         return displayLocation;
     }
 
     private LatLng limitDisplayedMotion(@Nullable LatLng previousLocation,
                                         @NonNull LatLng candidateLocation,
-                                        long nowRealtime) {
+                                        long nowRealtime,
+                                        boolean recentStepMotion) {
         if (previousLocation == null) {
             return candidateLocation;
         }
 
         double distanceMeters = UtilFunctions.distanceBetweenPoints(previousLocation, candidateLocation);
-        if (distanceMeters <= MAX_DISPLAY_JUMP_METERS) {
-            return candidateLocation;
-        }
-
         double elapsedSeconds = lastLocationUpdateRealtimeMs > 0L
                 ? Math.max(0.75d, Math.min(1.25d, (nowRealtime - lastLocationUpdateRealtimeMs) / 1000d))
                 : 1.0d;
-        double allowedDistance = Math.min(
-                MAX_DISPLAY_JUMP_METERS,
-                MAX_DISPLAY_SPEED_METERS_PER_SECOND * elapsedSeconds
-        );
+
+        if (!recentStepMotion && distanceMeters <= STATIONARY_FREEZE_DISTANCE_METERS) {
+            return previousLocation;
+        }
+
+        double allowedDistance = recentStepMotion
+                ? Math.min(MAX_DISPLAY_JUMP_METERS, MAX_DISPLAY_SPEED_METERS_PER_SECOND * elapsedSeconds)
+                : Math.min(STATIONARY_MAX_JUMP_METERS, STATIONARY_ALLOWED_DRIFT_METERS_PER_SECOND * elapsedSeconds);
         if (distanceMeters <= allowedDistance || distanceMeters <= 1e-3d) {
             return candidateLocation;
         }
@@ -707,23 +725,6 @@ public class TrajectoryMapFragment extends Fragment {
         directionMarker.setRotation(directionDegrees);
     }
 
-    private void updateDirectionFromHistory(@Nullable List<LatLng> fusedHistory) {
-        if (fusedHistory == null || fusedHistory.size() < 2 || directionMarker == null) {
-            return;
-        }
-
-        LatLng last = fusedHistory.get(fusedHistory.size() - 1);
-        for (int i = fusedHistory.size() - 2; i >= 0; i--) {
-            LatLng candidate = fusedHistory.get(i);
-            if (UtilFunctions.distanceBetweenPoints(candidate, last) >= MIN_DIRECTION_DISTANCE_METERS) {
-                float trackDirection = computeHeadingDegrees(candidate, last);
-                lastDirectionDegrees = trackDirection;
-                directionMarker.setRotation(trackDirection);
-                return;
-            }
-        }
-    }
-
     private Bitmap getDirectionBitmap() {
         Bitmap base = UtilFunctions.getBitmapFromVector(requireContext(), R.drawable.ic_baseline_navigation_24);
         int sizePx = Math.max(18, Math.round(
@@ -734,12 +735,33 @@ public class TrajectoryMapFragment extends Fragment {
 
     private float resolveDisplayDirection(@Nullable LatLng previousLocation,
                                           @NonNull LatLng currentLocation,
-                                          float fallbackOrientationDegrees) {
-        if (previousLocation != null
-                && UtilFunctions.distanceBetweenPoints(previousLocation, currentLocation)
-                >= MIN_DIRECTION_DISTANCE_METERS) {
-            lastDirectionDegrees = computeHeadingDegrees(previousLocation, currentLocation);
+                                          float fallbackOrientationDegrees,
+                                          boolean recentStepMotion) {
+        if (!recentStepMotion && !Float.isNaN(fallbackOrientationDegrees)) {
+            lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
             return lastDirectionDegrees;
+        }
+
+        if (recentStepMotion) {
+            float historyDirection = resolveDirectionFromRecentTrack(currentLocation);
+            if (!Float.isNaN(historyDirection)) {
+                lastDirectionDegrees = historyDirection;
+                return lastDirectionDegrees;
+            }
+
+            if (sensorFusion != null
+                    && sensorFusion.hasReliableMotionHeading()
+                    && !Float.isNaN(fallbackOrientationDegrees)) {
+                lastDirectionDegrees = normalizeDegrees(fallbackOrientationDegrees);
+                return lastDirectionDegrees;
+            }
+
+            if (previousLocation != null
+                    && UtilFunctions.distanceBetweenPoints(previousLocation, currentLocation)
+                    >= MIN_DIRECTION_DISTANCE_METERS) {
+                lastDirectionDegrees = computeHeadingDegrees(previousLocation, currentLocation);
+                return lastDirectionDegrees;
+            }
         }
 
         if (!Float.isNaN(fallbackOrientationDegrees)) {
@@ -752,6 +774,27 @@ public class TrajectoryMapFragment extends Fragment {
         }
 
         return lastDirectionDegrees;
+    }
+
+    private float resolveDirectionFromRecentTrack(@NonNull LatLng currentLocation) {
+        List<LatLng> userTrackHistory = getActiveTrackHistory();
+        if (userTrackHistory.isEmpty()) {
+            return Float.NaN;
+        }
+
+        double cumulativeDistanceMeters = 0d;
+        LatLng segmentEnd = currentLocation;
+        for (int i = userTrackHistory.size() - 1; i >= 0; i--) {
+            LatLng candidate = userTrackHistory.get(i);
+            cumulativeDistanceMeters += UtilFunctions.distanceBetweenPoints(candidate, segmentEnd);
+            if (cumulativeDistanceMeters >= TRACK_DIRECTION_LOOKBACK_METERS
+                    && UtilFunctions.distanceBetweenPoints(candidate, currentLocation)
+                    >= MIN_DIRECTION_DISTANCE_METERS) {
+                return computeHeadingDegrees(candidate, currentLocation);
+            }
+            segmentEnd = candidate;
+        }
+        return Float.NaN;
     }
 
     private float computeHeadingDegrees(@NonNull LatLng from, @NonNull LatLng to) {
@@ -770,7 +813,7 @@ public class TrajectoryMapFragment extends Fragment {
         return value;
     }
 
-    private void updateTrackHistory(@NonNull LatLng location) {
+    private void updateTrackHistory(@NonNull LatLng location, boolean recentStepMotion) {
         if (polyline == null) {
             return;
         }
@@ -791,6 +834,12 @@ public class TrajectoryMapFragment extends Fragment {
         double distanceMeters = !routedSegment.isEmpty()
                 ? computePathDistanceMeters(routedSegment)
                 : UtilFunctions.distanceBetweenPoints(lastPoint, location);
+
+        if (!recentStepMotion) {
+            userTrackHistory.set(lastIndex, location);
+            refreshDisplayedTrackPolyline();
+            return;
+        }
 
         if (distanceMeters <= TRACK_REPLACE_DISTANCE_METERS) {
             userTrackHistory.set(lastIndex, location);

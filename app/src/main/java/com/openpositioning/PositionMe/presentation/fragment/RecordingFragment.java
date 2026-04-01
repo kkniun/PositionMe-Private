@@ -66,6 +66,9 @@ import android.widget.Toast;
 public class RecordingFragment extends Fragment {
 
     private static final long UI_REFRESH_INTERVAL_MS = 1_000L;
+    private static final long RECENT_STEP_MOTION_WINDOW_MS = 1_800L;
+    private static final double MIN_DISTANCE_ACCUMULATION_METERS = 0.10;
+    private static final double MAX_DISTANCE_ACCUMULATION_METERS = 3.0;
 
     // UI elements
     private MaterialButton completeButton, cancelButton;
@@ -273,10 +276,15 @@ public class RecordingFragment extends Fragment {
             );
             if (displayedLocation != null) {
                 if (previousDisplayedLocation != null) {
-                    distance += UtilFunctions.distanceBetweenPoints(
+                    double movedMeters = UtilFunctions.distanceBetweenPoints(
                             previousDisplayedLocation,
                             displayedLocation
                     );
+                    if (sensorFusion.hasRecentStepMotion(RECENT_STEP_MOTION_WINDOW_MS)
+                            && movedMeters >= MIN_DISTANCE_ACCUMULATION_METERS
+                            && movedMeters <= MAX_DISTANCE_ACCUMULATION_METERS) {
+                        distance += movedMeters;
+                    }
                 }
                 previousDisplayedLocation = displayedLocation;
             }

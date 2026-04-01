@@ -253,6 +253,7 @@ public class SensorEventHandler {
      */
     void resetBootTime(long newBootTime) {
         this.bootTime = newBootTime;
+        lastStepTime = 0L;
         lastGnssCalibrationPosition = null;
         lastGnssCalibrationTimestampMs = 0L;
         lastWifiCalibrationPosition = null;
@@ -261,6 +262,11 @@ public class SensorEventHandler {
         relativeHeadingRad = Float.NaN;
         headingOffsetRad = Float.NaN;
         stabilizedHeadingRad = Float.NaN;
+    }
+
+    public boolean hasRecentStepMotion(long windowMillis) {
+        return lastStepTime > 0L
+                && System.currentTimeMillis() - lastStepTime <= Math.max(0L, windowMillis);
     }
 
     public void updateHeadingCalibrationFromGnss(Location location) {

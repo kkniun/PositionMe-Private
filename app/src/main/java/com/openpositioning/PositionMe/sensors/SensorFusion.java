@@ -792,6 +792,14 @@ public class SensorFusion implements SensorEventListener {
         return state.orientation[0];
     }
 
+    public boolean hasRecentStepMotion(long windowMillis) {
+        return eventHandler != null && eventHandler.hasRecentStepMotion(windowMillis);
+    }
+
+    public boolean hasReliableMotionHeading() {
+        return particleFilterEngine != null && particleFilterEngine.hasReliableMotionHeading();
+    }
+
     /**
      * Return most recent sensor readings.
      *
