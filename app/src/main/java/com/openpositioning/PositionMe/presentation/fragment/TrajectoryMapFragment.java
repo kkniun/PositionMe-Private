@@ -700,15 +700,31 @@ public class TrajectoryMapFragment extends Fragment {
             return;
         }
 
+        alignMapFloorToPreferredDisplayFloor();
+
         FloorDisplaySyncPolicy.Decision decision = resolveDisplayFloorDecision(probeLocation);
         if (decision == null) {
-            applyDisplayedFloor(sensorFusion.getPreferredDisplayLogicalFloor(), false, false);
             return;
         }
         if (!hasCommittedDisplayFloorSync) {
             alignDisplayedFloorImmediately(decision);
         }
         maybeApplyDisplayFloorDecision(decision, SystemClock.elapsedRealtime());
+    }
+
+    private void alignMapFloorToPreferredDisplayFloor() {
+        if (sensorFusion == null || indoorMapManager == null) {
+            return;
+        }
+        int preferredDisplayFloor = sensorFusion.getPreferredDisplayLogicalFloor();
+        if (indoorMapManager.getCurrentLogicalFloor() == preferredDisplayFloor) {
+            return;
+        }
+
+        // 地图显示层要跟随融合层选出的 display floor，避免 UI 长时间卡在 GF。
+        indoorMapManager.setCurrentFloor(preferredDisplayFloor, true);
+        syncActiveTrackFloorWithDisplayedFloor();
+        updateFloorLabel();
     }
 
     private void alignDisplayedFloorImmediately(@NonNull FloorDisplaySyncPolicy.Decision decision) {
