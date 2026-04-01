@@ -68,20 +68,21 @@ public class IndoorMapManager {
     private static final int LIFT_STROKE = Color.argb(220, 0, 137, 123);
     private static final int LIFT_FILL = Color.argb(70, 0, 137, 123);
     private static final int DEFAULT_STROKE = Color.argb(150, 100, 100, 100);
-    private static final double ROUTE_NODE_SNAP_METERS = 5.5;
-    private static final double MAX_ROUTE_EDGE_METERS = 22.0;
-    private static final double MAX_ROUTE_ENDPOINT_EDGE_METERS = 18.0;
+    private static final double ROUTE_NODE_SNAP_METERS = 4.8;
+    private static final double MAX_ROUTE_EDGE_METERS = 20.0;
+    private static final double MAX_ROUTE_ENDPOINT_EDGE_METERS = 16.0;
     private static final double MAX_ROUTABLE_SEGMENT_METERS = 12.0;
-    private static final double MAX_ROUTE_DETOUR_FACTOR = 3.2;
-    private static final double MAX_ROUTE_DETOUR_METERS = 30.0;
+    private static final double MAX_ROUTE_DETOUR_FACTOR = 2.8;
+    private static final double MAX_ROUTE_DETOUR_METERS = 22.0;
     private static final double INTERIOR_NODE_PULL_RATIO = 0.28;
     private static final double WALL_PROJECTION_MAX_METERS = 6.0;
     private static final double WALL_EXIT_OFFSET_METERS = 0.12;
     private static final double LIVE_ROUTE_PROGRESS_MIN_METERS = 0.45;
     private static final double LIVE_ROUTE_PROGRESS_GAIN = 1.35;
     private static final double WALL_BLOCK_SAMPLE_SPACING_METERS = 0.6;
-    private static final double ROUTE_NODE_SAMPLE_SPACING_METERS = 2.2;
-    private static final double WALL_ADJACENT_OFFSET_METERS = 0.55;
+    private static final double ROUTE_NODE_SAMPLE_SPACING_METERS = 4.0;
+    private static final double WALL_ADJACENT_OFFSET_METERS = 0.45;
+    private static final int MAX_ROUTE_NODE_COUNT = 420;
 
     private int cachedRouteBuilding = BUILDING_NONE;
     private int cachedRouteFloor = Integer.MIN_VALUE;
@@ -588,15 +589,24 @@ public class IndoorMapManager {
 
         List<LatLng> nodes = new ArrayList<>();
         FloorplanApiClient.FloorShapes floor = currentFloorShapes.get(currentFloor);
+        boolean allowDenseWallNodes = shouldUseDenseWallRouting();
         for (FloorplanApiClient.MapShapeFeature feature : floor.getFeatures()) {
+            if (nodes.size() >= MAX_ROUTE_NODE_COUNT) {
+                break;
+            }
             boolean polygonGeometry = isPolygonGeometry(feature.getGeometryType());
             for (List<LatLng> part : feature.getParts()) {
+                if (nodes.size() >= MAX_ROUTE_NODE_COUNT) {
+                    break;
+                }
                 if (part == null || part.isEmpty()) {
                     continue;
                 }
 
                 if ("wall".equals(feature.getIndoorType())) {
-                    addWallAdjacentNodes(nodes, part, polygonGeometry);
+                    if (allowDenseWallNodes) {
+                        addWallAdjacentNodes(nodes, part, polygonGeometry);
+                    }
                     continue;
                 }
 
@@ -628,6 +638,9 @@ public class IndoorMapManager {
                                       @Nullable LatLng pullTarget) {
         int segmentCount = closed ? path.size() : path.size() - 1;
         for (int i = 0; i < segmentCount; i++) {
+            if (nodes.size() >= MAX_ROUTE_NODE_COUNT) {
+                return;
+            }
             LatLng start = path.get(i);
             LatLng end = path.get((i + 1) % path.size());
             double segmentDistance = UtilFunctions.distanceBetweenPoints(start, end);
@@ -635,7 +648,11 @@ public class IndoorMapManager {
                 continue;
             }
             int sampleCount = Math.max(1, (int) Math.floor(segmentDistance / ROUTE_NODE_SAMPLE_SPACING_METERS));
+            sampleCount = Math.min(sampleCount, 5);
             for (int sampleIndex = 1; sampleIndex < sampleCount; sampleIndex++) {
+                if (nodes.size() >= MAX_ROUTE_NODE_COUNT) {
+                    return;
+                }
                 double ratio = sampleIndex / (double) sampleCount;
                 LatLng sampledPoint = interpolate(start, end, ratio);
                 if (pullTarget != null) {
@@ -651,6 +668,9 @@ public class IndoorMapManager {
                                       boolean closed) {
         int segmentCount = closed ? path.size() : path.size() - 1;
         for (int i = 0; i < segmentCount; i++) {
+            if (nodes.size() >= MAX_ROUTE_NODE_COUNT) {
+                return;
+            }
             LatLng start = path.get(i);
             LatLng end = path.get((i + 1) % path.size());
             addWallOffsetNodePair(nodes, start, end, start);
@@ -658,7 +678,11 @@ public class IndoorMapManager {
 
             double segmentDistance = UtilFunctions.distanceBetweenPoints(start, end);
             int sampleCount = Math.max(1, (int) Math.floor(segmentDistance / ROUTE_NODE_SAMPLE_SPACING_METERS));
+            sampleCount = Math.min(sampleCount, 4);
             for (int sampleIndex = 1; sampleIndex < sampleCount; sampleIndex++) {
+                if (nodes.size() >= MAX_ROUTE_NODE_COUNT) {
+                    return;
+                }
                 double ratio = sampleIndex / (double) sampleCount;
                 addWallOffsetNodePair(nodes, start, end, interpolate(start, end, ratio));
             }
@@ -691,7 +715,7 @@ public class IndoorMapManager {
     }
 
     private void addRouteNode(List<LatLng> nodes, @Nullable LatLng candidate) {
-        if (candidate == null || isInsideWall(candidate)) {
+        if (candidate == null || nodes.size() >= MAX_ROUTE_NODE_COUNT || isInsideWall(candidate)) {
             return;
         }
 
@@ -701,6 +725,14 @@ public class IndoorMapManager {
             }
         }
         nodes.add(candidate);
+    }
+
+    private boolean shouldUseDenseWallRouting() {
+        Integer logicalFloor = parseLogicalFloor(currentFloor);
+        if (logicalFloor == null) {
+            return false;
+        }
+        return logicalFloor == 1 || logicalFloor == 2;
     }
 
     private void addDistinctPoint(List<LatLng> points, LatLng candidate) {
