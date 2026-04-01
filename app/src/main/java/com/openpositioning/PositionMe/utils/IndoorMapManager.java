@@ -354,8 +354,7 @@ public class IndoorMapManager {
 
         for (int i = 1; i < rawHistory.size(); i++) {
             LatLng current = rawHistory.get(i);
-            appendLegalSegment(routedPath, previous, current);
-            previous = current;
+            previous = appendLegalSegment(routedPath, previous, current);
         }
         return routedPath;
     }
@@ -400,15 +399,15 @@ public class IndoorMapManager {
         return false;
     }
 
-    private void appendLegalSegment(List<LatLng> routedPath, LatLng start, LatLng end) {
+    private LatLng appendLegalSegment(List<LatLng> routedPath, LatLng start, LatLng end) {
         if (start == null || end == null) {
-            return;
+            return start;
         }
 
         double directDistance = UtilFunctions.distanceBetweenPoints(start, end);
         if (!isBlocked(start, end) && !isInsideWall(end)) {
             addDistinctPoint(routedPath, end);
-            return;
+            return end;
         }
 
         List<LatLng> detour = routeShortestLegalPath(start, end, directDistance);
@@ -416,13 +415,14 @@ public class IndoorMapManager {
             for (int i = 1; i < detour.size(); i++) {
                 addDistinctPoint(routedPath, detour.get(i));
             }
-            return;
+            return routedPath.get(routedPath.size() - 1);
         }
 
         LatLng safe = constrainToLegalPath(start, end);
         if (safe != null && !samePoint(routedPath.get(routedPath.size() - 1), safe)) {
             addDistinctPoint(routedPath, safe);
         }
+        return routedPath.get(routedPath.size() - 1);
     }
 
     private List<LatLng> routeShortestLegalPath(LatLng rawStart,
