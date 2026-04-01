@@ -7,12 +7,12 @@ import androidx.annotation.Nullable;
  */
 final class FloorTransitionHeuristics {
 
-    private static final float STRONG_ABSOLUTE_SWITCH_METERS = 3.7f;
-    private static final float FLOOR_HEIGHT_RATIO_THRESHOLD = 0.78f;
-    private static final double STAIRS_MIN_HORIZONTAL_METERS = 1.8;
-    private static final double STAIRS_MAX_VERTICAL_RATE_MPS = 2.8;
-    private static final double LIFT_MAX_HORIZONTAL_METERS = 2.0;
-    private static final double LIFT_MIN_VERTICAL_RATE_MPS = 0.9;
+    private static final float STRONG_ABSOLUTE_SWITCH_METERS = 2.4f;
+    private static final float FLOOR_HEIGHT_RATIO_THRESHOLD = 0.58f;
+    private static final double STAIRS_MIN_HORIZONTAL_METERS = 0.95;
+    private static final double STAIRS_MAX_VERTICAL_RATE_MPS = 3.4;
+    private static final double LIFT_MAX_HORIZONTAL_METERS = 3.2;
+    private static final double LIFT_MIN_VERTICAL_RATE_MPS = 0.45;
 
     enum Mode {
         NONE,

@@ -22,6 +22,7 @@ import androidx.fragment.app.Fragment;
 import com.google.android.gms.maps.OnMapReadyCallback;
 import com.openpositioning.PositionMe.R;
 import com.openpositioning.PositionMe.sensors.SensorFusion;
+import com.openpositioning.PositionMe.utils.FloorDisplaySyncPolicy;
 import com.openpositioning.PositionMe.utils.IndoorMapManager;
 import com.openpositioning.PositionMe.utils.UtilFunctions;
 import com.google.android.gms.maps.CameraUpdateFactory;
@@ -114,13 +115,22 @@ public class TrajectoryMapFragment extends Fragment {
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
-    private static final long AUTO_FLOOR_CHECK_INTERVAL_MS = 1000;
+    private static final long AUTO_FLOOR_CHECK_INTERVAL_MS = 400L;
+    private static final long AUTO_FLOOR_STABLE_MS = 1_200L;
+    private static final double AUTO_FLOOR_STAIRS_SYNC_PROXIMITY_METERS = 5.0;
+    private static final double AUTO_FLOOR_LIFT_SYNC_PROXIMITY_METERS = 4.5;
     private static final double TAIL_RADIUS_METERS = 0.45;
     private static final int GNSS_TAIL_COLOR = Color.rgb(25, 118, 210);
     private static final int WIFI_TAIL_COLOR = Color.rgb(0, 137, 123);
     private static final int PDR_TAIL_COLOR = Color.rgb(255, 111, 0);
     private Handler autoFloorHandler;
     private Runnable autoFloorTask;
+    @Nullable
+    private Integer pendingDisplayFloorCandidate;
+    private boolean pendingDisplayFloorCommitToFusion;
+    private boolean pendingDisplayFloorCompletesInitialSync;
+    private long pendingDisplayFloorSinceMs;
+    private boolean hasCommittedDisplayFloorSync;
 
     // UI
     private View mapControlsCard;
@@ -318,7 +328,7 @@ public class TrajectoryMapFragment extends Fragment {
         LatLng displaySourceLocation = newLocation;
         if (indoorMapManager != null) {
             indoorMapManager.setCurrentLocation(newLocation);
-            syncDisplayedFloor();
+            syncDisplayedFloor(newLocation);
             syncActiveTrackFloorWithDisplayedFloor();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
             displaySourceLocation = indoorMapManager.constrainPositionToLegalSpace(
@@ -525,6 +535,8 @@ public class TrajectoryMapFragment extends Fragment {
         lastCameraUpdateMs = 0L;
         userTrackHistoryByFloor.clear();
         activeTrackFloor = Integer.MIN_VALUE;
+        hasCommittedDisplayFloorSync = false;
+        clearPendingDisplayFloorDecision();
 
         // Clear test point markers
         for (com.google.android.gms.maps.model.Marker m : testPointMarkers) {
@@ -573,9 +585,9 @@ public class TrajectoryMapFragment extends Fragment {
     //region Auto-floor logic
 
     /**
-     * Starts the periodic auto-floor evaluation task. Checks every second
-     * and applies floor changes only after the debounce window (3 seconds
-     * of consistent readings).
+     * Starts the periodic auto-floor evaluation task.
+     * Strict floor evaluation runs every few hundred milliseconds; display-floor
+     * promotion still waits for a short stability window to avoid jitter.
      */
     private void startAutoFloor() {
         if (autoFloorHandler == null) {
@@ -607,10 +619,14 @@ public class TrajectoryMapFragment extends Fragment {
         if (sensorFusion == null || indoorMapManager == null) return;
         if (!indoorMapManager.getIsIndoorMapSet()) return;
 
-        int resolvedFloor = sensorFusion.getPreferredDisplayLogicalFloor();
-        indoorMapManager.setCurrentFloor(resolvedFloor, true);
-        syncActiveTrackFloorWithDisplayedFloor();
-        updateFloorLabel();
+        FloorDisplaySyncPolicy.Decision initialDecision = resolveDisplayFloorDecision(
+                getFloorProbeLocation()
+        );
+        if (initialDecision != null) {
+            applyDisplayedFloor(initialDecision.getLogicalFloor(), false, false);
+            return;
+        }
+        applyDisplayedFloor(sensorFusion.getPreferredDisplayLogicalFloor(), false, false);
     }
 
     /**
@@ -620,30 +636,30 @@ public class TrajectoryMapFragment extends Fragment {
         if (autoFloorHandler != null && autoFloorTask != null) {
             autoFloorHandler.removeCallbacks(autoFloorTask);
         }
+        clearPendingDisplayFloorDecision();
         Log.d(TAG, "Auto-floor stopped");
     }
 
     /**
-     * Evaluates the current floor using WiFi positioning (priority) or
-     * barometric elevation (fallback). Applies a 3-second debounce window
-     * to prevent jittery floor switching.
+     * Evaluates the current floor using barometric/semantic evidence first,
+     * then lets the display-floor sync policy handle stable WiFi-led alignment.
      */
     private void evaluateAutoFloor() {
         if (sensorFusion == null || indoorMapManager == null) return;
         if (!indoorMapManager.getIsIndoorMapSet()) return;
 
-        if (currentLocation == null) return;
+        LatLng floorProbeLocation = getFloorProbeLocation();
+        if (floorProbeLocation == null) return;
         Integer resolvedFloor = sensorFusion.evaluateIndoorFloorChange(
-                currentLocation,
+                floorProbeLocation,
                 SystemClock.elapsedRealtime()
         );
         if (resolvedFloor != null) {
-            indoorMapManager.setCurrentFloor(resolvedFloor, true);
-            syncActiveTrackFloorWithDisplayedFloor();
-            updateFloorLabel();
+            clearPendingDisplayFloorDecision();
+            applyDisplayedFloor(resolvedFloor, false, true);
             return;
         }
-        syncDisplayedFloor();
+        syncDisplayedFloor(getFloorProbeLocation());
     }
 
     //endregion
@@ -673,16 +689,139 @@ public class TrajectoryMapFragment extends Fragment {
     }
 
     private void syncDisplayedFloor() {
+        syncDisplayedFloor(getFloorProbeLocation());
+    }
+
+    private void syncDisplayedFloor(@Nullable LatLng probeLocation) {
         if (sensorFusion == null || indoorMapManager == null) {
             return;
         }
         if (!indoorMapManager.getIsIndoorMapSet()) {
             return;
         }
-        int preferredFloor = sensorFusion.getPreferredDisplayLogicalFloor();
-        indoorMapManager.setCurrentFloor(preferredFloor, true);
+
+        FloorDisplaySyncPolicy.Decision decision = resolveDisplayFloorDecision(probeLocation);
+        if (decision == null) {
+            applyDisplayedFloor(sensorFusion.getPreferredDisplayLogicalFloor(), false, false);
+            return;
+        }
+        maybeApplyDisplayFloorDecision(decision, SystemClock.elapsedRealtime());
+    }
+
+    @Nullable
+    private FloorDisplaySyncPolicy.Decision resolveDisplayFloorDecision(@Nullable LatLng probeLocation) {
+        if (sensorFusion == null) {
+            return null;
+        }
+
+        boolean hasWifiFloor = sensorFusion.getLatLngWifiPositioning() != null;
+        int fusedFloor = sensorFusion.getCurrentLogicalFloor();
+        int wifiFloor = hasWifiFloor ? sensorFusion.getWifiFloor() : fusedFloor;
+        return FloorDisplaySyncPolicy.resolve(
+                hasCommittedDisplayFloorSync,
+                hasWifiFloor,
+                wifiFloor,
+                fusedFloor,
+                isNearTransitionFeature(probeLocation)
+        );
+    }
+
+    private void maybeApplyDisplayFloorDecision(@NonNull FloorDisplaySyncPolicy.Decision decision,
+                                                long now) {
+        if (sensorFusion == null || indoorMapManager == null) {
+            return;
+        }
+
+        int displayedFloor = indoorMapManager.getCurrentLogicalFloor();
+        boolean needsFusionCommit = decision.shouldCommitToFusion()
+                && sensorFusion.getCurrentLogicalFloor() != decision.getLogicalFloor();
+        boolean needsInitialSyncCompletion = decision.shouldCompleteInitialSync()
+                && !hasCommittedDisplayFloorSync;
+
+        if (!decision.requiresStability()) {
+            clearPendingDisplayFloorDecision();
+            applyDisplayedFloor(
+                    decision.getLogicalFloor(),
+                    needsFusionCommit,
+                    needsInitialSyncCompletion
+            );
+            return;
+        }
+
+        if (displayedFloor == decision.getLogicalFloor()
+                && !needsFusionCommit
+                && !needsInitialSyncCompletion) {
+            clearPendingDisplayFloorDecision();
+            updateFloorLabel();
+            return;
+        }
+
+        boolean samePending = pendingDisplayFloorCandidate != null
+                && pendingDisplayFloorCandidate == decision.getLogicalFloor()
+                && pendingDisplayFloorCommitToFusion == needsFusionCommit
+                && pendingDisplayFloorCompletesInitialSync == needsInitialSyncCompletion;
+        if (!samePending) {
+            pendingDisplayFloorCandidate = decision.getLogicalFloor();
+            pendingDisplayFloorCommitToFusion = needsFusionCommit;
+            pendingDisplayFloorCompletesInitialSync = needsInitialSyncCompletion;
+            pendingDisplayFloorSinceMs = now;
+            return;
+        }
+
+        if (now - pendingDisplayFloorSinceMs < AUTO_FLOOR_STABLE_MS) {
+            return;
+        }
+
+        applyDisplayedFloor(
+                decision.getLogicalFloor(),
+                needsFusionCommit,
+                needsInitialSyncCompletion
+        );
+        clearPendingDisplayFloorDecision();
+    }
+
+    private void applyDisplayedFloor(int logicalFloor,
+                                     boolean commitToFusion,
+                                     boolean completeInitialSync) {
+        if (sensorFusion != null && commitToFusion
+                && sensorFusion.getCurrentLogicalFloor() != logicalFloor) {
+            sensorFusion.setCurrentLogicalFloor(logicalFloor);
+        }
+        if (indoorMapManager != null) {
+            indoorMapManager.setCurrentFloor(logicalFloor, true);
+        }
         syncActiveTrackFloorWithDisplayedFloor();
         updateFloorLabel();
+        if (commitToFusion || completeInitialSync) {
+            hasCommittedDisplayFloorSync = true;
+        }
+    }
+
+    private void clearPendingDisplayFloorDecision() {
+        pendingDisplayFloorCandidate = null;
+        pendingDisplayFloorCommitToFusion = false;
+        pendingDisplayFloorCompletesInitialSync = false;
+        pendingDisplayFloorSinceMs = 0L;
+    }
+
+    @Nullable
+    private LatLng getFloorProbeLocation() {
+        return currentRawLocation != null ? currentRawLocation : currentLocation;
+    }
+
+    private boolean isNearTransitionFeature(@Nullable LatLng position) {
+        if (position == null || sensorFusion == null) {
+            return false;
+        }
+        return sensorFusion.isNearIndoorFeature(
+                position,
+                "stairs",
+                AUTO_FLOOR_STAIRS_SYNC_PROXIMITY_METERS
+        ) || sensorFusion.isNearIndoorFeature(
+                position,
+                "lift",
+                AUTO_FLOOR_LIFT_SYNC_PROXIMITY_METERS
+        );
     }
 
     private void maybeApplyMapCorrection(@NonNull LatLng fusedLocation,

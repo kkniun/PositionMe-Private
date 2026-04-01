@@ -1,6 +1,7 @@
 package com.openpositioning.PositionMe.sensors;
 
 import android.util.Log;
+import android.os.SystemClock;
 
 import com.google.android.gms.maps.model.LatLng;
 
@@ -34,7 +35,10 @@ public class WifiPositionManager implements Observer {
     private final WiFiPositioning wiFiPositioning;
     private final TrajectoryRecorder recorder;
     private final PositionUpdateListener positionUpdateListener;
+    private final WifiObservationSmoother wifiObservationSmoother;
     private List<Wifi> wifiList;
+    private LatLng wifiLocation;
+    private int wifiFloor;
 
     /**
      * Creates a new WifiPositionManager.
@@ -48,6 +52,7 @@ public class WifiPositionManager implements Observer {
         this.wiFiPositioning = wiFiPositioning;
         this.recorder = recorder;
         this.positionUpdateListener = positionUpdateListener;
+        this.wifiObservationSmoother = new WifiObservationSmoother();
     }
 
     /**
@@ -78,8 +83,19 @@ public class WifiPositionManager implements Observer {
             this.wiFiPositioning.request(wifiFingerPrint, new WiFiPositioning.VolleyCallback() {
                 @Override
                 public void onSuccess(LatLng wifiLocation, int floor) {
+                    WifiObservationSmoother.SmoothedObservation smoothedObservation =
+                            wifiObservationSmoother.observe(
+                                    wifiLocation,
+                                    floor,
+                                    SystemClock.elapsedRealtime()
+                            );
+                    WifiPositionManager.this.wifiLocation = smoothedObservation.getLocation();
+                    WifiPositionManager.this.wifiFloor = smoothedObservation.getFloor();
                     if (positionUpdateListener != null) {
-                        positionUpdateListener.onWifiPositionUpdate(wifiLocation, floor);
+                        positionUpdateListener.onWifiPositionUpdate(
+                                WifiPositionManager.this.wifiLocation,
+                                WifiPositionManager.this.wifiFloor
+                        );
                     }
                 }
 
@@ -99,6 +115,9 @@ public class WifiPositionManager implements Observer {
      * @return {@link LatLng} corresponding to the user's position
      */
     public LatLng getLatLngWifiPositioning() {
+        if (this.wifiLocation != null) {
+            return this.wifiLocation;
+        }
         return this.wiFiPositioning.getWifiLocation();
     }
 
@@ -108,6 +127,9 @@ public class WifiPositionManager implements Observer {
      * @return current floor number
      */
     public int getWifiFloor() {
+        if (this.wifiLocation != null) {
+            return this.wifiFloor;
+        }
         return this.wiFiPositioning.getFloor();
     }
 

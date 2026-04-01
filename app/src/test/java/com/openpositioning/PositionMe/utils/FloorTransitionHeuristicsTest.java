@@ -77,4 +77,40 @@ public class FloorTransitionHeuristicsTest {
         assertEquals(FloorTransitionHeuristics.Mode.NONE, decision.getMode());
         assertEquals(0, decision.getTargetFloor());
     }
+
+    @Test
+    public void evaluate_typicalStairsClimb_transitionsWithLowerButRealisticDelta() {
+        FloorTransitionHeuristics.Decision decision = FloorTransitionHeuristics.evaluate(
+                1,
+                2.7f,
+                4.0f,
+                1.4,
+                3200L,
+                true,
+                false,
+                false,
+                null
+        );
+
+        assertEquals(FloorTransitionHeuristics.Mode.STAIRS, decision.getMode());
+        assertEquals(2, decision.getTargetFloor());
+    }
+
+    @Test
+    public void evaluate_typicalLiftRide_allowsSingleFloorTransitionWithoutHugeVerticalRate() {
+        FloorTransitionHeuristics.Decision decision = FloorTransitionHeuristics.evaluate(
+                1,
+                2.8f,
+                4.0f,
+                1.1,
+                4200L,
+                false,
+                true,
+                true,
+                null
+        );
+
+        assertEquals(FloorTransitionHeuristics.Mode.LIFT, decision.getMode());
+        assertEquals(2, decision.getTargetFloor());
+    }
 }

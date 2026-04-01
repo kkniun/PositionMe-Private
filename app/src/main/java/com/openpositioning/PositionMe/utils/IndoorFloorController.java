@@ -15,12 +15,12 @@ import com.google.android.gms.maps.model.LatLng;
  */
 public class IndoorFloorController {
 
-    private static final long WIFI_FLOOR_CONFIRM_MS = 1_100L;
-    private static final long FLOOR_CHANGE_DEBOUNCE_MS = 900L;
-    private static final float TRANSITION_WINDOW_START_RATIO = 0.30f;
-    private static final float TRANSITION_WINDOW_START_MIN_METERS = 1.1f;
-    private static final double STAIRS_PROXIMITY_METERS = 4.0;
-    private static final double LIFT_PROXIMITY_METERS = 3.5;
+    private static final long WIFI_FLOOR_CONFIRM_MS = 900L;
+    private static final long FLOOR_CHANGE_DEBOUNCE_MS = 700L;
+    private static final float TRANSITION_WINDOW_START_RATIO = 0.22f;
+    private static final float TRANSITION_WINDOW_START_MIN_METERS = 0.75f;
+    private static final double STAIRS_PROXIMITY_METERS = 5.0;
+    private static final double LIFT_PROXIMITY_METERS = 4.5;
     private final IndoorSpatialConstraintModel spatialModel;
 
     private float anchorElevation = Float.NaN;
