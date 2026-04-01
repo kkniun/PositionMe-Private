@@ -27,7 +27,7 @@ public class ParticleFilterEngine {
         WIFI
     }
 
-    private static final int PARTICLE_COUNT = 240;
+    private static final int PARTICLE_COUNT = 800;
     private static final int MAX_TAIL_SIZE = 5;
     private static final int MAX_HISTORY_SIZE = 600;
     private static final long MIN_HISTORY_INTERVAL_MS = 1_000L;
