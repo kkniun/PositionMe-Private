@@ -65,7 +65,7 @@ import android.widget.Toast;
 
 public class RecordingFragment extends Fragment {
 
-    private static final long UI_REFRESH_INTERVAL_MS = 1_500L;
+    private static final long UI_REFRESH_INTERVAL_MS = 1_000L;
 
     // UI elements
     private MaterialButton completeButton, cancelButton;

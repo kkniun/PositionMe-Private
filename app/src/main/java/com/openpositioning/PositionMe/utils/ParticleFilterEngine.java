@@ -30,9 +30,9 @@ public class ParticleFilterEngine {
     private static final int PARTICLE_COUNT = 240;
     private static final int MAX_TAIL_SIZE = 5;
     private static final int MAX_HISTORY_SIZE = 600;
-    private static final long MIN_HISTORY_INTERVAL_MS = 1_500L;
+    private static final long MIN_HISTORY_INTERVAL_MS = 1_000L;
     private static final long HISTORY_ACTIVE_MOTION_WINDOW_MS = 2_500L;
-    private static final long DISPLAY_WINDOW_MS = 1_500L;
+    private static final long DISPLAY_WINDOW_MS = 1_000L;
     private static final int MAX_ABSOLUTE_FIX_BUFFER_SIZE = 8;
     private static final double MIN_HISTORY_DISTANCE_METERS = 0.85;
     private static final double MAX_HISTORY_SEGMENT_METERS = 4.0;

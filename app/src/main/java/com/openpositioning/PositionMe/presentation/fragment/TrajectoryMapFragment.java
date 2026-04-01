@@ -69,8 +69,10 @@ public class TrajectoryMapFragment extends Fragment {
 
     private static final float DIRECTION_MARKER_SIZE_DP = 18f;
     private static final double MIN_DIRECTION_DISTANCE_METERS = 0.55;
+    private static final double MAX_DISPLAY_SPEED_METERS_PER_SECOND = 2.6;
+    private static final double MAX_DISPLAY_JUMP_METERS = 3.0;
     private static final double CAMERA_RECENTER_DISTANCE_METERS = 4.0;
-    private static final long CAMERA_RECENTER_INTERVAL_MS = 1_500L;
+    private static final long CAMERA_RECENTER_INTERVAL_MS = 1_000L;
     private static final int MAX_TRACK_HISTORY_POINTS = 600;
     private static final double TRACK_APPEND_DISTANCE_METERS = 0.06;
     private static final double TRACK_REPLACE_DISTANCE_METERS = 0.03;
@@ -95,12 +97,13 @@ public class TrajectoryMapFragment extends Fragment {
     private float lastDirectionDegrees = 0f;
     private LatLng lastCameraLocation;
     private long lastCameraUpdateMs;
+    private long lastLocationUpdateRealtimeMs;
     private final Map<Integer, List<LatLng>> userTrackHistoryByFloor = new HashMap<>();
     private int activeTrackFloor = Integer.MIN_VALUE;
 
     // Auto-floor state
     private static final String TAG = "TrajectoryMapFragment";
-    private static final long AUTO_FLOOR_CHECK_INTERVAL_MS = 1500;
+    private static final long AUTO_FLOOR_CHECK_INTERVAL_MS = 1000;
     private static final double TAIL_RADIUS_METERS = 0.45;
     private static final int GNSS_TAIL_COLOR = Color.rgb(25, 118, 210);
     private static final int WIFI_TAIL_COLOR = Color.rgb(0, 137, 123);
@@ -301,13 +304,15 @@ public class TrajectoryMapFragment extends Fragment {
         if (gMap == null) return newLocation;
 
         LatLng oldLocation = this.currentLocation;
-        LatLng displayLocation = newLocation;
+        long nowRealtime = SystemClock.elapsedRealtime();
+        LatLng rateLimitedLocation = limitDisplayedMotion(oldLocation, newLocation, nowRealtime);
+        LatLng displayLocation = rateLimitedLocation;
         if (indoorMapManager != null) {
-            indoorMapManager.setCurrentLocation(newLocation);
+            indoorMapManager.setCurrentLocation(rateLimitedLocation);
             syncDisplayedFloor();
             syncActiveTrackFloorWithDisplayedFloor();
             setFloorControlsVisibility(indoorMapManager.getIsIndoorMapSet() ? View.VISIBLE : View.GONE);
-            displayLocation = indoorMapManager.constrainPositionToLegalSpace(oldLocation, newLocation);
+            displayLocation = indoorMapManager.constrainPositionToLegalSpace(oldLocation, rateLimitedLocation);
             indoorMapManager.setCurrentLocation(displayLocation);
         }
 
@@ -317,6 +322,7 @@ public class TrajectoryMapFragment extends Fragment {
         boolean insignificantRotation = directionMarker != null
                 && absoluteBearingDelta(lastDirectionDegrees, resolvedDirection) < 2.5f;
         this.currentLocation = displayLocation;
+        this.lastLocationUpdateRealtimeMs = nowRealtime;
 
         if (insignificantMove && insignificantRotation) {
             updateTrackHistory(displayLocation);
@@ -343,6 +349,36 @@ public class TrajectoryMapFragment extends Fragment {
 
         updateTrackHistory(displayLocation);
         return displayLocation;
+    }
+
+    private LatLng limitDisplayedMotion(@Nullable LatLng previousLocation,
+                                        @NonNull LatLng candidateLocation,
+                                        long nowRealtime) {
+        if (previousLocation == null) {
+            return candidateLocation;
+        }
+
+        double distanceMeters = UtilFunctions.distanceBetweenPoints(previousLocation, candidateLocation);
+        if (distanceMeters <= MAX_DISPLAY_JUMP_METERS) {
+            return candidateLocation;
+        }
+
+        double elapsedSeconds = lastLocationUpdateRealtimeMs > 0L
+                ? Math.max(0.75d, Math.min(1.25d, (nowRealtime - lastLocationUpdateRealtimeMs) / 1000d))
+                : 1.0d;
+        double allowedDistance = Math.min(
+                MAX_DISPLAY_JUMP_METERS,
+                MAX_DISPLAY_SPEED_METERS_PER_SECOND * elapsedSeconds
+        );
+        if (distanceMeters <= allowedDistance || distanceMeters <= 1e-3d) {
+            return candidateLocation;
+        }
+
+        double ratio = allowedDistance / distanceMeters;
+        return new LatLng(
+                previousLocation.latitude + (candidateLocation.latitude - previousLocation.latitude) * ratio,
+                previousLocation.longitude + (candidateLocation.longitude - previousLocation.longitude) * ratio
+        );
     }
 
     public boolean isRenderSurfaceReady() {
