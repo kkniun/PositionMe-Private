@@ -782,6 +782,10 @@ public class SensorFusion implements SensorEventListener {
      */
     public float passOrientation() {
         if (particleFilterEngine != null && particleFilterEngine.isInitialized()) {
+            if (!particleFilterEngine.hasReliableMotionHeading()
+                    && !Float.isNaN(state.orientation[0])) {
+                return state.orientation[0];
+            }
             return (float) particleFilterEngine.getCurrentDisplayHeadingRad();
         }
         return state.orientation[0];

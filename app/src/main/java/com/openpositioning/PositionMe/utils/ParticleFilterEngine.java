@@ -30,9 +30,10 @@ public class ParticleFilterEngine {
     private static final int PARTICLE_COUNT = 240;
     private static final int MAX_TAIL_SIZE = 5;
     private static final int MAX_HISTORY_SIZE = 600;
-    private static final long MIN_HISTORY_INTERVAL_MS = 2_000L;
+    private static final long MIN_HISTORY_INTERVAL_MS = 1_500L;
     private static final long HISTORY_ACTIVE_MOTION_WINDOW_MS = 2_500L;
-    private static final long DISPLAY_WINDOW_MS = 2_000L;
+    private static final long DISPLAY_WINDOW_MS = 1_500L;
+    private static final int MAX_ABSOLUTE_FIX_BUFFER_SIZE = 8;
     private static final double MIN_HISTORY_DISTANCE_METERS = 0.85;
     private static final double MAX_HISTORY_SEGMENT_METERS = 4.0;
     private static final double STATIONARY_REBASE_DISTANCE_METERS = 2.5;
@@ -56,6 +57,7 @@ public class ParticleFilterEngine {
     private final ArrayDeque<LatLng> wifiTail = new ArrayDeque<>();
     private final ArrayDeque<LatLng> pdrTail = new ArrayDeque<>();
     private final ArrayDeque<DisplaySample> recentDisplaySamples = new ArrayDeque<>();
+    private final ArrayDeque<AbsoluteFix> recentAbsoluteFixes = new ArrayDeque<>();
     private final IndoorSpatialConstraintModel spatialConstraintModel;
     private final AdaptivePlanarKalmanFilter displayKalmanFilter = new AdaptivePlanarKalmanFilter();
 
@@ -103,6 +105,7 @@ public class ParticleFilterEngine {
         wifiTail.clear();
         pdrTail.clear();
         recentDisplaySamples.clear();
+        recentAbsoluteFixes.clear();
         displayKalmanFilter.reset();
         reference = null;
         initialized = false;
@@ -158,6 +161,11 @@ public class ParticleFilterEngine {
             return pose.headingRad;
         }
         return displayHeadingRad;
+    }
+
+    public synchronized boolean hasReliableMotionHeading() {
+        DisplayPose pose = getWindowedDisplayPose();
+        return pose != null && pose.motionHeadingReliable;
     }
 
     public synchronized int getLatestWifiFloor() {
@@ -434,6 +442,7 @@ public class ParticleFilterEngine {
             initialized = true;
             pdrTrackEasting = 0d;
             pdrTrackNorthing = 0d;
+            recordAbsoluteFix(0d, 0d, accuracyMeters, confidence, source, timestampMillis);
             commitPose(
                     0d,
                     0d,
@@ -450,6 +459,7 @@ public class ParticleFilterEngine {
             injectFloorHypotheses(normalizedFloor, confidence);
         }
         double[] local = reference.toLocal(latLng);
+        recordAbsoluteFix(local[0], local[1], accuracyMeters, confidence, source, timestampMillis);
         updateWeights(local[0], local[1], accuracyMeters, confidence, source, normalizedFloor);
 
         if (effectiveParticleCount() < RESAMPLE_THRESHOLD_RATIO * particles.size()) {
@@ -817,7 +827,7 @@ public class ParticleFilterEngine {
                 : recentDisplaySamples.peekLast().timestampMillis;
         pruneDisplaySamples(now);
         if (recentDisplaySamples.isEmpty()) {
-            return new DisplayPose(displayEasting, displayNorthing, displayHeadingRad);
+            return new DisplayPose(displayEasting, displayNorthing, displayHeadingRad, false);
         }
 
         double weightedEast = 0d;
@@ -840,19 +850,39 @@ public class ParticleFilterEngine {
         }
 
         if (weightSum <= 1e-6) {
-            return new DisplayPose(displayEasting, displayNorthing, displayHeadingRad);
+            return new DisplayPose(displayEasting, displayNorthing, displayHeadingRad, false);
         }
 
         double averagedEast = weightedEast / weightSum;
         double averagedNorth = weightedNorth / weightSum;
         double headingRad;
-        if (first != null && last != null
-                && Math.hypot(last.easting - first.easting, last.northing - first.northing) >= 0.6d) {
+        boolean motionHeadingReliable = first != null
+                && last != null
+                && Math.hypot(last.easting - first.easting, last.northing - first.northing) >= 0.55d;
+        if (motionHeadingReliable) {
             headingRad = Math.atan2(last.easting - first.easting, last.northing - first.northing);
         } else {
             headingRad = Math.atan2(weightedSin, weightedCos);
         }
-        return new DisplayPose(averagedEast, averagedNorth, normalizeRad(headingRad));
+
+        AbsoluteConsensus consensus = getWindowedAbsoluteConsensus(now);
+        if (consensus != null) {
+            double support = clamp(consensus.weightSum / 1.7d, 0d, 1d);
+            double consistency = 1d - clamp(consensus.spreadMeters / 5.5d, 0d, 1d);
+            double blend = clamp(0.10 + 0.38 * support * consistency, 0.10, 0.48);
+            averagedEast = lerp(averagedEast, consensus.easting, blend);
+            averagedNorth = lerp(averagedNorth, consensus.northing, blend);
+            if (!motionHeadingReliable && !Double.isNaN(consensus.headingRad)) {
+                headingRad = circleBlend(headingRad, consensus.headingRad, 0.32);
+            }
+        }
+
+        return new DisplayPose(
+                averagedEast,
+                averagedNorth,
+                normalizeRad(headingRad),
+                motionHeadingReliable
+        );
     }
 
     private void recordDisplaySample(long timestampMillis) {
@@ -870,6 +900,84 @@ public class ParticleFilterEngine {
                 && nowMillis - recentDisplaySamples.peekFirst().timestampMillis > DISPLAY_WINDOW_MS) {
             recentDisplaySamples.removeFirst();
         }
+    }
+
+    private void recordAbsoluteFix(double easting,
+                                   double northing,
+                                   double accuracyMeters,
+                                   double confidence,
+                                   ObservationSource source,
+                                   long timestampMillis) {
+        recentAbsoluteFixes.addLast(new AbsoluteFix(
+                easting,
+                northing,
+                clamp(accuracyMeters, 1.0, 45.0),
+                clamp(confidence, 0.15, 1.0),
+                source,
+                timestampMillis
+        ));
+        pruneAbsoluteFixes(timestampMillis);
+        while (recentAbsoluteFixes.size() > MAX_ABSOLUTE_FIX_BUFFER_SIZE) {
+            recentAbsoluteFixes.removeFirst();
+        }
+    }
+
+    private void pruneAbsoluteFixes(long nowMillis) {
+        while (!recentAbsoluteFixes.isEmpty()
+                && nowMillis - recentAbsoluteFixes.peekFirst().timestampMillis > DISPLAY_WINDOW_MS) {
+            recentAbsoluteFixes.removeFirst();
+        }
+    }
+
+    @Nullable
+    private AbsoluteConsensus getWindowedAbsoluteConsensus(long nowMillis) {
+        pruneAbsoluteFixes(nowMillis);
+        if (recentAbsoluteFixes.isEmpty()) {
+            return null;
+        }
+
+        double weightedEast = 0d;
+        double weightedNorth = 0d;
+        double weightSum = 0d;
+        AbsoluteFix first = recentAbsoluteFixes.peekFirst();
+        AbsoluteFix last = recentAbsoluteFixes.peekLast();
+
+        for (AbsoluteFix fix : recentAbsoluteFixes) {
+            double ageRatio = 1d - Math.max(0d,
+                    Math.min(1d, (nowMillis - fix.timestampMillis) / (double) DISPLAY_WINDOW_MS));
+            double sourceWeight = fix.source == ObservationSource.WIFI ? 1.08d : 0.96d;
+            double accuracyWeight = clamp(5.5d / Math.max(2.5d, fix.accuracyMeters), 0.18d, 1.15d);
+            double weight = (0.35d + 0.65d * ageRatio) * sourceWeight * accuracyWeight * fix.confidence;
+            weightedEast += fix.easting * weight;
+            weightedNorth += fix.northing * weight;
+            weightSum += weight;
+        }
+
+        if (weightSum <= 1e-6d) {
+            return null;
+        }
+
+        double consensusEast = weightedEast / weightSum;
+        double consensusNorth = weightedNorth / weightSum;
+        double weightedSpread = 0d;
+        for (AbsoluteFix fix : recentAbsoluteFixes) {
+            double ageRatio = 1d - Math.max(0d,
+                    Math.min(1d, (nowMillis - fix.timestampMillis) / (double) DISPLAY_WINDOW_MS));
+            double sourceWeight = fix.source == ObservationSource.WIFI ? 1.08d : 0.96d;
+            double accuracyWeight = clamp(5.5d / Math.max(2.5d, fix.accuracyMeters), 0.18d, 1.15d);
+            double weight = (0.35d + 0.65d * ageRatio) * sourceWeight * accuracyWeight * fix.confidence;
+            weightedSpread += Math.hypot(
+                    fix.easting - consensusEast,
+                    fix.northing - consensusNorth
+            ) * weight;
+        }
+        double spreadMeters = weightedSpread / weightSum;
+        double headingRad = Double.NaN;
+        if (first != null && last != null
+                && Math.hypot(last.easting - first.easting, last.northing - first.northing) >= 0.8d) {
+            headingRad = Math.atan2(last.easting - first.easting, last.northing - first.northing);
+        }
+        return new AbsoluteConsensus(consensusEast, consensusNorth, spreadMeters, weightSum, headingRad);
     }
 
     private double normalizeHeading(double headingRad) {
@@ -1091,10 +1199,58 @@ public class ParticleFilterEngine {
         private final double easting;
         private final double northing;
         private final double headingRad;
+        private final boolean motionHeadingReliable;
 
-        private DisplayPose(double easting, double northing, double headingRad) {
+        private DisplayPose(double easting,
+                            double northing,
+                            double headingRad,
+                            boolean motionHeadingReliable) {
             this.easting = easting;
             this.northing = northing;
+            this.headingRad = headingRad;
+            this.motionHeadingReliable = motionHeadingReliable;
+        }
+    }
+
+    private static final class AbsoluteFix {
+        private final double easting;
+        private final double northing;
+        private final double accuracyMeters;
+        private final double confidence;
+        private final ObservationSource source;
+        private final long timestampMillis;
+
+        private AbsoluteFix(double easting,
+                            double northing,
+                            double accuracyMeters,
+                            double confidence,
+                            ObservationSource source,
+                            long timestampMillis) {
+            this.easting = easting;
+            this.northing = northing;
+            this.accuracyMeters = accuracyMeters;
+            this.confidence = confidence;
+            this.source = source;
+            this.timestampMillis = timestampMillis;
+        }
+    }
+
+    private static final class AbsoluteConsensus {
+        private final double easting;
+        private final double northing;
+        private final double spreadMeters;
+        private final double weightSum;
+        private final double headingRad;
+
+        private AbsoluteConsensus(double easting,
+                                  double northing,
+                                  double spreadMeters,
+                                  double weightSum,
+                                  double headingRad) {
+            this.easting = easting;
+            this.northing = northing;
+            this.spreadMeters = spreadMeters;
+            this.weightSum = weightSum;
             this.headingRad = headingRad;
         }
     }

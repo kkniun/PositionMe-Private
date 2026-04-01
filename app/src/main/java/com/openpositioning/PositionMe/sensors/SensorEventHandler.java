@@ -38,6 +38,7 @@ public class SensorEventHandler {
     private static final float GYRO_TURN_CONFIRM_RAD_PER_SEC = 0.55f;
     private static final double CALIBRATION_MIN_DISTANCE_METERS = 1.6;
     private static final long CALIBRATION_MAX_GAP_MS = 12_000L;
+    private static final long MIN_STEP_INTERVAL_MS = 280L;
 
     private final SensorState state;
     private final PdrProcessing pdrProcessing;
@@ -109,12 +110,10 @@ public class SensorEventHandler {
 
             case Sensor.TYPE_PRESSURE:
                 state.pressure = (1 - ALPHA) * state.pressure + ALPHA * sensorEvent.values[0];
-                if (recorder.isRecording()) {
-                    state.elevation = pdrProcessing.updateElevation(
-                            SensorManager.getAltitude(
-                                    SensorManager.PRESSURE_STANDARD_ATMOSPHERE, state.pressure)
-                    );
-                }
+                state.elevation = pdrProcessing.updateElevation(
+                        SensorManager.getAltitude(
+                                SensorManager.PRESSURE_STANDARD_ATMOSPHERE, state.pressure)
+                );
                 break;
 
             // NOTE: intentional fall-through from GYROSCOPE to LINEAR_ACCELERATION
@@ -183,7 +182,7 @@ public class SensorEventHandler {
             case Sensor.TYPE_STEP_DETECTOR:
                 long stepTime = SystemClock.uptimeMillis() - bootTime;
 
-                if (currentTime - lastStepTime < 20) {
+                if (currentTime - lastStepTime < MIN_STEP_INTERVAL_MS) {
                     Log.e("SensorFusion", "Ignoring step event, too soon after last step event:"
                             + (currentTime - lastStepTime) + " ms");
                     break;

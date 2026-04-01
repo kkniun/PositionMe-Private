@@ -278,8 +278,7 @@ public class IndoorMapManager {
             double directDistance = UtilFunctions.distanceBetweenPoints(previousLocation, candidateLocation);
             if (directDistance >= 0.10d
                     && (isBlocked(previousLocation, candidateLocation)
-                    || isInsideWall(candidateLocation)
-                    || candidateNearWall)) {
+                    || isInsideWall(candidateLocation))) {
                 List<LatLng> detour = routeShortestLegalPath(previousLocation, candidateLocation, directDistance);
                 if (detour.size() >= 2) {
                     LatLng progressed = advanceAlongPath(
@@ -294,7 +293,7 @@ public class IndoorMapManager {
         }
 
         LatLng corrected = candidateLocation;
-        if (isInsideWall(corrected) || candidateNearWall) {
+        if (isInsideWall(corrected)) {
             LatLng projected = projectToNearestWallBoundary(candidateLocation);
             if (projected != null) {
                 corrected = projected;
@@ -304,6 +303,12 @@ public class IndoorMapManager {
                 if (snapped != null) {
                     corrected = snapped;
                 }
+            }
+        }
+        if (candidateNearWall && previousLocation != null && isBlocked(previousLocation, corrected)) {
+            LatLng clipped = constrainToLegalPath(previousLocation, corrected);
+            if (clipped != null && !isInsideWall(clipped)) {
+                corrected = clipped;
             }
         }
 
