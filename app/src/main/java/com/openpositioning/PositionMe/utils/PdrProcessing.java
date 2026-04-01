@@ -188,6 +188,10 @@ public class PdrProcessing {
      * @return                  current elevation in meters relative to the start position.
      */
     public float updateElevation(float absoluteElevation) {
+        if (!Float.isFinite(absoluteElevation)) {
+            return elevation;
+        }
+
         // Set start to median of first three values
         if(setupIndex < 3) {
             // Add values to buffer until it's full
@@ -393,6 +397,8 @@ public class PdrProcessing {
         this.floorHeight = settings.getInt("floor_height", 4);
         // Array for holding initial values
         this.startElevationBuffer = new Float[3];
+        this.setupIndex = 0;
+        this.startElevation = 0f;
         // Start floor - assumed to be zero
         this.currentFloor = 0;
     }

@@ -109,11 +109,18 @@ public class SensorEventHandler {
                 break;
 
             case Sensor.TYPE_PRESSURE:
-                state.pressure = (1 - ALPHA) * state.pressure + ALPHA * sensorEvent.values[0];
-                state.elevation = pdrProcessing.updateElevation(
-                        SensorManager.getAltitude(
-                                SensorManager.PRESSURE_STANDARD_ATMOSPHERE, state.pressure)
-                );
+                float rawPressure = sensorEvent.values[0];
+                if (Float.isFinite(rawPressure) && rawPressure >= 850f && rawPressure <= 1100f) {
+                    if (!Float.isFinite(state.pressure) || state.pressure <= 0f) {
+                        state.pressure = rawPressure;
+                    } else {
+                        state.pressure = (1 - ALPHA) * state.pressure + ALPHA * rawPressure;
+                    }
+                    state.elevation = pdrProcessing.updateElevation(
+                            SensorManager.getAltitude(
+                                    SensorManager.PRESSURE_STANDARD_ATMOSPHERE, state.pressure)
+                    );
+                }
                 break;
 
             // NOTE: intentional fall-through from GYROSCOPE to LINEAR_ACCELERATION
