@@ -178,12 +178,6 @@ public class SensorFusion implements SensorEventListener {
                 new WifiPositionManager.PositionUpdateListener() {
                     @Override
                     public void onWifiPositionUpdate(LatLng wifiLocation, int floor) {
-                        if (eventHandler != null) {
-                            eventHandler.updateHeadingCalibrationFromWifi(
-                                    wifiLocation,
-                                    System.currentTimeMillis()
-                            );
-                        }
                         if (particleFilterEngine != null) {
                             particleFilterEngine.onWifiObservation(
                                     wifiLocation,
