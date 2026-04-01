@@ -76,6 +76,10 @@ public class TrajectoryMapFragment extends Fragment {
     private static final double TRACK_REPLACE_DISTANCE_METERS = 0.03;
     private static final double MAX_TRACK_APPEND_DISTANCE_METERS = 6.0;
     private static final double TRACK_SEGMENT_INTERPOLATION_METERS = 3.0;
+    private static final double MAX_DISPLAY_SPEED_METERS_PER_SECOND = 3.2;
+    private static final double DISPLAY_JUMP_BASE_ALLOWANCE_METERS = 0.9;
+    private static final double MAX_DISPLAY_STEP_CAP_METERS = 5.5;
+    private static final long DISPLAY_SPEED_CAP_STALE_MS = 3_500L;
     private GoogleMap gMap; // Google Maps instance
     private LatLng currentLocation; // Stores the user's current location
     private Marker directionMarker; // Current user direction arrow
@@ -96,6 +100,7 @@ public class TrajectoryMapFragment extends Fragment {
     private float lastDirectionDegrees = 0f;
     private LatLng lastCameraLocation;
     private long lastCameraUpdateMs;
+    private long lastLocationUpdateMs;
     private final Map<Integer, List<LatLng>> userTrackHistoryByFloor = new HashMap<>();
     private int activeTrackFloor = Integer.MIN_VALUE;
 
@@ -301,6 +306,7 @@ public class TrajectoryMapFragment extends Fragment {
     public LatLng updateUserLocation(@NonNull LatLng newLocation, float orientation) {
         if (gMap == null) return newLocation;
 
+        long now = SystemClock.elapsedRealtime();
         LatLng oldLocation = this.currentLocation;
         LatLng displayLocation = newLocation;
         if (indoorMapManager != null) {
@@ -311,6 +317,7 @@ public class TrajectoryMapFragment extends Fragment {
             displayLocation = indoorMapManager.constrainPositionToLegalSpace(oldLocation, newLocation);
             indoorMapManager.setCurrentLocation(displayLocation);
         }
+        displayLocation = capDisplayLocationJump(oldLocation, displayLocation, now);
 
         float resolvedDirection = resolveDisplayDirection(oldLocation, displayLocation, orientation);
         boolean insignificantMove = oldLocation != null
@@ -321,6 +328,7 @@ public class TrajectoryMapFragment extends Fragment {
 
         if (insignificantMove && insignificantRotation) {
             updateTrackHistory(displayLocation);
+            lastLocationUpdateMs = now;
             return displayLocation;
         }
 
@@ -328,10 +336,9 @@ public class TrajectoryMapFragment extends Fragment {
             updateDirectionMarker(displayLocation, resolvedDirection);
             gMap.moveCamera(CameraUpdateFactory.newLatLngZoom(displayLocation, 19f));
             lastCameraLocation = displayLocation;
-            lastCameraUpdateMs = SystemClock.elapsedRealtime();
+            lastCameraUpdateMs = now;
         } else {
             updateDirectionMarker(displayLocation, resolvedDirection);
-            long now = SystemClock.elapsedRealtime();
             boolean movedEnough = lastCameraLocation == null
                     || UtilFunctions.distanceBetweenPoints(lastCameraLocation, displayLocation)
                     >= CAMERA_RECENTER_DISTANCE_METERS;
@@ -343,6 +350,7 @@ public class TrajectoryMapFragment extends Fragment {
         }
 
         updateTrackHistory(displayLocation);
+        lastLocationUpdateMs = now;
         return displayLocation;
     }
 
@@ -481,6 +489,7 @@ public class TrajectoryMapFragment extends Fragment {
         lastDirectionDegrees = 0f;
         lastCameraLocation = null;
         lastCameraUpdateMs = 0L;
+        lastLocationUpdateMs = 0L;
         userTrackHistoryByFloor.clear();
         activeTrackFloor = Integer.MIN_VALUE;
 
@@ -755,10 +764,17 @@ public class TrajectoryMapFragment extends Fragment {
 
         int lastIndex = userTrackHistory.size() - 1;
         LatLng lastPoint = userTrackHistory.get(lastIndex);
-        double distanceMeters = UtilFunctions.distanceBetweenPoints(lastPoint, location);
+        List<LatLng> routedSegment = buildTrackSegment(lastPoint, location);
+        double distanceMeters = pathLengthMeters(routedSegment);
 
         if (distanceMeters <= TRACK_REPLACE_DISTANCE_METERS) {
             userTrackHistory.set(lastIndex, location);
+            refreshDisplayedTrackPolyline();
+            return;
+        }
+
+        if (routedSegment.size() > 2) {
+            appendPathPoints(userTrackHistory, routedSegment.subList(1, routedSegment.size()));
             refreshDisplayedTrackPolyline();
             return;
         }
@@ -777,6 +793,47 @@ public class TrajectoryMapFragment extends Fragment {
         refreshDisplayedTrackPolyline();
     }
 
+    @NonNull
+    private List<LatLng> buildTrackSegment(@NonNull LatLng start, @NonNull LatLng end) {
+        if (indoorMapManager == null) {
+            List<LatLng> direct = new ArrayList<>(2);
+            direct.add(start);
+            direct.add(end);
+            return direct;
+        }
+        List<LatLng> routedSegment = indoorMapManager.buildLegalDisplaySegment(start, end);
+        if (routedSegment.isEmpty()) {
+            List<LatLng> direct = new ArrayList<>(2);
+            direct.add(start);
+            direct.add(end);
+            return direct;
+        }
+        return routedSegment;
+    }
+
+    private double pathLengthMeters(@NonNull List<LatLng> points) {
+        double total = 0d;
+        for (int i = 1; i < points.size(); i++) {
+            total += UtilFunctions.distanceBetweenPoints(points.get(i - 1), points.get(i));
+        }
+        return total;
+    }
+
+    private void appendPathPoints(@NonNull List<LatLng> userTrackHistory,
+                                  @NonNull List<LatLng> points) {
+        for (LatLng point : points) {
+            LatLng lastPoint = userTrackHistory.get(userTrackHistory.size() - 1);
+            if (UtilFunctions.distanceBetweenPoints(lastPoint, point) <= TRACK_REPLACE_DISTANCE_METERS) {
+                userTrackHistory.set(userTrackHistory.size() - 1, point);
+            } else {
+                userTrackHistory.add(point);
+            }
+        }
+        while (userTrackHistory.size() > MAX_TRACK_HISTORY_POINTS) {
+            userTrackHistory.remove(0);
+        }
+    }
+
     private void appendInterpolatedTrackPoints(@NonNull List<LatLng> userTrackHistory,
                                                @NonNull LatLng start,
                                                @NonNull LatLng end,
@@ -793,6 +850,72 @@ public class TrajectoryMapFragment extends Fragment {
         while (userTrackHistory.size() > MAX_TRACK_HISTORY_POINTS) {
             userTrackHistory.remove(0);
         }
+    }
+
+    @NonNull
+    private LatLng capDisplayLocationJump(@Nullable LatLng previousLocation,
+                                          @NonNull LatLng candidateLocation,
+                                          long nowMs) {
+        if (previousLocation == null || lastLocationUpdateMs <= 0L) {
+            return candidateLocation;
+        }
+
+        long elapsedMs = nowMs - lastLocationUpdateMs;
+        if (elapsedMs <= 0L || elapsedMs > DISPLAY_SPEED_CAP_STALE_MS) {
+            return candidateLocation;
+        }
+
+        double distanceMeters = UtilFunctions.distanceBetweenPoints(previousLocation, candidateLocation);
+        double allowedDistance = Math.min(
+                MAX_DISPLAY_STEP_CAP_METERS,
+                DISPLAY_JUMP_BASE_ALLOWANCE_METERS
+                        + (elapsedMs / 1000d) * MAX_DISPLAY_SPEED_METERS_PER_SECOND
+        );
+        if (distanceMeters <= allowedDistance) {
+            return candidateLocation;
+        }
+
+        List<LatLng> legalSegment = buildTrackSegment(previousLocation, candidateLocation);
+        if (legalSegment.size() >= 2) {
+            LatLng progressed = advanceAlongPath(legalSegment, allowedDistance);
+            if (progressed != null) {
+                return progressed;
+            }
+        }
+
+        double ratio = allowedDistance / Math.max(distanceMeters, 1e-6);
+        return new LatLng(
+                previousLocation.latitude + (candidateLocation.latitude - previousLocation.latitude) * ratio,
+                previousLocation.longitude + (candidateLocation.longitude - previousLocation.longitude) * ratio
+        );
+    }
+
+    @Nullable
+    private LatLng advanceAlongPath(@NonNull List<LatLng> path, double targetDistanceMeters) {
+        if (path.size() < 2) {
+            return path.isEmpty() ? null : path.get(path.size() - 1);
+        }
+
+        double remaining = Math.max(0d, targetDistanceMeters);
+        LatLng previous = path.get(0);
+        for (int i = 1; i < path.size(); i++) {
+            LatLng current = path.get(i);
+            double segmentDistance = UtilFunctions.distanceBetweenPoints(previous, current);
+            if (segmentDistance <= 1e-3d) {
+                previous = current;
+                continue;
+            }
+            if (remaining <= segmentDistance) {
+                double ratio = remaining / segmentDistance;
+                return new LatLng(
+                        previous.latitude + (current.latitude - previous.latitude) * ratio,
+                        previous.longitude + (current.longitude - previous.longitude) * ratio
+                );
+            }
+            remaining -= segmentDistance;
+            previous = current;
+        }
+        return path.get(path.size() - 1);
     }
 
     private void clearTrackHistory() {
