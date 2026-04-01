@@ -64,6 +64,14 @@ public final class FloorLabelParser {
             }
         }
 
+        if (normalized.startsWith("F") && normalized.length() > 1) {
+            try {
+                return Integer.parseInt(normalized.substring(1));
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+
         try {
             return Integer.parseInt(normalized);
         } catch (NumberFormatException ignored) {

@@ -19,6 +19,12 @@ public class FloorLabelParserTest {
     }
 
     @Test
+    public void parseLogicalFloorLabel_recognizesNumberWithLeadingF() {
+        assertEquals(Integer.valueOf(1), FloorLabelParser.parseLogicalFloorLabel("F1"));
+        assertEquals(Integer.valueOf(2), FloorLabelParser.parseLogicalFloorLabel("F2"));
+    }
+
+    @Test
     public void parseLogicalFloorLabel_recognizesBasementAndLevelWithTrailingF() {
         assertEquals(Integer.valueOf(-1), FloorLabelParser.parseLogicalFloorLabel("B1F"));
         assertEquals(Integer.valueOf(2), FloorLabelParser.parseLogicalFloorLabel("L2F"));
